@@ -73,6 +73,8 @@ export interface CodexRunOptions {
   readonly env?: NodeJS.ProcessEnv;
   readonly signal?: AbortSignal;
   readonly timeoutMs?: number;
+  // Check the caller's current permission immediately before each child start.
+  readonly mayStart?: () => boolean;
 }
 
 type Send = (text: string) => boolean;
@@ -125,6 +127,7 @@ export async function runCodex<T, E>(
     const line = Buffer.allocUnsafe(Math.min(LINE_BYTES, maxBytes));
     let child: ChildProcessByStdio<Writable, Readable, null>;
     try {
+      if (options.mayStart?.() === false) { resolve(err("aborted")); return; }
       child = spawn(codex.path, args, {
         shell: false, detached: true, cwd: options.cwd, stdio: ["pipe", "pipe", "ignore"],
         env: childEnv(codex.searchPath, options.env ?? process.env),

@@ -5,6 +5,7 @@
 // If Node is too old or the import fails, it pipes stdin to stdout.
 // `statusline` imports only dist/statusline.js. It prints one short line and exits 0.
 // If Node is too old or the import fails, it prints a fixed short line.
+// `refresh` does quota work without output and does not open stdin.
 // Other commands check the Node version first. Then dist/cli.js prints one JSON envelope.
 
 const [major = 0] = process.versions.node.split(".").map(Number);
@@ -57,6 +58,8 @@ if (process.argv[2] === "record") {
   } else {
     printLine("tokenmeter: needs Node 22.0");
   }
+} else if (process.argv[2] === "refresh") {
+  if (nodeOk) import("../dist/refresh.js").then((module) => module.refreshMain()).catch(() => undefined);
 } else if (nodeOk) {
   import("../dist/cli.js").then(
     (cli) => cli.cliMain(),

@@ -28,6 +28,7 @@ function descendant() {
 
 function version(mode) {
   appendFileSync("version-calls", "1\n");
+  if (mode === "rpc-switch-off") writeFileSync("config.json", '{"version":1,"app_server":"off"}', { mode: 0o600 });
   if (mode === "old") process.stdout.write("codex-cli 0.56.0-alpha.1\n");
   else if (mode === "rpc-old") process.stdout.write("codex-cli 0.55.0\n");
   else if (mode === "bad") process.stdout.write("unclear 0.165.0\n");
@@ -39,6 +40,7 @@ function version(mode) {
 function rpc() {
   const replies = JSON.parse(readFileSync("rpc-replies.json", "utf8"));
   writeFileSync("rpc-input", "");
+  writeFileSync("rpc-pid", String(process.pid));
   const input = createInterface({ input: process.stdin });
   input.on("line", (line) => {
     appendFileSync("rpc-input", line + "\n");
@@ -52,7 +54,7 @@ function rpc() {
 
 function main(mode, arg) {
   if (arg === "--version") version(mode);
-  else if (arg === "app-server" && (mode === "rpc" || mode === "rpc-old")) rpc();
+  else if (arg === "app-server" && (mode === "rpc" || mode === "rpc-old" || mode === "rpc-switch-off")) rpc();
   else if (mode === "env") process.stdout.write(JSON.stringify({ env: process.env, cwd: process.cwd() }) + "\n");
   else if (mode === "eof") {
     // In Codex 0.165.0, the wrapper and its only child exit cleanly within 20 ms of EOF.
