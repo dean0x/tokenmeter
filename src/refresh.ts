@@ -42,7 +42,10 @@ async function refreshAppServer(
 ): Promise<Result<null, FsError>> {
   const binKey = codex?.binKey ?? null;
   const gate = appServerGate(dataDir, prior, binKey, deps);
-  if (gate === "off") return writeRefreshState(dataDir, { ...current, outcome: "off" }, deps);
+  if (gate === "off") {
+    const nextAppServerAt = Math.min(current.nextAppServerAt, deps.nowMs() + REFRESH_INTERVAL_MS);
+    return writeRefreshState(dataDir, { ...current, outcome: "off", nextAppServerAt }, deps);
+  }
   if (gate === "backoff" || !timeLeft()) return writeRefreshState(dataDir, current, deps);
 
   // The record must survive an interruption before or during either child start.
@@ -90,8 +93,9 @@ async function refreshLocked(
 
   // The log and app-server reads can succeed independently of each other.
   const tail = readCodexTail(join(options.homeDir, ".codex", "sessions"), now, deps);
-  if (tail.ok && tail.value.length > 0) storeCodexQuota(dataDir, tail.value, deps);
-  return refreshAppServer(dataDir, prior.value, current, codex, options, timeLeft, deps);
+  const logs = tail.ok && tail.value.length > 0 ? storeCodexQuota(dataDir, tail.value, deps) : tail;
+  const server = await refreshAppServer(dataDir, prior.value, current, codex, options, timeLeft, deps);
+  return logs.ok ? server : logs;
 }
 
 export async function refresh(

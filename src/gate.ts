@@ -74,15 +74,19 @@ function binaryBackoff(state: RefreshState): boolean {
   return state.outcome === "old" || state.outcome === "shape";
 }
 
-function changedBinary(state: RefreshState, binKey: string | null): boolean {
-  return binKey !== null && binKey !== state.binKey;
+function binaryRetryDue(state: RefreshState, now: number, resolveKey: () => string | null): boolean {
+  if (!binaryBackoff(state)) return false;
+  const retryFloor = state.nextAppServerAt - backoffMs(state.outcome) + REFRESH_INTERVAL_MS;
+  if (now < retryFloor) return false;
+  const key = resolveKey();
+  return key !== null && key !== state.binKey;
 }
 
 // Reuse this check under the lock with a fresh state read and before any state write.
 export function refreshDue(readingAt: number | null, state: RefreshState | null, now: number, resolveBinKey: () => string | null): boolean {
   if (readingAt !== null && now - readingAt < REFRESH_INTERVAL_MS) return false;
   if (state === null) return true;
-  return now >= state.nextRefreshAt || (binaryBackoff(state) && changedBinary(state, resolveBinKey()));
+  return now >= state.nextRefreshAt || binaryRetryDue(state, now, resolveBinKey);
 }
 
 export function refreshGate(
@@ -99,8 +103,5 @@ export function appServerGate(
   if (readAppServerSetting(dataDir, deps) === "off") return "off";
   const now = deps.nowMs();
   if (state === null || now >= state.nextAppServerAt) return "open";
-  // A new binary ends the long backoff, not the first minute after an attempt.
-  const retryFloor = state.nextAppServerAt - backoffMs(state.outcome) + REFRESH_INTERVAL_MS;
-  if (binaryBackoff(state) && now >= retryFloor && changedBinary(state, binKey)) return "open";
-  return "backoff";
+  return binaryRetryDue(state, now, () => binKey) ? "open" : "backoff";
 }

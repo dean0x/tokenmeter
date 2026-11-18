@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { accessSync, constants, realpathSync, statSync } from "node:fs";
 import { delimiter, dirname, isAbsolute, join } from "node:path";
 import { err, ok, type Result } from "./core.ts";
+import { defaultDeps, readOwnFile, writeOwnFile } from "./fsafe.ts";
 
 const MAX_PATH_BYTES = 64 * 1024;
 const MAX_PATH_ENTRIES = 256;
@@ -43,7 +44,7 @@ export function resolveCodex(
     try {
       const path = realpathSync.native(join(folder, "codex"));
       const info = statSync(path);
-      if (!info.isFile() || !privateFolder(dirname(path))) continue;
+      if (!info.isFile() || (info.mode & SHARED_WRITE) !== 0 || !privateFolder(dirname(path))) continue;
       accessSync(path, constants.X_OK);
       const binKey = createHash("sha256").update(JSON.stringify([path, info.size, info.mtimeMs])).digest("hex");
       return ok({ path, binKey, searchPath });
@@ -131,6 +132,33 @@ function signalGroup(pid: number | undefined, signal: "SIGTERM" | "SIGKILL"): bo
   }
 }
 
+// Reuse one line buffer. Stop as soon as the exchange settles or exceeds a cap.
+function lineReceiver(maxBytes: number, accept: (text: string) => void, stopped: () => boolean) {
+  const line = Buffer.allocUnsafe(Math.min(LINE_BYTES, maxBytes));
+  let total = 0;
+  let length = 0;
+  function emit(): void {
+    const end = length > 0 && line[length - 1] === 13 ? length - 1 : length;
+    const text = line.toString("utf8", 0, end);
+    length = 0;
+    accept(text);
+  }
+  function receive(chunk: Buffer): boolean {
+    total += chunk.length;
+    if (total > maxBytes) return false;
+    for (let start = 0; !stopped() && start < chunk.length;) {
+      const newline = chunk.indexOf(10, start);
+      const end = newline < 0 ? chunk.length : newline;
+      if (length + end - start > line.length) return false;
+      length += chunk.copy(line, length, start, end);
+      if (newline >= 0) emit();
+      start = end + 1;
+    }
+    return true;
+  }
+  return { receive, finish: () => { if (length > 0) emit(); } };
+}
+
 // Node supplies pipe capture and POSIX process groups without a runtime dependency.
 export async function runCodex<T, E>(
   codex: ResolvedCodex,
@@ -147,7 +175,6 @@ export async function runCodex<T, E>(
   const maxBytes = version ? VERSION_OUTPUT_BYTES : APP_OUTPUT_BYTES;
 
   return new Promise((resolve) => {
-    const line = Buffer.allocUnsafe(Math.min(LINE_BYTES, maxBytes));
     let child: ChildProcessByStdio<Writable, Readable, null>;
     try {
       if (options.mayStart?.() === false) { resolve(err("aborted")); return; }
@@ -161,8 +188,6 @@ export async function runCodex<T, E>(
     }
 
     let settled = false;
-    let total = 0;
-    let length = 0;
     let inputBytes = 0;
     const abort = () => settle(err("aborted"));
     const deadline = setTimeout(() => settle(err("timeout")), timeout);
@@ -195,27 +220,14 @@ export async function runCodex<T, E>(
       return true;
     };
 
-    function emitLine(): void {
-      const end = length > 0 && line[length - 1] === 13 ? length - 1 : length;
-      const text = line.toString("utf8", 0, end);
-      length = 0;
+    const lines = lineReceiver(maxBytes, (text) => {
       const result = exchange.onLine(text, send);
       if (result !== undefined) settle(result);
-    }
+    }, () => settled);
 
     child.stdout.on("data", (chunk: Buffer) => {
-      total += chunk.length;
-      if (total > maxBytes) { settle(err("output_limit")); return; }
       try {
-        // Each pass consumes a newline or all remaining bytes in a capped chunk.
-        for (let start = 0; !settled && start < chunk.length;) {
-          const newline = chunk.indexOf(10, start);
-          const end = newline < 0 ? chunk.length : newline;
-          if (length + end - start > line.length) { settle(err("output_limit")); return; }
-          length += chunk.copy(line, length, start, end);
-          if (newline >= 0) emitLine();
-          start = end + 1;
-        }
+        if (!lines.receive(chunk)) settle(err("output_limit"));
       } catch {
         settle(err("error"));
       }
@@ -229,7 +241,7 @@ export async function runCodex<T, E>(
       if (settled) return;
       if (code !== 0) { failed(); return; }
       try {
-        if (length > 0) emitLine();
+        lines.finish();
         if (!settled) settle(exchange.onExit());
       } catch {
         failed();
@@ -245,7 +257,10 @@ export async function runCodex<T, E>(
 
 export type CodexVersionError = CodexRunError | "old" | "shape";
 type VersionAnswer = Result<void, "old" | "shape">;
-let lastVersion: { readonly binKey: string; readonly answer: VersionAnswer } | undefined;
+// Each HUD refresh has its own process. Keep only the supported binary's digest.
+// The refresh gate caches an old or malformed answer for up to one day.
+const VERSION_CACHE = "codex-version.json";
+const CACHE_BYTES = 66; // 64 hex digits and the JSON quotes.
 const CODEX_VERSION = /^codex-cli (0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 
 function versionAnswer(line: string | undefined): VersionAnswer {
@@ -262,7 +277,12 @@ export async function checkCodexVersion(
   options: Omit<CodexRunOptions, "timeoutMs">,
 ): Promise<Result<void, CodexVersionError>> {
   if (options.signal?.aborted) return err("aborted");
-  if (lastVersion?.binKey === codex.binKey) return lastVersion.answer;
+  if (!isAbsolute(options.cwd)) return err("error");
+  const deps = defaultDeps();
+  const cache = join(options.cwd, VERSION_CACHE);
+  const digest = JSON.stringify(codex.binKey);
+  const saved = readOwnFile(cache, CACHE_BYTES, deps);
+  if (saved.ok && saved.value === digest) return ok(undefined);
   let line: string | undefined;
   let extraLine = false;
   const answer = await runCodex<VersionAnswer, never>(codex, ["--version"], options, {
@@ -273,6 +293,6 @@ export async function checkCodexVersion(
     onExit: () => ok(extraLine ? err("shape") : versionAnswer(line)),
   });
   if (!answer.ok) return answer;
-  lastVersion = { binKey: codex.binKey, answer: answer.value };
-  return answer.value;
+  if (!answer.value.ok) return answer.value;
+  return writeOwnFile(cache, digest, deps).ok ? ok(undefined) : err("error");
 }

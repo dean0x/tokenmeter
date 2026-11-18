@@ -78,8 +78,10 @@ test("an executable and a symlink target in a group-writable folder are refused"
 
 test("candidates must be regular executable files", posix, (t) => {
   const { box, env, path } = fake(t);
-  chmodSync(path, 0o600);
-  assert.deepEqual(resolveCodex(env), err("missing"));
+  for (const mode of [0o600, 0o770, 0o707]) {
+    chmodSync(path, mode);
+    assert.deepEqual(resolveCodex(env), err("missing"));
+  }
   mkdirSync(box.path("directory"), { mode: 0o700 });
   mkdirSync(box.path("directory", "codex"), { mode: 0o700 });
   assert.deepEqual(resolveCodex({ PATH: box.path("directory") }), err("missing"));
@@ -177,6 +179,23 @@ test("version support is cached by binary identity and a changed mtime ends the 
   assert.deepEqual(await checkCodexVersion(changed.value, { cwd, env }), ok(undefined));
   assert.equal(readFileSync(calls, "utf8"), "1\n1\n");
 });
+
+for (const kind of ["link", "shared"] as const) {
+  test(`a ${kind} version cache cannot approve an old binary`, posix, async (t) => {
+    const { box, codex, cwd, env } = fake(t, "old");
+    const cache = box.path("data", "codex-version.json");
+    const digest = JSON.stringify(codex.binKey);
+    if (kind === "link") {
+      const target = box.path("digest");
+      writeFileSync(target, digest, { mode: 0o600 });
+      symlinkSync(target, cache);
+    } else {
+      writeFileSync(cache, digest);
+      chmodSync(cache, 0o644);
+    }
+    assert.deepEqual(await checkCodexVersion(codex, { cwd, env }), err("old"));
+  });
+}
 
 for (const [mode, error] of [["old", "old"], ["bad", "shape"], ["large", "output_limit"], ["fail", "error"]] as const) {
   test(`version probe returns ${error} for ${mode} output`, posix, async (t) => {

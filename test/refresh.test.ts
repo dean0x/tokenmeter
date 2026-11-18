@@ -10,6 +10,7 @@ import { defaultDeps } from "../src/fsafe.ts";
 import { readRefreshState, REFRESH_INTERVAL_MS, writeRefreshState } from "../src/gate.ts";
 import { readCodexLatest } from "../src/quota.ts";
 import { refresh } from "../src/refresh.ts";
+import { resolveCodex } from "../src/spawn.ts";
 import { writeFakeCodex, type FakeMode } from "./fixtures/fake-codex.mjs";
 import { installSuiteGuard, makeSandbox, type Sandbox } from "./helpers.ts";
 
@@ -22,8 +23,14 @@ function setup(t: TestContext, mode?: FakeMode) {
   const box = makeSandbox(t);
   mkdirSync(box.dataDir, { mode: 0o700 });
   const path = box.path("bin");
-  if (mode !== undefined) writeFakeCodex(path, mode);
-  return { box, env: { ...box.env, PATH: path } };
+  const env = { ...box.env, PATH: path };
+  if (mode !== undefined) {
+    const fake = writeFakeCodex(path, mode);
+    const binary = resolveCodex(env);
+    assert.ok(binary.ok);
+    assert.equal(binary.value.path, fake);
+  }
+  return { box, env };
 }
 
 function rollout(box: Sandbox, at: number, percent: number): void {
@@ -116,6 +123,41 @@ test("the rollout read continues while sign-in backoff prevents a Codex start", 
   assert.equal(readCodexLatest(box.dataDir, NOW)[0]?.usedPercent, 43);
   assert.equal(state(box)?.nextAppServerAt, auth?.nextAppServerAt);
   assert.equal(readFileSync(join(box.dataDir, "rpc-input"), "utf8").split("account/rateLimits/read").length - 1, 1);
+});
+
+test("a new refresher reuses the version result for the same binary", posix, async (t) => {
+  const { box, env } = setup(t, "rpc");
+  replies(box, { error: { code: -32600 } });
+  assertQuiet(await runBin(env, "refresh", t).done);
+  const prior = state(box);
+  assert.ok(prior && prior.outcome === "auth");
+  assert.ok(writeRefreshState(box.dataDir, { ...prior, nextRefreshAt: 0, nextAppServerAt: 0 }).ok);
+  replies(box, { error: { code: -32601 } });
+  assertQuiet(await runBin(env, "refresh", t).done);
+  assert.equal(state(box)?.outcome, "error");
+  assert.equal(readFileSync(join(box.dataDir, "version-calls"), "utf8"), "1\n");
+});
+
+test("a rollout read error stays visible after the app-server gate completes", posix, async (t) => {
+  const { box, env } = setup(t);
+  mkdirSync(join(box.home, ".codex"), { recursive: true });
+  writeFileSync(join(box.home, ".codex", "sessions"), "");
+  const result = await refresh(box.dataDir, { homeDir: box.home, env });
+  assert.ok(!result.ok);
+  assert.equal(state(box)?.outcome, "missing");
+  assert.equal(existsSync(join(box.dataDir, "refresh.lock")), false);
+});
+
+test("the off switch replaces a long backoff with the normal wait", posix, async (t) => {
+  const { box, env } = setup(t, "rpc");
+  replies(box, { error: { code: -32600 } });
+  await pass(box, env);
+  assert.ok(writeAppServerSetting(box.dataDir, "off").ok);
+  await pass(box, env, NOW + REFRESH_INTERVAL_MS);
+  assert.equal(state(box)?.outcome, "off");
+  assert.ok(writeAppServerSetting(box.dataDir, "on").ok);
+  await pass(box, env, NOW + 2 * REFRESH_INTERVAL_MS);
+  assert.equal(state(box)?.outcome, "auth");
 });
 
 test("two refreshes produce one app-server call and a fresh reading stops a new attempt", posix, async (t) => {

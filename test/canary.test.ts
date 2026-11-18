@@ -13,6 +13,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { Readable } from "node:stream";
@@ -457,9 +458,26 @@ test("static: no console output in src or bin", () => {
   for (const [name, text] of readAll(sourceFiles())) assert.equal(text.includes("console."), false, `${name} holds console.`);
 });
 
-test("static: no name of a tool that uses the meter in src, bin, README or the fixtures", () => {
-  const files = [...sourceFiles(), join(REPO, "README.md"), ...filesUnder(FIXTURES)];
-  for (const [name, text] of readAll(files)) assert.doesNotMatch(text, /devflow|factory|board/i, name);
+test("static: public code, tests and docs do not name consumer tools", () => {
+  // Check substrings without putting the names in the public test itself.
+  const fingerprints = new Set([
+    "5898b9896e0d8147631dc1e22b7ed6a0c6cd1440fc4400fc1b08fbaafb1930ab",
+    "06c8aaa93d80a768829b6005973fa92e34612849b79910c8be8e3b006cf91c61",
+    "859169b38185780daa5497983ff20d2994390058d8a71f2847ac7846f970971e",
+  ]);
+  const checked = new Set<string>();
+  const files = gitFiles(REPO, ["--cached"]).filter((path) => /^(?:src|test|bin)\//.test(path) || path.endsWith(".md"));
+  for (const [name, text] of readAll(files.map((path) => join(REPO, path)))) {
+    for (const size of [5, 7]) {
+      const substrings = new RegExp(`(?=([a-z]{${size}}))`, "g");
+      for (const match of text.toLowerCase().matchAll(substrings)) {
+        const part = match[1];
+        if (part === undefined || checked.has(part)) continue;
+        assert.ok(!fingerprints.has(createHash("sha256").update(part).digest("hex")), `${name} names a consumer`);
+        checked.add(part);
+      }
+    }
+  }
 });
 
 // ---------------------------------------------------------------------------

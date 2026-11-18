@@ -90,6 +90,18 @@ test("hud starts one refresher but does not create the missing data folder itsel
   assert.deepEqual(starts, [["spawn", process.execPath, [bin, "refresh"], dirname(bin), true, "ignore"]]);
 });
 
+test("hud rejects extra arguments instead of starting a refresh", (t) => {
+  const box = makeSandbox(t);
+  const child = spawnSync(process.execPath, [BIN, "hud", "--unknown"], {
+    env: { ...box.env, PATH: box.path("bin") }, encoding: "utf8", timeout: 2_000,
+  });
+  assert.equal(child.status, 2);
+  const parsed = parseJson(child.stdout);
+  assert.ok(parsed.ok);
+  assert.equal(asRow(asRow(parsed.value)?.error)?.code, "usage_error");
+  assert.equal(existsSync(box.dataDir), false);
+});
+
 test("hud ignores a linked data folder and starts no refresher", POSIX, (t) => {
   const { box, env } = setup(t);
   storeRollout(box, NOW - MINUTE);

@@ -86,14 +86,15 @@ for (const [outcome, change] of [["old", "size"], ["shape", "mtime"]] as const) 
       return result.value.binKey;
     };
     const finishedAt = AT + 1_000;
-    const saved = state({ outcome, binKey: getKey(), nextAppServerAt: finishedAt + DAY });
+    const saved = state({ outcome, binKey: getKey(), nextRefreshAt: AT + 2 * MINUTE, nextAppServerAt: finishedAt + DAY });
     const early = depsAt(AT + MINUTE - 1);
     assert.equal(refreshGate(dir, null, ok(saved), getKey, early), false);
     assert.equal(refreshGate(dir, null, ok(saved), () => null, early), false);
     assert.equal(appServerGate(dir, saved, null, early), "backoff");
     if (change === "size") appendFileSync(path, "# updated\n");
     else utimesSync(path, new Date(AT), new Date(AT));
-    assert.equal(refreshGate(dir, null, ok(saved), getKey, early), true);
+    assert.equal(refreshGate(dir, null, ok(saved), getKey, early), false);
+    assert.equal(refreshGate(dir, null, ok(saved), getKey, depsAt(finishedAt + MINUTE)), true);
     assert.equal(appServerGate(dir, saved, getKey(), depsAt(finishedAt + MINUTE - 1)), "backoff");
     assert.equal(appServerGate(dir, saved, getKey(), depsAt(finishedAt + MINUTE)), "open");
     assert.equal(existsSync(marker), false);

@@ -1150,6 +1150,17 @@ test("codex latest: a stored Codex window that is out of range does not hold bac
 // Codex latest reader and merge
 // ---------------------------------------------------------------------------
 
+test("a newer latest file stays intact after either quota writer runs", (t) => {
+  const w = makeWorld(t);
+  const path = writeLatest(w, { version: 2, future: "keep" });
+  const before = readFileSync(path, "utf8");
+  const codex = mk("codex", "week", NOW, 10, WEEK_RESET_MS);
+  assert.deepEqual(readCodexLatest(w.dir, NOW, BASE_DEPS), []);
+  assert.equal(storeCodexQuota(w.dir, [codex], BASE_DEPS).ok, false);
+  assert.equal(recordStatuslineQuota(w.dir, quotaOf(rawPoint(10, FIVE_RESET_MS), null), NOW, BASE_DEPS).ok, false);
+  assert.equal(readFileSync(path, "utf8"), before);
+});
+
 test("codex latest: a version 1 reading without metadata defaults to rollouts and not reached", (t) => {
   const w = makeWorld(t);
   const at = NOW - 8 * DAY_MS;
