@@ -459,7 +459,7 @@ test("static: no console output in src or bin", () => {
 });
 
 test("static: public code, tests and docs do not name consumer tools", () => {
-  // Check substrings without putting the names in the public test itself.
+  // Use SHA-256 fingerprints so the public test does not list the names it checks.
   const fingerprints = new Set([
     "5898b9896e0d8147631dc1e22b7ed6a0c6cd1440fc4400fc1b08fbaafb1930ab",
     "06c8aaa93d80a768829b6005973fa92e34612849b79910c8be8e3b006cf91c61",
