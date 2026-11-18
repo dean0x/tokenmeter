@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { ok, SCHEMA_ID } from "./core.ts";
-import { defaultDeps, existingDataDir, resolveDataDirPath } from "./fsafe.ts";
+import { dataDirWritable, defaultDeps, existingDataDir, resolveDataDirPath } from "./fsafe.ts";
 import { readRefreshState, refreshGate } from "./gate.ts";
 import { readCodexLatest, type CodexLatestWindow } from "./quota.ts";
 import { resolveCodex, startRefresh } from "./spawn.ts";
@@ -39,7 +39,9 @@ function readHud(ownBin: string) {
     return bin.ok ? bin.value.binKey : null;
   };
   // Only the refresher can create the data folder.
-  if (refreshGate(dataDir, at, state, binKey, deps)) startRefresh(ownBin, dataDir, env, dir.ok);
+  if (refreshGate(dataDir, at, state, binKey, deps) && dataDirWritable(dataDir, dir.ok)) {
+    startRefresh(ownBin, dataDir, env, dir.ok);
+  }
   if (at === null || (state.ok && state.value?.codexFound === false && now - at >= MISSING_MAX_AGE_MS)) return null;
   return codexData(samples, at);
 }

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdirSync, readdirSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
@@ -12,7 +12,7 @@ import { storeAppServerReading, storeCodexQuota } from "../src/quota.ts";
 import { resolveCodex } from "../src/spawn.ts";
 import { writeFakeCodex } from "./fixtures/fake-codex.mjs";
 import { installSuiteGuard, makeSandbox, type Sandbox } from "./helpers.ts";
-import { probeStarts } from "./spawn-probe.ts";
+import { observeStarts, probeStarts } from "./spawn-probe.ts";
 
 installSuiteGuard();
 const ROOT = resolve(import.meta.dirname, "..");
@@ -21,9 +21,14 @@ const NOW = Date.now();
 const MINUTE = 60_000;
 const DAY = 24 * 60 * MINUTE;
 const ROLLOUT_RESET = Math.floor((NOW + MINUTE) / 1000);
-const CLOCK = `--import=data:text/javascript,${encodeURIComponent(`Date.now = () => ${NOW};`)}`;
 const POSIX = { skip: process.platform === "win32" };
 const EMPTY = { schema: SCHEMA_ID, ok: true, data: { hud: 1, codex: null } };
+
+function preload(source: string): string {
+  return `--import=data:text/javascript,${encodeURIComponent(source)}`;
+}
+
+const CLOCK = preload(`Date.now = () => ${NOW};`);
 
 function setup(t: TestContext) {
   const box = makeSandbox(t);
@@ -48,9 +53,9 @@ function runHud(env: NodeJS.ProcessEnv): Record<string, unknown> {
   return envelope(child.stdout);
 }
 
-function deferRefresh(box: Sandbox, outcome: RefreshOutcome, codexFound: boolean): void {
+function deferRefresh(box: Sandbox, outcome: RefreshOutcome, codexFound: boolean, now = NOW): void {
   assert.ok(writeRefreshState(box.dataDir, {
-    lastAttemptAt: NOW, nextRefreshAt: NOW + MINUTE, nextAppServerAt: NOW + MINUTE,
+    lastAttemptAt: now, nextRefreshAt: now + MINUTE, nextAppServerAt: now + MINUTE,
     outcome, binKey: null, codexFound,
   }).ok);
 }
@@ -91,6 +96,65 @@ test("hud starts one refresher but does not create the missing data folder itsel
     ["spawn", process.execPath, [bin, "refresh"], dirname(bin), true, "ignore", "",
       ["HOME", "PATH", "TMPDIR", "TOKENMETER_DATA_DIR"]],
   ]);
+});
+
+test("hud can start a refresher when several parent folders are missing", POSIX, (t) => {
+  const box = makeSandbox(t);
+  const env = { ...box.env, PATH: box.path("bin"), TOKENMETER_DATA_DIR: box.path("new", "parent", "data") };
+  const { stdout, starts } = probeStarts(box, "hud", env);
+  assert.deepEqual(envelope(stdout), EMPTY);
+  assert.equal(starts.length, 1);
+  assert.equal(existsSync(box.path("new")), false);
+});
+
+test("repeated HUD calls start no refresher when the data folder has a group-writable parent", POSIX, (t) => {
+  const box = makeSandbox(t);
+  const parent = box.path("shared");
+  mkdirSync(parent);
+  chmodSync(parent, 0o770);
+  const env = { ...box.env, PATH: box.path("bin"), TOKENMETER_DATA_DIR: join(parent, "data") };
+  const first = probeStarts(box, "hud", env);
+  const second = probeStarts(box, "hud", env);
+  assert.deepEqual(envelope(first.stdout), EMPTY);
+  assert.deepEqual(envelope(second.stdout), EMPTY);
+  assert.deepEqual([first.starts.length, second.starts.length], [0, 0]);
+  assert.equal(existsSync(env.TOKENMETER_DATA_DIR), false);
+});
+
+for (const kind of ["data folder", "nearest existing ancestor"] as const) {
+  test(`hud starts no refresher when the ${kind} is read-only`, {
+    skip: process.platform === "win32" || process.getuid?.() === 0,
+  }, (t) => {
+    const { box, env } = setup(t);
+    const path = kind === "data folder" ? box.dataDir : box.path("ancestor");
+    if (kind === "nearest existing ancestor") mkdirSync(path, { mode: 0o700 });
+    const dataDir = kind === "data folder" ? path : join(path, "missing", "data");
+    chmodSync(path, 0o500);
+    try {
+      const { stdout, starts } = probeStarts(box, "hud", { ...env, TOKENMETER_DATA_DIR: dataDir });
+      assert.deepEqual(envelope(stdout), EMPTY);
+      assert.deepEqual(starts, []);
+    } finally {
+      chmodSync(path, 0o700);
+    }
+  });
+}
+
+test("hud returns an error envelope when its main function throws", (t) => {
+  const box = makeSandbox(t);
+  const failHome = preload(`
+    import os from 'node:os';
+    import { syncBuiltinESMExports } from 'node:module';
+    os.homedir = () => { throw new Error('No home folder'); };
+    syncBuiltinESMExports();
+  `);
+  const child = spawnSync(process.execPath, [failHome, BIN, "hud"], { env: box.env, encoding: "utf8", timeout: 2_000 });
+  assert.ifError(child.error);
+  assert.equal(child.status, 1);
+  assert.deepEqual(parseJson(child.stdout), { ok: true, value: {
+    schema: SCHEMA_ID, ok: false, error: { code: "internal_error", hint: "An internal error occurred." },
+  } });
+  assert.equal(child.stderr, "");
 });
 
 test("hud rejects extra arguments instead of starting a refresh", (t) => {
@@ -239,7 +303,10 @@ test("hud closes stdout within 300 ms with stdin open and a detached refresh sti
 
 test("doctor, status and hud emit envelopes from the installed tarball", POSIX, (t) => {
   const { box } = setup(t);
-  deferRefresh(box, "missing", false);
+  // This fixture is already due on the wall clock. Use its own clock for the packed binary.
+  const packedNow = NOW - 2 * MINUTE;
+  const packedClock = preload(`Date.now = () => ${packedNow};`);
+  deferRefresh(box, "missing", false, packedNow);
   const env = { ...box.env, npm_config_cache: box.path("npm-cache"), npm_config_offline: "true" };
   const npm = (args: string[], cwd: string): void => {
     const result = spawnSync("npm", args, { cwd, env, encoding: "utf8", timeout: 8_000 });
@@ -254,23 +321,30 @@ test("doctor, status and hud emit envelopes from the installed tarball", POSIX, 
   mkdirSync(install);
   npm(["install", "--prefix", install, "--no-save", "--ignore-scripts", "--no-audit", "--no-fund", join(box.tmp, archive)], install);
   const bin = join(install, "node_modules", ".bin", "tokenmeter");
-  for (const command of ["doctor", "status", "hud"]) {
-    const child = spawnSync(process.execPath, [bin, command], {
-      cwd: install, env: { ...box.env, PATH: box.path("bin") }, encoding: "utf8", timeout: 2_000,
-    });
+  const expected = [
+    ["doctor", 0, true, undefined],
+    ["status", 1, false, "not_collected"],
+    ["hud", 0, true, undefined],
+  ] as const;
+  for (const [command, code, okValue, errorCode] of expected) {
+    const { result: child, starts } = observeStarts(box, command, (observer) =>
+      spawnSync(process.execPath, [observer, packedClock, bin, command], {
+        cwd: install, env: { ...box.env, PATH: box.path("bin") }, encoding: "utf8", timeout: 2_000,
+      }));
     assert.ifError(child.error);
     assert.equal(child.signal, null);
     assert.equal(child.stderr, "");
     const parsed = parseJson(child.stdout);
     assert.ok(parsed.ok, child.stdout);
     const value = asRow(parsed.value);
-    assert.equal(value?.schema, SCHEMA_ID);
-    assert.notEqual(asRow(value?.error)?.code, "internal_error");
+    assert.deepEqual(
+      [child.status, value?.schema, value?.ok, asRow(value?.error)?.code],
+      [code, SCHEMA_ID, okValue, errorCode],
+      command,
+    );
     if (command === "hud") {
-      assert.equal(child.status, 0, child.stdout);
       assert.deepEqual(value, EMPTY);
-    } else if (value?.ok !== true) {
-      assert.equal(asRow(value?.error)?.code, "not_collected");
+      assert.equal(starts.length, 0, "The installed HUD must not start a refresher");
     }
   }
 });

@@ -62,10 +62,8 @@ if (process.argv[2] === "record") {
 } else if (process.argv[2] === "refresh") {
   if (nodeOk) import("../dist/refresh.js").then((module) => module.refreshMain()).catch(() => undefined);
 } else if (nodeOk && process.argv[2] === "hud" && process.argv.length === 3) {
-  import("../dist/hud.js").then(
-    (hud) => hud.hudMain(import.meta.filename),
-    () => failure("internal_error", "An internal error occurred."),
-  );
+  import("../dist/hud.js").then((hud) => hud.hudMain(import.meta.filename))
+    .catch(() => failure("internal_error", "An internal error occurred."));
 } else if (nodeOk) {
   import("../dist/cli.js").then(
     (cli) => cli.cliMain(),

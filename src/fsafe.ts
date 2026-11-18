@@ -5,6 +5,7 @@
 import { randomBytes } from "node:crypto";
 import {
   type Stats,
+  accessSync,
   closeSync,
   constants,
   fchmodSync,
@@ -62,6 +63,7 @@ const GROUP_WORLD_WRITE = 0o022;
 const GROUP_WORLD_BITS = 0o077;
 const STICKY_BIT = 0o1000;
 const APP_DIR = "tokenmeter";
+const MAX_DATA_DIR_ANCESTORS = 256;
 const SUFFIX_BYTES = 6;
 const TOKEN_BYTES = 8;
 const TOKEN_MAX_CHARS = 64;
@@ -240,10 +242,11 @@ export function resolveDataDirPath(input: DataDirInput): string {
 function parentIsSafe(parent: string): Result<null, FsError> {
   const stat = attemptFs(() => statSync(parent));
   if (!stat.ok) return err({ code: "data_dir_unsafe", sys: stat.error.sys });
-  const { mode } = stat.value;
-  const writable = (mode & GROUP_WORLD_WRITE) !== 0;
-  const sticky = (mode & STICKY_BIT) !== 0;
-  return writable && !sticky ? err({ code: "data_dir_unsafe", sys: null }) : ok(null);
+  return parentModeIsSafe(stat.value.mode) ? ok(null) : err({ code: "data_dir_unsafe", sys: null });
+}
+
+function parentModeIsSafe(mode: number): boolean {
+  return (mode & GROUP_WORLD_WRITE) === 0 || (mode & STICKY_BIT) !== 0;
 }
 
 // Creates the folder (parents and leaf 0700), checks the parent, and checks the
@@ -290,6 +293,32 @@ export function existingDataDir(path: string, deps: FsDeps = defaultDeps()): Res
   if (!found.ok && found.error.code === "not_found") return found;
   const parent = parentIsSafe(dirname(target));
   return parent.ok ? checkDataDir(target, deps) : parent;
+}
+
+function canWriteIn(path: string): boolean {
+  return attemptFs(() => accessSync(path, constants.W_OK | constants.X_OK)).ok;
+}
+
+// Check write access without creating the data folder. The caller checks an existing folder first.
+export function dataDirWritable(path: string, exists: boolean): boolean {
+  if (!isValidDirPath(path)) return false;
+  if (exists) return canWriteIn(path);
+
+  let parent = dirname(path);
+  for (let depth = 0; depth < MAX_DATA_DIR_ANCESTORS; depth += 1) {
+    const entry = lstatEntry(parent);
+    if (entry.ok) {
+      const info = entry.value.isSymbolicLink() ? attemptFs(() => statSync(parent)) : entry;
+      // If the direct parent does not exist, the refresher creates it at 0700.
+      return info.ok && info.value.isDirectory() && (depth !== 0 || parentModeIsSafe(info.value.mode))
+        && canWriteIn(parent);
+    }
+    if (entry.error.sys !== "ENOENT") return false;
+    const next = dirname(parent);
+    if (next === parent) return false;
+    parent = next;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------

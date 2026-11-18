@@ -7,9 +7,9 @@ import type { Sandbox } from "./helpers.ts";
 const BIN = join(import.meta.dirname, "..", "bin", "tokenmeter.js");
 
 // Observe process starts at the Node boundary. Do not launch the requested child.
-export function probeStarts(
-  box: Sandbox, command: "hud" | "record" | "statusline", env: NodeJS.ProcessEnv, input = "",
-): { readonly stdout: string; readonly starts: readonly unknown[] } {
+export function observeStarts<T>(
+  box: Sandbox, command: string, run: (preload: string) => T,
+): { readonly result: T; readonly starts: readonly unknown[] } {
   const log = box.path(`${command}-starts.jsonl`);
   const observer = `
     import childProcess from 'node:child_process';
@@ -27,10 +27,18 @@ export function probeStarts(
     syncBuiltinESMExports();
   `;
   const preload = `--import=data:text/javascript,${encodeURIComponent(observer)}`;
-  const child = spawnSync(process.execPath, [preload, BIN, command], { env, input, encoding: "utf8", timeout: 2_000 });
+  const result = run(preload);
+  const starts = existsSync(log) ? readFileSync(log, "utf8").trimEnd().split("\n").map((line): unknown => JSON.parse(line)) : [];
+  return { result, starts };
+}
+
+export function probeStarts(
+  box: Sandbox, command: "hud" | "record" | "statusline", env: NodeJS.ProcessEnv, input = "",
+): { readonly stdout: string; readonly starts: readonly unknown[] } {
+  const { result: child, starts } = observeStarts(box, command, (preload) =>
+    spawnSync(process.execPath, [preload, BIN, command], { env, input, encoding: "utf8", timeout: 2_000 }));
   assert.ifError(child.error);
   assert.equal(child.status, 0, child.stdout + child.stderr);
   assert.equal(child.stderr, "");
-  const starts = existsSync(log) ? readFileSync(log, "utf8").trimEnd().split("\n").map((line): unknown => JSON.parse(line)) : [];
   return { stdout: child.stdout, starts };
 }

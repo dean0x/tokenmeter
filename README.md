@@ -732,6 +732,7 @@ Its `source` is `rollouts` for session logs or `appserver` for a Codex reply. Th
 If the newest reading is missing or at least 60 seconds old, a HUD call can start a detached refresh.
 The first refresh creates the data folder if necessary. The refresh reads only the tails of recent Codex session logs.
 It normally runs at most once per minute per data folder, and only in response to a HUD call.
+A full disk or simultaneous HUD calls before the first refresh takes its lock can cause extra starts.
 
 The Codex limits read is on by default. It needs Codex 0.56.0 or newer on `PATH` and does not run on Windows.
 The Codex lookup and the child process `PATH` use only folders that you or root own.
