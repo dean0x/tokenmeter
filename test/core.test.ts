@@ -857,7 +857,7 @@ test("the real pid check: a finished child is dead and this process is alive", (
   const child = spawnSync(process.execPath, ["--version"], { env: sb.env });
   assert.ok(child.pid !== undefined && child.pid > 0);
   const now = Date.now();
-  writeFileSync(path, JSON.stringify({ pid: child.pid, startedAtMs: now, token: "old" }));
+  writeFileSync(path, JSON.stringify({ pid: child.pid, startedAtMs: now, token: "old" }), { mode: 0o600 });
   const taken = valueOf(acquireLock(path));
   assert.notEqual(taken.token, "old");
   assert.equal(failureOf(acquireLock(path)), "lock_held");
@@ -866,7 +866,7 @@ test("the real pid check: a finished child is dead and this process is alive", (
 test("an unreadable lock body falls back to the file time", (t) => {
   const sb = makeSandbox(t);
   const path = sb.path("collect.lock");
-  writeFileSync(path, "garbage");
+  writeFileSync(path, "garbage", { mode: 0o600 });
   const live = { ...defaultDeps(), isAlive: () => true };
   assert.equal(failureOf(acquireLock(path, live)), "lock_held");
   const old = (Date.now() - 2 * LOCK_STALE_MS) / 1000;

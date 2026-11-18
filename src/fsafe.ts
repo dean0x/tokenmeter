@@ -302,7 +302,7 @@ export interface OpenedFile {
 // Opens read-only without following a link and without blocking on a pipe,
 // then checks through the descriptor: a regular file owned by this user.
 // The caller closes the descriptor with closeFd.
-export function openRegularRead(path: string, deps: FsDeps = defaultDeps()): Result<OpenedFile, FsError> {
+export function openRegularRead(path: string, deps: FsDeps = defaultDeps(), privateOnly = false): Result<OpenedFile, FsError> {
   if (!isValidDirPath(path)) return err(BAD_INPUT);
   const opened = attemptFs(() => openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK));
   if (!opened.ok) return opened;
@@ -313,7 +313,8 @@ export function openRegularRead(path: string, deps: FsDeps = defaultDeps()): Res
     return stat;
   }
   const info = stat.value;
-  if (!info.isFile() || info.uid !== deps.uid) {
+  const safe = privateOnly ? isOwnPrivateFile(info, deps.uid) : info.isFile() && info.uid === deps.uid;
+  if (!safe) {
     closeFd(fd);
     return err(UNSAFE_FILE);
   }
@@ -336,9 +337,9 @@ function readAll(fd: number, size: number): Result<Buffer, FsError> {
 }
 
 // Text with invalid UTF-8 replaced. A file over the cap is refused, not cut.
-export function safeRead(path: string, capBytes: number, deps: FsDeps = defaultDeps()): Result<string, FsError> {
+function readText(path: string, capBytes: number, deps: FsDeps, privateOnly: boolean): Result<string, FsError> {
   if (!Number.isInteger(capBytes) || capBytes < 0) return err(BAD_INPUT);
-  const opened = openRegularRead(path, deps);
+  const opened = openRegularRead(path, deps, privateOnly);
   if (!opened.ok) return opened;
   const { fd, size } = opened.value;
   const body: Result<Buffer, FsError> = size > capBytes ? err({ code: "too_large", sys: null }) : readAll(fd, size);
@@ -347,11 +348,14 @@ export function safeRead(path: string, capBytes: number, deps: FsDeps = defaultD
   return ok(DECODER.decode(body.value));
 }
 
+export function safeRead(path: string, capBytes: number, deps: FsDeps = defaultDeps()): Result<string, FsError> {
+  return readText(path, capBytes, deps, false);
+}
+
 type FileFailure = "missing" | "unsafe" | "too_large";
 
-// The one trust rule for a data file that is read back or appended to: a regular
-// file, not a link (`info` comes from lstat), owned by this user, with no group
-// or world bits.
+// A regular file, owned by this user, with no group or world bits.
+// Use lstat or a no-follow descriptor to reject links.
 export function isOwnPrivateFile(info: Pick<Stats, "isFile" | "uid" | "mode">, uid: number): boolean {
   return info.isFile() && info.uid === uid && (info.mode & GROUP_WORLD_BITS) === 0;
 }
@@ -359,10 +363,7 @@ export function isOwnPrivateFile(info: Pick<Stats, "isFile" | "uid" | "mode">, u
 // A file that passes `isOwnPrivateFile`, within the byte cap. Anything else is a
 // failure code, never an error text.
 export function readOwnFile(path: string, capBytes: number, deps: FsDeps): Result<string, FileFailure> {
-  const stat = lstatEntry(path);
-  if (!stat.ok) return err(stat.error.code === "not_found" ? "missing" : "unsafe");
-  if (!isOwnPrivateFile(stat.value, deps.uid)) return err("unsafe");
-  const text = safeRead(path, capBytes, deps);
+  const text = readText(path, capBytes, deps, true);
   if (text.ok) return text;
   if (text.error.code === "too_large") return err("too_large");
   return err(text.error.code === "not_found" ? "missing" : "unsafe");
@@ -455,6 +456,14 @@ export function writeAtomic(path: string, text: string, deps: FsDeps = defaultDe
   const renamed = renameFile(staged.value, path);
   if (!renamed.ok) removeQuiet(staged.value);
   return renamed;
+}
+
+// Replace only a missing or private file in the caller's checked data folder.
+export function writeOwnFile(path: string, text: string, deps: FsDeps): Result<null, FsError> {
+  const stat = lstatEntry(path);
+  if (stat.ok && !isOwnPrivateFile(stat.value, deps.uid)) return err(UNSAFE_FILE);
+  if (!stat.ok && stat.error.sys !== "ENOENT") return stat;
+  return writeAtomic(path, text, deps);
 }
 
 // Makes the renames and removals in a folder durable. A file system that cannot
@@ -569,7 +578,7 @@ function parseLockBody(text: string): LockBody | null {
 
 // A body over the cap reads as empty, so the file time decides.
 function readLockFile(path: string, deps: FsDeps): Result<LockRead, FsError> {
-  const opened = openRegularRead(path, deps);
+  const opened = openRegularRead(path, deps, true);
   if (!opened.ok) return opened;
   const { fd, size, mtimeMs } = opened.value;
   const body: Result<Buffer, FsError> = size > LOCK_BODY_CAP_BYTES ? ok(Buffer.alloc(0)) : readAll(fd, size);
@@ -610,6 +619,12 @@ function judgeLock(path: string, deps: FsDeps): Result<LockVerdict, FsError> {
   if (deps.nowMs() - startedAt >= LOCK_STALE_MS) return ok(stale);
   if (body !== null && !deps.isAlive(body.pid)) return ok(stale);
   return ok({ kind: "held" });
+}
+
+// A read-only check. Only acquireLock can claim an available lock.
+export function lockAvailable(path: string, deps: FsDeps): boolean {
+  const verdict = judgeLock(path, deps);
+  return verdict.ok && verdict.value.kind !== "held";
 }
 
 // Removes the lock only if it still holds the content judged stale. A small

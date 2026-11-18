@@ -33,6 +33,7 @@ import { PassThrough, Readable, Writable } from "node:stream";
 import { DAYS_HORIZON_DAYS, DAYS_MAX_MODELS, SCHEMA_ID, STATUS_OUTPUT_MAX_BYTES, SYNC_MAX_BYTES, SYNC_MAX_OPEN_ITEMS, errorRecord, weighted } from "../src/core.ts";
 import { type CliIo, parseArgs, runCli } from "../src/cli.ts";
 import { DEFAULT_BUDGET } from "../src/collect.ts";
+import { DEFAULT_APP_SERVER } from "../src/config.ts";
 import { DayRows, cutoffDateOf, shiftDate } from "../src/days.ts";
 import { ESTIMATE_LOG_CAP_BYTES, logLineText } from "../src/estimate-log.ts";
 import type { EstimateLogLine, RangedLogLine } from "../src/estimator.ts";
@@ -144,6 +145,36 @@ async function cli(w: World, args: readonly string[], options: CliOptions = {}):
   const text = out.join("");
   return { code, text, stderr: errs.join(""), env: JSON.parse(text) as Envelope };
 }
+
+test("config reports the default without creating a data folder", async (t) => {
+  const w = makeWorld(t);
+  const run = await cli(w, ["config"]);
+  assert.equal(run.code, 0, run.text);
+  assert.deepEqual(run.env.data, { app_server: DEFAULT_APP_SERVER });
+  assert.equal(existsSync(w.sb.dataDir), false);
+});
+
+test("config writes to the selected folder, reports it, and reads the saved value", async (t) => {
+  const w = makeWorld(t);
+  const dataDir = w.sb.path("selected-data");
+  for (const app_server of ["off", "on"]) {
+    const set = await cli(w, ["config", "app_server", app_server, "--data-dir", dataDir]);
+    assert.equal(set.code, 0, set.text);
+    assert.deepEqual(set.env.data, { app_server, data_dir: dataDir });
+    const read = await cli(w, ["config", "--data-dir", dataDir]);
+    assert.deepEqual(read.env.data, { app_server });
+  }
+  assert.equal(existsSync(w.sb.dataDir), false);
+});
+
+test("config rejects invalid keys and values without creating a data folder", async (t) => {
+  const w = makeWorld(t);
+  for (const args of [["other", "off"], ["app_server"], ["app_server", "true"], ["app_server", "off", "on"]]) {
+    const run = await cli(w, ["config", ...args]);
+    assert.equal(run.env.error?.code, "usage_error", run.text);
+  }
+  assert.equal(existsSync(w.sb.dataDir), false);
+});
 
 function collectArgs(w: World): string[] {
   return ["collect", "--claude-root", w.claude, "--codex-root", w.codex];

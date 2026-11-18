@@ -9,14 +9,15 @@
 //   tasks         the tasks of the snapshot
 //   estimate      estimates for the open items on stdin
 //   doctor        counters only: no text from a source reaches the output
+//   config        reads or sets the Codex app-server switch
 //   record        the statusline filter (the bin runs it without this module)
 //   statusline    stores the rate limits as record does, then prints one short
 //                 line (the bin runs it without this module)
 //
 // Every command prints one JSON envelope: {schema, ok, data} or
 // {schema, ok:false, error:{code, hint}}. The hints are fixed. Exit code: 0 for
-// ok, 2 for usage_error, 1 for any other error. Nothing here reads or prints a
-// source text, a path or the text of a failure.
+// ok, 2 for usage_error, 1 for any other error. Only a config write prints its
+// data folder. No command prints source text or the text of a failure.
 
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -32,6 +33,7 @@ import {
   ok,
 } from "./core.ts";
 import { type CollectState, loadBucketRows, periodSlots, readAnalysis } from "./analysis.ts";
+import { DEFAULT_APP_SERVER, isAppServerSetting, readAppServerSetting, writeAppServerSetting, type AppServerSetting } from "./config.ts";
 import {
   type CollectBudget,
   type CollectError,
@@ -172,6 +174,7 @@ type CommandName =
   | "tasks"
   | "estimate"
   | "doctor"
+  | "config"
   | "record"
   | "statusline";
 type FlagName = "--data-dir" | "--claude-root" | "--codex-root" | "--week-start";
@@ -191,25 +194,31 @@ const COMMAND_FLAGS: Readonly<Record<CommandName, readonly FlagName[]>> = {
   tasks: DATA_FLAGS,
   "tasks sync": DATA_FLAGS,
   estimate: DATA_FLAGS,
+  config: DATA_FLAGS,
   record: [],
   statusline: [],
 };
 const MAX_ARGS = 16;
 
-interface Parsed {
-  readonly command: CommandName;
-  readonly flags: ReadonlyMap<string, string>;
-}
+type Command =
+  | { readonly command: "config"; readonly setting: AppServerSetting | null }
+  | { readonly command: Exclude<CommandName, "config"> };
+type Parsed = Command & { readonly flags: ReadonlyMap<string, string> };
 
-function commandOf(words: readonly string[]): CommandName | null {
-  const [first, second, ...rest] = words;
-  if (first === undefined || rest.length > 0) return null;
+function commandOf(words: readonly string[]): Command | null {
+  const [first, second, value] = words;
+  if (first === "config") {
+    if (words.length === 1) return { command: "config", setting: null };
+    if (words.length !== 3 || second !== "app_server" || !isAppServerSetting(value)) return null;
+    return { command: "config", setting: value };
+  }
+  if (first === undefined || words.length > 2) return null;
   if (first === "tasks") {
-    if (second === undefined) return "tasks";
-    return second === "sync" ? "tasks sync" : null;
+    if (second === undefined) return { command: "tasks" };
+    return second === "sync" ? { command: "tasks sync" } : null;
   }
   if (second !== undefined || !SINGLE_WORD_COMMANDS.includes(first)) return null;
-  return first as CommandName;
+  return { command: first as Exclude<CommandName, "config"> };
 }
 
 // Strict: an unknown command or flag, a flag without a value, a repeated flag
@@ -234,9 +243,9 @@ export function parseArgs(argv: readonly string[]): Result<Parsed, ErrorRecord> 
   }
   const command = commandOf(words);
   if (command === null) return fail("usage_error");
-  const allowed: readonly string[] = COMMAND_FLAGS[command];
+  const allowed: readonly string[] = COMMAND_FLAGS[command.command];
   if (![...flags.keys()].every((name) => allowed.includes(name))) return fail("usage_error");
-  return ok({ command, flags });
+  return ok({ ...command, flags });
 }
 
 // ---------------------------------------------------------------------------
@@ -608,13 +617,25 @@ function doctorCommand(ctx: Ctx): Result<unknown, ErrorRecord> {
   });
 }
 
+function configCommand(ctx: Ctx, setting: AppServerSetting | null): Result<unknown, ErrorRecord> {
+  const dir = dataDirOf(ctx, setting !== null);
+  if (!dir.ok) {
+    if (setting === null && dir.error.code === "not_collected") return ok({ app_server: DEFAULT_APP_SERVER });
+    return dir;
+  }
+  const { deps } = ctx.io;
+  if (setting === null) return ok({ app_server: readAppServerSetting(dir.value, deps) });
+  const wrote = writeAppServerSetting(dir.value, setting, deps);
+  return wrote.ok ? ok({ app_server: setting, data_dir: dir.value }) : fail("internal_error");
+}
+
 // ---------------------------------------------------------------------------
 // Entry points
 // ---------------------------------------------------------------------------
 
 type Handler = (ctx: Ctx) => Result<unknown, ErrorRecord> | Promise<Result<unknown, ErrorRecord>>;
 
-const HANDLERS: Readonly<Record<Exclude<CommandName, "record" | "statusline">, Handler>> = {
+const HANDLERS: Readonly<Record<Exclude<CommandName, "record" | "statusline" | "config">, Handler>> = {
   collect: collectCommand,
   status: statusCommand,
   usage: usageCommand,
@@ -639,6 +660,7 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       await statuslineMain();
       return 0;
     }
+    if (command === "config") return emit(io.stdout, configCommand({ io, flags }, parsed.value.setting));
     return emit(io.stdout, await HANDLERS[command]({ io, flags }));
   } catch {
     return emit(io.stdout, fail("internal_error"));
