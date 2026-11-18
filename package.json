@@ -26,7 +26,7 @@
     "tokenmeter": "bin/tokenmeter.js"
   },
   "engines": {
-    "node": ">=22.18"
+    "node": ">=22.0.0"
   },
   "files": [
     "bin",

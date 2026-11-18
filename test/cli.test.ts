@@ -3219,7 +3219,7 @@ test("bin statusline: with Node too old it still prints a short line, exits 0 an
   const run = await runBin(["statusline"], { ...w.sb.env, NODE_OPTIONS: `--require=${preload}` }, realStatusline(40));
   assert.equal(run.code, 0);
   assert.equal(run.stderr, "");
-  assert.equal(run.stdout, "tokenmeter: needs Node 22.18\n");
+  assert.equal(run.stdout, "tokenmeter: needs Node 22.0\n");
   assert.equal(existsSync(dataDir(w)), false, "no store work on an old Node");
 });
 

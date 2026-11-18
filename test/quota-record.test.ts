@@ -1480,7 +1480,7 @@ test("bin: an unknown command prints a JSON usage_error, and node_too_old on an 
   const preload = sb.path("old-node.cjs");
   writeFileSync(
     preload,
-    'Object.defineProperty(process, "versions", { value: { ...process.versions, node: "22.17.9" }, configurable: true });\n',
+    'Object.defineProperty(process, "versions", { value: { ...process.versions, node: "21.7.3" }, configurable: true });\n',
   );
   const old = await runBin(["status"], "", { ...sb.env, NODE_OPTIONS: `--require=${preload}` });
   assert.deepEqual(JSON.parse(old.stdout.toString("utf8")), { schema: SCHEMA_ID, ok: false, error: errorRecord("node_too_old") });
