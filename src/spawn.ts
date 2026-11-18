@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessByStdio } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
 import { createHash } from "node:crypto";
-import { accessSync, constants, realpathSync, statSync } from "node:fs";
+import { accessSync, constants, realpathSync, statSync, type Stats } from "node:fs";
 import { delimiter, dirname, isAbsolute, join } from "node:path";
 import { err, ok, type Result } from "./core.ts";
 import { defaultDeps, readOwnFile, writeOwnFile } from "./fsafe.ts";
@@ -16,36 +16,44 @@ export interface ResolvedCodex {
   readonly searchPath: string;
 }
 
-function privateFolder(path: string): boolean {
+interface CodexPathDeps {
+  readonly uid: number;
+  readonly stat?: (path: string) => Stats;
+}
+
+function privateEntry(info: Stats, uid: number): boolean {
+  return (info.uid === 0 || info.uid === uid) && (info.mode & SHARED_WRITE) === 0;
+}
+
+function privateFolder(path: string, deps: CodexPathDeps): boolean {
   try {
-    const info = statSync(path);
-    return info.isDirectory() && (info.mode & SHARED_WRITE) === 0;
+    const info = (deps.stat ?? statSync)(path);
+    return info.isDirectory() && privateEntry(info, deps.uid);
   } catch {
     return false;
   }
 }
 
-function pathFolders(path: string): readonly string[] {
+function pathFolders(path: string, deps: CodexPathDeps): readonly string[] {
   if (path.length > MAX_PATH_BYTES || Buffer.byteLength(path) > MAX_PATH_BYTES) return [];
   const parts = path.split(delimiter);
   if (parts.length > MAX_PATH_ENTRIES) return [];
-  // Exclude group- and world-writable folders from lookup and the child PATH.
-  // An env shebang in a Codex wrapper can otherwise select node from such a folder.
-  return [...new Set(parts.filter(isAbsolute))].filter(privateFolder);
+  return [...new Set(parts.filter(isAbsolute))].filter((folder) => privateFolder(folder, deps));
 }
 
 export function resolveCodex(
   env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
+  deps: CodexPathDeps = defaultDeps(),
 ): Result<ResolvedCodex, "missing"> {
   if (platform === "win32") return err("missing");
-  const folders = pathFolders(env["PATH"] ?? "");
+  const folders = pathFolders(env["PATH"] ?? "", deps);
   const searchPath = folders.join(delimiter);
   for (const folder of folders) {
     try {
       const path = realpathSync.native(join(folder, "codex"));
-      const info = statSync(path);
-      if (!info.isFile() || (info.mode & SHARED_WRITE) !== 0 || !privateFolder(dirname(path))) continue;
+      const info = (deps.stat ?? statSync)(path);
+      if (!info.isFile() || !privateEntry(info, deps.uid) || !privateFolder(dirname(path), deps)) continue;
       accessSync(path, constants.X_OK);
       const binKey = createHash("sha256").update(JSON.stringify([path, info.size, info.mtimeMs])).digest("hex");
       return ok({ path, binKey, searchPath });
@@ -107,8 +115,9 @@ export function startRefresh(
   try {
     const bin = realpathSync.native(ownBin);
     const cwd = dataDirExists ? dataDir : dirname(bin);
-    if (!dataDirExists && !privateFolder(cwd)) return err("error");
-    const searchPath = pathFolders(source["PATH"] ?? "").join(delimiter);
+    const deps = defaultDeps();
+    if (!dataDirExists && !privateFolder(cwd, deps)) return err("error");
+    const searchPath = pathFolders(source["PATH"] ?? "", deps).join(delimiter);
     const child = spawn(process.execPath, [bin, "refresh"], {
       shell: false, detached: true, cwd, stdio: "ignore",
       env: { ...childEnv(searchPath, source), TOKENMETER_DATA_DIR: dataDir },

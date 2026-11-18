@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { delimiter, relative } from "node:path";
 import { test, type TestContext } from "node:test";
 import { setTimeout as wait } from "node:timers/promises";
 import { asRow, err, ok } from "../src/core.ts";
-import { checkCodexVersion, resolveCodex, runCodex } from "../src/spawn.ts";
+import { checkCodexVersion, resolveCodex, runCodex, startRefresh } from "../src/spawn.ts";
 import { writeFakeCodex, type FakeMode } from "./fixtures/fake-codex.mjs";
 import { installSuiteGuard, makeSandbox } from "./helpers.ts";
 
@@ -42,15 +42,22 @@ test("Codex is off on Windows even if PATH is set", () => {
   assert.deepEqual(resolveCodex({ PATH: process.cwd() }, "win32"), err("missing"));
 });
 
-test("relative and empty PATH entries and the working folder never supply codex or node", posix, async (t) => {
+test("the Codex child PATH contains only eligible absolute folders", posix, async (t) => {
   const { box, folder, env, path, cwd } = fake(t, "env");
   for (const name of ["codex", "node"]) {
     writeFileSync(box.path("data", name), "#!/bin/sh\n: > marker\n", { mode: 0o700 });
   }
+  const shared = box.path("shared");
+  const other = box.path("other-owner");
+  mkdirSync(shared);
+  chmodSync(shared, 0o770);
+  mkdirSync(other, { mode: 0o700 });
+  const uid = statSync(folder).uid + 1;
+  const stat = (name: string) => Object.assign(statSync(name), { uid: name === other ? uid + 1 : uid });
   const relativePath = relative(process.cwd(), cwd);
-  const dirtyPath = [relativePath, "", folder, folder, ""].join(delimiter);
+  const dirtyPath = [relativePath, "", shared, other, folder, folder, ""].join(delimiter);
   assert.deepEqual(resolveCodex({ PATH: relativePath }), err("missing"));
-  const resolved = resolveCodex({ ...env, PATH: dirtyPath });
+  const resolved = resolveCodex({ ...env, PATH: dirtyPath }, process.platform, { uid, stat });
   assert.ok(resolved.ok);
   assert.equal(resolved.value.path, path);
   const result = await runCodex(resolved.value, ["app-server"], { cwd, env: { ...env, PATH: dirtyPath, CODEX_HOME: "" } }, {
@@ -59,7 +66,26 @@ test("relative and empty PATH entries and the working folder never supply codex 
   });
   assert.ok(result.ok);
   assertChildEnv(result.value, { PATH: folder, HOME: box.home, TMPDIR: box.tmp }, cwd);
+  assert.equal(resolved.value.searchPath, folder);
   assert.equal(existsSync(box.path("data", "marker")), false);
+});
+
+test("Codex lookup accepts root owners and refuses a different user as the file owner", posix, (t) => {
+  const { env, path, folder } = fake(t);
+  const uid = statSync(path).uid + 1;
+  const stat = (name: string) => Object.assign(statSync(name), { uid: name === folder ? 0 : uid + 1 });
+  assert.ok(resolveCodex(env, process.platform, { uid, stat: (name) => Object.assign(statSync(name), { uid: 0 }) }).ok);
+  assert.deepEqual(resolveCodex(env, process.platform, { uid, stat }), err("missing"));
+});
+
+test("the refresh does not start from a shared-write bin folder when the data folder is absent", posix, (t) => {
+  const box = makeSandbox(t);
+  const folder = box.path("bin");
+  const bin = box.path("bin", "refresh.js");
+  mkdirSync(folder);
+  chmodSync(folder, 0o770);
+  writeFileSync(bin, "// Fixture only.\n");
+  assert.deepEqual(startRefresh(bin, box.dataDir, box.env, false), err("error"));
 });
 
 test("an executable and a symlink target in a group-writable folder are refused", posix, (t) => {

@@ -87,7 +87,10 @@ test("hud starts one refresher but does not create the missing data folder itsel
   const bin = realpathSync.native(BIN);
   assert.deepEqual(envelope(stdout), EMPTY);
   assert.equal(existsSync(box.dataDir), false);
-  assert.deepEqual(starts, [["spawn", process.execPath, [bin, "refresh"], dirname(bin), true, "ignore"]]);
+  assert.deepEqual(starts, [
+    ["spawn", process.execPath, [bin, "refresh"], dirname(bin), true, "ignore", "",
+      ["HOME", "PATH", "TMPDIR", "TOKENMETER_DATA_DIR"]],
+  ]);
 });
 
 test("hud rejects extra arguments instead of starting a refresh", (t) => {

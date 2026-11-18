@@ -17,7 +17,8 @@ export function probeStarts(
     import { syncBuiltinESMExports } from 'node:module';
     for (const method of ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']) {
       childProcess[method] = (file, args, options) => {
-        const call = [method, file, args, options?.cwd, options?.detached, options?.stdio];
+        const env = options?.env;
+        const call = [method, file, args, options?.cwd, options?.detached, options?.stdio, env?.PATH, Object.keys(env ?? {}).sort()];
         appendFileSync(${JSON.stringify(log)}, JSON.stringify(call) + '\\n');
         if (method !== 'spawn') throw new Error('Unexpected process start');
         return { on() {}, unref() {} };

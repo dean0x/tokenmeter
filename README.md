@@ -734,7 +734,9 @@ The first refresh creates the data folder if necessary. The refresh reads only t
 It normally runs at most once per minute per data folder, and only in response to a HUD call.
 
 The Codex limits read is on by default. It needs Codex 0.56.0 or newer on `PATH` and does not run on Windows.
-Tokenmeter excludes group- and world-writable folders from the Codex lookup and from the child process `PATH`.
+The Codex lookup and the child process `PATH` use only folders that you or root own.
+Group and other users must not have write access to these folders or to the Codex executable.
+You or root must also own the executable and its folder.
 The refresher checks `codex --version` when necessary and runs `codex app-server` to request account rate limits over stdin and stdout.
 It tries the limits read at most once per minute per data folder. Some failures extend the wait before another attempt.
 

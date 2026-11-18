@@ -14,8 +14,8 @@ import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, utimesSync, writeFileSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { chmodSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, utimesSync, writeFileSync } from "node:fs";
+import { delimiter, dirname, join, relative, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { ERROR_CODES, asRow, parseJson } from "../src/core.ts";
 import { type CliIo, runCli } from "../src/cli.ts";
@@ -435,13 +435,19 @@ test("record and statusline start no process", (t) => {
   }
 });
 
-test("hud can start one detached refresh from an existing data folder", (t) => {
+test("hud starts one detached refresh with a filtered PATH and only the allowed env keys", { skip: process.platform === "win32" }, (t) => {
   const box = makeSandbox(t);
   mkdirSync(box.dataDir, { mode: 0o700 });
-  const env = { ...box.env, PATH: box.path("bin") };
+  const folder = box.path("bin");
+  const shared = box.path("shared");
+  mkdirSync(folder, { mode: 0o700 });
+  mkdirSync(shared);
+  chmodSync(shared, 0o770);
+  const env = { ...box.env, PATH: [shared, folder].join(delimiter), LANG: "C", CANARY_ONLY: "canary" };
   const bin = realpathSync.native(BIN);
   assert.deepEqual(probeStarts(box, "hud", env).starts, [
-    ["spawn", process.execPath, [bin, "refresh"], box.dataDir, true, "ignore"],
+    ["spawn", process.execPath, [bin, "refresh"], box.dataDir, true, "ignore", folder,
+      ["HOME", "LANG", "PATH", "TMPDIR", "TOKENMETER_DATA_DIR"]],
   ]);
 });
 
