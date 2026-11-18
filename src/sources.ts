@@ -146,6 +146,7 @@ export interface CodexQuotaSample {
   readonly at: number;
   readonly usedPercent: number;
   readonly resetsAt: number;
+  readonly reached: boolean;
 }
 
 export interface CodexEntry {
@@ -278,12 +279,13 @@ function windowOf(minutes: unknown): QuotaWindow | null {
 function readWindow(
   window: Row,
   at: number,
+  reached: boolean,
 ): Result<CodexQuotaSample, "bad_window" | "bad_percent" | "bad_reset"> {
   const name = windowOf(window["window_minutes"]);
   if (name === null) return err("bad_window");
   const point = quotaPoint(window["used_percent"], window["resets_at"], at);
   if (!point.ok) return point;
-  return ok({ window: name, at, usedPercent: point.value.usedPercent, resetsAt: point.value.resetsAt });
+  return ok({ window: name, at, ...point.value, reached });
 }
 
 function readQuota(value: unknown, at: number): QuotaRead {
@@ -293,12 +295,14 @@ function readQuota(value: unknown, at: number): QuotaRead {
   if (limitId !== undefined && limitId !== null && limitId !== "codex") {
     return { samples: [], skips: ["other_limit"] };
   }
+  const reachedType = limits["rate_limit_reached_type"];
+  const reached = typeof reachedType === "string" && reachedType.length > 0;
   const samples: CodexQuotaSample[] = [];
   const skips: SkipReason[] = [];
   for (const slot of QUOTA_SLOTS) {
     const window = asRow(limits[slot]);
     if (window === null) continue;
-    const sample = readWindow(window, at);
+    const sample = readWindow(window, at, reached);
     if (sample.ok) {
       samples.push(sample.value);
     } else {

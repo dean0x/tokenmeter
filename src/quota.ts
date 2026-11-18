@@ -9,15 +9,14 @@
 //
 // The Claude writer (record) appends a line only when the percent or the reset
 // time changed, and rewrites the latest file on a change or when its time is 60 s
-// old. The Codex writer (collect) uses the same append path and skips a sample
-// whose percent and reset time are already in the file, whatever its sample time.
+// old. Both Codex sources use the same append path and skip a sample whose
+// percent and reset time are already in the file, whatever its sample time.
 // A month file stops growing at 1 MiB.
 //
-// The latest file holds the time each window was last seen. For Claude, record
-// writes it. For Codex, collect writes it. A repeat of the numbers adds no line to
-// the month file, so the line holds the time of the change, and the latest file
-// holds the later time of the last repeat. Each writer keeps the section of the
-// other. The forecast of both uses the later time (see readObservations).
+// The latest file holds the time each window was last seen. Codex windows also
+// hold their source and reached flag. A repeat adds no line to the month file.
+// Each writer keeps the other provider's section. The forecast uses the time
+// of the last repeat (see readObservations).
 //
 // A window that the statusline did not carry, or carried with a bad percent or a
 // bad reset time, is stored as a reason code: absent, bad_percent or bad_reset.
@@ -75,8 +74,15 @@ export const QUOTA_MONTH_READ_CAP_BYTES = QUOTA_MONTH_CAP_BYTES + 64 * KIB;
 const MAX_STORE_SAMPLES = 20_000;
 const MAX_READ_MONTHS = 24;
 const MONTH_NAME = /^\d{4}-(?:0[1-9]|1[0-2])$/;
+const CODEX_LATEST_MAX_AGE_MS = 8 * 24 * 60 * 60 * 1_000;
 
 export type QuotaProvider = "claude" | "codex";
+type CodexSource = "appserver" | "rollouts";
+type RolloutQuotaSample = Omit<CodexQuotaSample, "reached"> & { readonly reached?: boolean };
+
+export interface CodexLatestWindow extends CodexQuotaSample {
+  readonly src: CodexSource;
+}
 
 export const QUOTA_WINDOWS: readonly QuotaWindow[] = ["five_hour", "week"];
 
@@ -211,6 +217,8 @@ export type LatestQuota = { readonly [W in QuotaWindow]: QuotaReading };
 interface StoredPoint extends QuotaPoint {
   // The last time the percent was confirmed, epoch milliseconds.
   readonly at: number;
+  readonly src?: CodexSource;
+  readonly reached?: boolean;
 }
 
 interface StoredReason {
@@ -243,10 +251,16 @@ function storedWindow(value: unknown): StoredWindow {
   if (value === null || value === undefined) return ok(null);
   const row = asRow(value);
   if (row === null) return err("bad_shape");
-  const { usedPercent, resetsAt, at, reason } = row;
+  const { usedPercent, resetsAt, at, reason, src, reached } = row;
   if (reason !== undefined) return isReason(reason) && isNumber(at) ? ok({ reason, at }) : err("bad_shape");
   if (!isNumber(usedPercent) || !isNumber(resetsAt) || !isNumber(at)) return err("bad_shape");
-  return ok({ usedPercent, resetsAt, at });
+  if (src !== undefined && src !== "appserver" && src !== "rollouts") return err("bad_shape");
+  if (reached !== undefined && typeof reached !== "boolean") return err("bad_shape");
+  return ok({
+    usedPercent, resetsAt, at,
+    ...(src === undefined ? {} : { src }),
+    ...(reached === undefined ? {} : { reached }),
+  });
 }
 
 function storedSection(value: unknown): StoredSection {
@@ -293,6 +307,27 @@ export function readLatestQuota(dataDir: string, nowMs: number, deps: FsDeps = d
   return { five_hour: judge(claude.five_hour, nowMs), week: judge(claude.week, nowMs) };
 }
 
+function observedPoint(entry: StoredWindow, nowMs: number): StoredPoint | null {
+  const point = entry.ok ? entry.value : null;
+  if (point === null || isStoredReason(point)) return null;
+  if (!(point.at >= EARLIEST_TIME_MS && point.at <= nowMs + FUTURE_SLACK_MS)) return null;
+  return checkQuotaPoint(point.usedPercent, point.resetsAt, point.at).ok ? point : null;
+}
+
+// The Codex windows for the HUD, in window order. A window can be past its reset.
+export function readCodexLatest(dataDir: string, nowMs: number, deps: FsDeps = defaultDeps()): readonly CodexLatestWindow[] {
+  const stored = loadStored(dataDir, deps);
+  if (!stored.ok) return [];
+  const windows: CodexLatestWindow[] = [];
+  for (const window of QUOTA_WINDOWS) {
+    const point = observedPoint(stored.value.codex[window], nowMs);
+    if (point === null || point.at < nowMs - CODEX_LATEST_MAX_AGE_MS) continue;
+    if (!Number.isSafeInteger(point.at) || !Number.isSafeInteger(point.resetsAt)) continue;
+    windows.push({ window, ...point, src: point.src ?? "rollouts", reached: point.reached ?? false });
+  }
+  return windows;
+}
+
 const OBSERVED_PROVIDERS: readonly QuotaProvider[] = ["claude", "codex"];
 
 // The windows of the latest file, Claude first and then Codex, as samples whose
@@ -304,11 +339,8 @@ export function readObservations(dataDir: string, nowMs: number, deps: FsDeps = 
   const seen: QuotaSample[] = [];
   for (const provider of OBSERVED_PROVIDERS) {
     for (const window of QUOTA_WINDOWS) {
-      const entry = stored.value[provider][window];
-      const point = entry.ok ? entry.value : null;
-      if (point === null || isStoredReason(point)) continue;
-      if (!(point.at >= EARLIEST_TIME_MS && point.at <= nowMs + FUTURE_SLACK_MS)) continue;
-      if (!checkQuotaPoint(point.usedPercent, point.resetsAt, point.at).ok) continue;
+      const point = observedPoint(stored.value[provider][window], nowMs);
+      if (point === null) continue;
       seen.push({ provider, window, at: point.at, usedPercent: point.usedPercent, resetsAt: point.resetsAt });
     }
   }
@@ -336,7 +368,7 @@ export function readQuotaSamples(
   return samples;
 }
 
-function beats(a: QuotaSample, b: QuotaSample): boolean {
+function beats(a: StoredPoint, b: StoredPoint): boolean {
   if (a.resetsAt !== b.resetsAt) return a.resetsAt > b.resetsAt;
   if (a.usedPercent !== b.usedPercent) return a.usedPercent > b.usedPercent;
   return a.at > b.at;
@@ -508,33 +540,53 @@ function storedKeys(path: string, deps: FsDeps): Set<string> {
   return keys;
 }
 
-// The Codex window of the latest file after a pass: the sample that pickLatestSample
-// takes from the stored point and the samples of the pass. So the highest percent
-// of the newest reset time stays, and its time is the last time it was seen.
-// A stored point out of range is not trusted. Null when there is nothing to keep.
-function latestCodexPoint(window: QuotaWindow, old: StoredValue | null, samples: readonly QuotaSample[]): StoredPoint | null {
-  const pool = samples.filter((sample) => sample.window === window);
-  if (old !== null && !isStoredReason(old) && checkQuotaPoint(old.usedPercent, old.resetsAt, old.at).ok) {
-    pool.push({ provider: "codex", window, at: old.at, usedPercent: old.usedPercent, resetsAt: old.resetsAt });
+// Compare sources by time. The app-server wins a tie. Only two rollout points
+// use the reset and percent rule, which keeps restamped child copies in order.
+function replacesCodexPoint(old: StoredPoint, next: StoredPoint): boolean {
+  if (next.src === "appserver") return next.at >= old.at;
+  if (old.src === "appserver") return next.at > old.at;
+  return !beats(old, next);
+}
+
+function latestCodexPoint(
+  window: QuotaWindow,
+  old: StoredValue | null,
+  samples: readonly RolloutQuotaSample[],
+  src: CodexSource,
+): StoredPoint | null {
+  let best: RolloutQuotaSample | null = null;
+  for (const sample of samples) {
+    if (sample.window !== window) continue;
+    if (best === null || (src === "appserver" ? sample.at >= best.at : beats(sample, best))) best = sample;
   }
-  const best = pickLatestSample(pool, "codex", window, ANY_RESET);
-  return best === null ? null : { usedPercent: best.usedPercent, resetsAt: best.resetsAt, at: best.at };
+  if (best === null) return null;
+  const { usedPercent, resetsAt, at, reached = false } = best;
+  const next = { usedPercent, resetsAt, at, src, reached };
+  if (old !== null && !isStoredReason(old) && checkQuotaPoint(old.usedPercent, old.resetsAt, old.at).ok) {
+    if (!replacesCodexPoint(old, next)) return null;
+  }
+  return next;
 }
 
-function samePoint(a: StoredValue | null, b: StoredPoint | null): boolean {
-  if (a === null || b === null) return a === b;
-  return !isStoredReason(a) && a.usedPercent === b.usedPercent && a.resetsAt === b.resetsAt && a.at === b.at;
+function samePoint(a: StoredValue | null, b: StoredPoint): boolean {
+  if (a === null || isStoredReason(a)) return false;
+  return a.usedPercent === b.usedPercent && a.resetsAt === b.resetsAt && a.at === b.at
+    && (a.src ?? "rollouts") === b.src && (a.reached ?? false) === b.reached;
 }
 
-// Rewrites the Codex section of the latest file when a window has a new point or a later
-// time. The Claude section is written back as it was. Returns true when it wrote the file.
-function refreshCodexLatest(dataDir: string, samples: readonly QuotaSample[], deps: FsDeps): Result<boolean, FsError> {
+// Rewrites the Codex section when a point changes. The Claude section stays.
+function refreshCodexLatest(
+  dataDir: string,
+  samples: readonly RolloutQuotaSample[],
+  src: CodexSource,
+  deps: FsDeps,
+): Result<boolean, FsError> {
   const stored = loadStored(dataDir, deps);
   const old = valuesOf(stored.ok ? stored.value.codex : EMPTY_STORED);
   const next: LatestSection = { five_hour: old.five_hour, week: old.week };
   let write = false;
   for (const window of QUOTA_WINDOWS) {
-    const point = latestCodexPoint(window, old[window], samples);
+    const point = latestCodexPoint(window, old[window], samples, src);
     if (point === null || samePoint(old[window], point)) continue;
     next[window] = point;
     write = true;
@@ -544,30 +596,19 @@ function refreshCodexLatest(dataDir: string, samples: readonly QuotaSample[], de
   return written.ok ? ok(true) : written;
 }
 
-// The collect side: the Codex samples of one pass (the `codexQuota` list of the
-// collect report). A pass reads the new lines of a rollout, so it emits samples
-// with new times and mostly old numbers. A sample whose percent and reset time
-// are in the month file already, or earlier in the list, is not written again.
-// The latest file takes the Codex window as the pass saw it, with the later time
-// of a repeat, so that the month file does not grow.
-export function storeCodexQuota(
+// Both sources share the monthly dedupe keys. Repeats can update the latest file
+// without an extra line in the month file.
+function storeCodexSamples(
   dataDir: string,
-  samples: readonly CodexQuotaSample[],
-  deps: FsDeps = defaultDeps(),
+  samples: readonly RolloutQuotaSample[],
+  src: CodexSource,
+  deps: FsDeps,
 ): Result<QuotaWriteReport, FsError> {
-  // Per month file: the keys stored, and then the keys of this list as they are taken.
   const keysByPath = new Map<string, Set<string>>();
   const fresh: QuotaSample[] = [];
-  const seen: QuotaSample[] = [];
-  for (const source of samples.slice(0, MAX_STORE_SAMPLES)) {
-    const sample: QuotaSample = {
-      provider: "codex",
-      window: source.window,
-      at: source.at,
-      usedPercent: source.usedPercent,
-      resetsAt: source.resetsAt,
-    };
-    seen.push(sample);
+  const seen = samples.slice(0, MAX_STORE_SAMPLES);
+  for (const { window, at, usedPercent, resetsAt } of seen) {
+    const sample: QuotaSample = { provider: "codex", window, at, usedPercent, resetsAt };
     const path = join(dataDir, quotaMonthFile(sample.at));
     const key = sampleKey(sample.provider, sample.window, sample.usedPercent, sample.resetsAt);
     let keys = keysByPath.get(path);
@@ -581,8 +622,26 @@ export function storeCodexQuota(
   }
   const appended = appendSamples(dataDir, fresh, deps);
   if (!appended.ok) return appended;
-  const latest = refreshCodexLatest(dataDir, seen, deps);
+  const latest = refreshCodexLatest(dataDir, seen, src, deps);
   if (!latest.ok) return latest;
   const { appended: count, full } = appended.value;
   return ok({ appended: count, skipped: samples.length - count - full, full, latestWritten: latest.value });
+}
+
+// The rollout samples of one collect or refresh pass.
+export function storeCodexQuota(
+  dataDir: string,
+  samples: readonly RolloutQuotaSample[],
+  deps: FsDeps = defaultDeps(),
+): Result<QuotaWriteReport, FsError> {
+  return storeCodexSamples(dataDir, samples, "rollouts", deps);
+}
+
+// The parsed windows from one app-server reply.
+export function storeAppServerReading(
+  dataDir: string,
+  samples: readonly CodexQuotaSample[],
+  deps: FsDeps = defaultDeps(),
+): Result<QuotaWriteReport, FsError> {
+  return storeCodexSamples(dataDir, samples, "appserver", deps);
 }
