@@ -29,7 +29,8 @@ function pathFolders(path: string): readonly string[] {
   if (path.length > MAX_PATH_BYTES || Buffer.byteLength(path) > MAX_PATH_BYTES) return [];
   const parts = path.split(delimiter);
   if (parts.length > MAX_PATH_ENTRIES) return [];
-  // A wrapper can also look up its interpreter on PATH.
+  // Exclude group- and world-writable folders from lookup and the child PATH.
+  // An env shebang in a Codex wrapper can otherwise select node from such a folder.
   return [...new Set(parts.filter(isAbsolute))].filter(privateFolder);
 }
 
