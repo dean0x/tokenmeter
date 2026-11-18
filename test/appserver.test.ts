@@ -109,6 +109,9 @@ for (const [name, message, outcome] of [
   ["another limit id", reply({ limitId: "other" }), "shape"],
   ["no usable window", reply({ primary: null }), "shape"],
   ["a malformed reply", "{", "shape"],
+  ["an unsupported JSON-RPC version", { ...reply(), jsonrpc: "1.0" }, "shape"],
+  ["an error with a result", { ...reply(), error: { code: -32600 } }, "shape"],
+  ["a non-integer error code", { id: 2, error: { code: 1.5 } }, "shape"],
   ["an auth error", { id: 2, error: { code: -32600, message: CANARY } }, "auth"],
   ["another RPC error", { id: 2, error: { code: -32601, message: CANARY } }, "error"],
 ] as const) {
@@ -123,6 +126,11 @@ test("a malformed initialize reply cannot open the rate limits read", posix, asy
   assert.deepEqual(await readAppServerLimits(codex, options), err("shape"));
   const sent = readFileSync(box.path("data", "rpc-input"), "utf8");
   assert.equal(sent.includes("account/rateLimits/read"), false);
+});
+
+test("an initialize error with code -32600 returns auth", posix, async (t) => {
+  const { codex, options } = fake(t, [reply()], [{ id: 1, error: { code: -32600 } }]);
+  assert.deepEqual(await readAppServerLimits(codex, options), err("auth"));
 });
 
 test("a silent server returns timeout", posix, async (t) => {

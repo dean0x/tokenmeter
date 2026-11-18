@@ -1140,6 +1140,17 @@ test("readRows delivers objects and counts failures by reason without any line t
   assert.ok(!JSON.stringify(scan).includes("CANARY"));
 });
 
+test("readRows refuses a file whose opened descriptor has a different identity", (t) => {
+  const box = makeSandbox(t);
+  const file = box.path("rows.jsonl");
+  writeFileSync(file, '{"a":1}\n');
+  const { dev, ino } = statSync(file);
+  const rows: unknown[] = [];
+  const scanned = readRows(file, { offset: 0, identity: { dev, ino: ino === 0 ? 1 : 0 } }, (row) => rows.push(row));
+  assert.deepEqual(scanned, { ok: false, error: { code: "unsafe_file", sys: null } });
+  assert.deepEqual(rows, []);
+});
+
 test("readRows applies the pre-filter before any parse", (t) => {
   const sb = makeSandbox(t);
   const file = sb.path("a.jsonl");
