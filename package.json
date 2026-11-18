@@ -1,0 +1,51 @@
+{
+  "name": "@dean0x/tokenmeter",
+  "version": "0.1.0",
+  "description": "Count Claude Code and Codex tokens on your own machine, with weekly limit forecasts",
+  "keywords": [
+    "claude-code",
+    "codex",
+    "tokens",
+    "usage",
+    "rate-limits",
+    "statusline",
+    "cli"
+  ],
+  "homepage": "https://github.com/dean0x/tokenmeter#readme",
+  "bugs": {
+    "url": "https://github.com/dean0x/tokenmeter/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dean0x/tokenmeter.git"
+  },
+  "license": "MIT",
+  "author": "Dean Sharon",
+  "type": "module",
+  "bin": {
+    "tokenmeter": "bin/tokenmeter.js"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc --project tsconfig.build.json",
+    "prepack": "npm run build",
+    "pretest": "npm run build",
+    "test": "node --test --test-concurrency=1 test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "typescript": "7.0.2"
+  }
+}

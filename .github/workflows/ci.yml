@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: ['**']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: typecheck and test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22.0.0", "22.18", "24"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci
+      - run: npm run build
+      - run: npm run typecheck
+      - name: Test
+        # The 22.0.0 run checks a candidate floor. The package requires 22.18.
+        continue-on-error: ${{ matrix.node == '22.0.0' }}
+        run: npm test
+
+  pack-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22.18'
+      - run: npm ci
+      - name: Test the installed tarball
+        shell: bash
+        run: |
+          smoke=$(mktemp -d)
+          archive=$(npm pack --json --pack-destination "$smoke" | jq -er '.[0].filename')
+          mkdir "$smoke/project"
+          cd "$smoke/project"
+          printf '%s\n' '{"private":true}' > package.json
+          npm install --ignore-scripts --no-audit --no-fund "$smoke/$archive"
+
+          export TOKENMETER_DATA_DIR="$smoke/data"
+          bin=./node_modules/.bin/tokenmeter
+          printf '{"rate_limits":{"seven_day":{"used_percentage":40,"resets_at":%s}}}\n' \
+            "$(( $(date +%s) + 3600 ))" > input.json
+          "$bin" record < input.json > output.json
+          cmp input.json output.json
+          "$bin" doctor --claude-root "$smoke/claude" --codex-root "$smoke/codex" |
+            jq -se 'length == 1 and all(.[]; .schema == "tokenmeter.v1" and .ok == true and .error == null and .data.quota.claude.seven_day.pct == 40)'
+          status_exit=0
+          "$bin" status > status.json || status_exit=$?
+          test "$status_exit" -eq 1
+          jq -se 'length == 1 and all(.[]; .schema == "tokenmeter.v1" and .ok == false and .error.code == "not_collected")' status.json

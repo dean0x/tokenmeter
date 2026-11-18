@@ -1,0 +1,27 @@
+.npm-cache/
+.npm-logs/
+node_modules/
+dist/
+state-test/
+
+# Devflow runtime data — local by default (memory, curation, docs, locks).
+# Shared via git: feature knowledge bases under .devflow/features/ (index.md and
+# every {slug}/KNOWLEDGE.md), .devflow/conventions.md (naming authority),
+# .devflow/policy.json (retired; presence only) and .devflow/project.json (team settings).
+# To stop sharing the first two, re-add `.devflow/features/` or
+# `.devflow/conventions.md` to your own .gitignore.
+.devflow/*
+!.devflow/features/
+.devflow/features/*
+!.devflow/features/index.md
+!.devflow/features/*/
+.devflow/features/*/*
+!.devflow/features/*/KNOWLEDGE.md
+!.devflow/conventions.md
+!.devflow/policy.json
+!.devflow/project.json
+.claudeignore
+
+# This repository does not share the devflow tool files.
+.devflow/features/
+.devflow/conventions.md
