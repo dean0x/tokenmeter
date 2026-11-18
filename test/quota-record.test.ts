@@ -1150,15 +1150,28 @@ test("codex latest: a stored Codex window that is out of range does not hold bac
 // Codex latest reader and merge
 // ---------------------------------------------------------------------------
 
-test("a newer latest file stays intact after either quota writer runs", (t) => {
+test("codex latest: the HUD reader ignores a newer version with valid windows", (t) => {
   const w = makeWorld(t);
-  const path = writeLatest(w, { version: 2, future: "keep" });
-  const before = readFileSync(path, "utf8");
-  const codex = mk("codex", "week", NOW, 10, WEEK_RESET_MS);
+  writeLatest(w, { version: 2, claude: {}, codex: { week: storedPoint(40, WEEK_RESET_MS, NOW) } });
   assert.deepEqual(readCodexLatest(w.dir, NOW, BASE_DEPS), []);
-  assert.equal(storeCodexQuota(w.dir, [codex], BASE_DEPS).ok, false);
-  assert.equal(recordStatuslineQuota(w.dir, quotaOf(rawPoint(10, FIVE_RESET_MS), null), NOW, BASE_DEPS).ok, false);
-  assert.equal(readFileSync(path, "utf8"), before);
+});
+
+test("codex latest: the Codex writer replaces a newer version with version 1", (t) => {
+  const w = makeWorld(t);
+  const path = writeLatest(w, { version: 2, claude: {}, codex: { week: storedPoint(40, WEEK_RESET_MS, NOW) } });
+  const sample = { window: "week", at: NOW, usedPercent: 10, resetsAt: WEEK_RESET_MS } as const;
+  assert.equal(must(storeCodexQuota(w.dir, [sample], BASE_DEPS)).latestWritten, true);
+  assert.equal(JSON.parse(readText(path)).version, 1);
+  assert.deepEqual(readCodexLatest(w.dir, NOW, BASE_DEPS), [{ ...sample, src: "rollouts", reached: false }]);
+});
+
+test("writer: the statusline writer replaces a newer latest file with version 1", (t) => {
+  const w = makeWorld(t);
+  const path = writeLatest(w, { ...latestBody(storedPoint(40, FIVE_RESET_MS, NOW), null), version: 2 });
+  const quota = quotaOf(rawPoint(10, FIVE_RESET_MS), null);
+  assert.equal(must(recordStatuslineQuota(w.dir, quota, NOW, BASE_DEPS)).latestWritten, true);
+  assert.equal(JSON.parse(readText(path)).version, 1);
+  assert.deepEqual(readLatestQuota(w.dir, NOW, BASE_DEPS).five_hour, { known: true, ...quota.five_hour, at: NOW });
 });
 
 test("codex latest: a version 1 reading without metadata defaults to rollouts and not reached", (t) => {

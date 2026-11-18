@@ -268,17 +268,14 @@ function storedSection(value: unknown): StoredSection {
   return { five_hour: storedWindow(section?.["five_hour"]), week: storedWindow(section?.["week"]) };
 }
 
-type StoredFailure = UnknownReason | "newer_version";
-
-function loadStored(dataDir: string, deps: FsDeps): Result<StoredFile, StoredFailure> {
+function loadStored(dataDir: string, deps: FsDeps): Result<StoredFile, UnknownReason> {
   const text = readOwnFile(join(dataDir, QUOTA_LATEST_FILE), QUOTA_LATEST_CAP_BYTES, deps);
   if (!text.ok) return err(text.error);
   const parsed = parseJson(text.value);
   if (!parsed.ok) return err("bad_shape");
   const root = asRow(parsed.value);
   const version = root?.["version"];
-  if (typeof version === "number" && Number.isInteger(version) && version > STORE_VERSION) return err("newer_version");
-  if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
+  if (typeof version !== "number" || !Number.isInteger(version) || version < 1 || version > STORE_VERSION) {
     return err("bad_shape");
   }
   if (asRow(root?.["claude"]) === null) return err("bad_shape");
@@ -305,10 +302,7 @@ function judge(stored: StoredWindow, nowMs: number): QuotaReading {
 // damaged, out of range or ended reading is unknown.
 export function readLatestQuota(dataDir: string, nowMs: number, deps: FsDeps = defaultDeps()): LatestQuota {
   const stored = loadStored(dataDir, deps);
-  if (!stored.ok) {
-    const reason = stored.error === "newer_version" ? "bad_shape" : stored.error;
-    return { five_hour: unknown(reason), week: unknown(reason) };
-  }
+  if (!stored.ok) return { five_hour: unknown(stored.error), week: unknown(stored.error) };
   const { claude } = stored.value;
   return { five_hour: judge(claude.five_hour, nowMs), week: judge(claude.week, nowMs) };
 }
@@ -505,7 +499,6 @@ export function recordStatuslineQuota(
   deps: FsDeps = defaultDeps(),
 ): Result<QuotaWriteReport, FsError> {
   const stored = loadStored(dataDir, deps);
-  if (!stored.ok && stored.error === "newer_version") return err({ code: "bad_input", sys: null });
   const before = valuesOf(stored.ok ? stored.value.claude : EMPTY_STORED);
 
   const fresh: QuotaSample[] = [];
@@ -589,7 +582,6 @@ function refreshCodexLatest(
   deps: FsDeps,
 ): Result<boolean, FsError> {
   const stored = loadStored(dataDir, deps);
-  if (!stored.ok && stored.error === "newer_version") return err({ code: "bad_input", sys: null });
   const old = valuesOf(stored.ok ? stored.value.codex : EMPTY_STORED);
   const next: LatestSection = { five_hour: old.five_hour, week: old.week };
   let write = false;
