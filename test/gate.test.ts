@@ -111,16 +111,33 @@ test("the state round-trips codexFound and the outcome at mode 0600", (t) => {
   assert.equal(statSync(box.path("data", "refresh-state.json")).mode & 0o777, 0o600);
 });
 
-test("a malformed state closes the refresh gate", (t) => {
+test("a malformed private state opens the refresh gate when the reading is absent or stale", (t) => {
   const { box, dir } = setup(t);
   const deps = depsAt(AT + MINUTE);
   const path = box.path("data", "refresh-state.json");
-  for (const patch of [{ codexFound: "false" }, { outcome: "unknown" }, { nextAppServerAt: -1 }, { binKey: "unknown" }]) {
-    writeFileSync(path, JSON.stringify({ ...state(), ...patch }), { mode: 0o600 });
+  const invalidFields = [{ codexFound: "false" }, { outcome: "unknown" }, { nextAppServerAt: -1 }, { binKey: "unknown" }];
+  for (const text of ["{", ...invalidFields.map((patch) => JSON.stringify({ ...state(), ...patch }))]) {
+    writeFileSync(path, text, { mode: 0o600 });
     const stored = readRefreshState(dir, deps);
-    assert.equal(stored.ok, false);
-    assert.equal(refreshGate(dir, null, stored, NO_BINARY_CHECK, deps), false);
+    assert.equal(refreshGate(dir, null, stored, NO_BINARY_CHECK, deps), true);
+    assert.equal(refreshGate(dir, AT, stored, NO_BINARY_CHECK, deps), true);
+    assert.equal(refreshGate(dir, AT + 1, stored, NO_BINARY_CHECK, deps), false);
+    assert.deepEqual(stored, ok(null));
   }
+});
+
+test("a malformed state with a different owner, over the cap or at mode 0400 keeps the gate closed", posix, (t) => {
+  const { box, dir } = setup(t);
+  const deps = depsAt(AT);
+  const path = box.path("data", "refresh-state.json");
+  const opens = (fsDeps: typeof deps) => refreshGate(dir, null, readRefreshState(dir, fsDeps), NO_BINARY_CHECK, fsDeps);
+  writeFileSync(path, "{", { mode: 0o600 });
+  assert.equal(opens({ ...deps, uid: deps.uid + 1 }), false, "different owner");
+  writeFileSync(path, "{".repeat(4 * 1024 + 1));
+  assert.equal(opens(deps), false, "over the cap");
+  writeFileSync(path, "{");
+  chmodSync(path, 0o400);
+  assert.equal(opens(deps), false, "mode 0400");
 });
 
 test("a live refresh lock blocks the gate and a second acquire; a stale lock does not", (t) => {

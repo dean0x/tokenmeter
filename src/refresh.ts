@@ -12,9 +12,11 @@ import {
 import { readCodexLatest, storeAppServerReading, storeCodexQuota } from "./quota.ts";
 import { resolveCodex, type ResolvedCodex } from "./spawn.ts";
 
+// The 15 s deadline covers the async work. Bounded synchronous reads cannot be preempted.
+// A stuck pass delays refreshes for at most LOCK_STALE_MS, by the stale break of refresh.lock.
 const DEADLINE_MS = 15_000;
 
-type RefreshError = FsError | "unsafe" | "too_large" | "bad_state";
+type RefreshError = FsError | "unsafe" | "too_large";
 
 interface RefreshOptions {
   readonly homeDir: string;

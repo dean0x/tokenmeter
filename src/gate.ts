@@ -34,7 +34,7 @@ export interface RefreshState {
   readonly codexFound: boolean;
 }
 
-type StoredState = Result<RefreshState | null, "unsafe" | "too_large" | "bad_state">;
+type StoredState = Result<RefreshState | null, "unsafe" | "too_large">;
 
 function isOutcome(value: unknown): value is RefreshOutcome {
   return typeof value === "string" && Object.hasOwn(BACKOFF_MS, value);
@@ -45,15 +45,16 @@ function isTime(value: unknown): value is number {
 }
 
 export function readRefreshState(dataDir: string, deps: FsDeps = defaultDeps()): StoredState {
-  const text = readOwnFile(join(dataDir, REFRESH_STATE_FILE), STATE_CAP_BYTES, deps);
+  const text = readOwnFile(join(dataDir, REFRESH_STATE_FILE), STATE_CAP_BYTES, deps, 0o600);
   if (!text.ok) return text.error === "missing" ? ok(null) : err(text.error);
+  // Treat malformed content as absent so the next refresh can repair it.
   const parsed = parseJson(text.value);
   const row = parsed.ok ? asRow(parsed.value) : null;
-  if (row === null) return err("bad_state");
+  if (row === null) return ok(null);
   const { lastAttemptAt, nextRefreshAt, nextAppServerAt, outcome, binKey, codexFound } = row;
   if (!isTime(lastAttemptAt) || !isTime(nextRefreshAt) || !isTime(nextAppServerAt) || !isOutcome(outcome)
     || (binKey !== null && (typeof binKey !== "string" || !BIN_KEY.test(binKey))) || typeof codexFound !== "boolean") {
-    return err("bad_state");
+    return ok(null);
   }
   return ok({ lastAttemptAt, nextRefreshAt, nextAppServerAt, outcome, binKey, codexFound });
 }

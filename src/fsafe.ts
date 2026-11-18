@@ -307,7 +307,9 @@ export interface OpenedFile {
 // Opens read-only without following a link and without blocking on a pipe,
 // then checks through the descriptor: a regular file owned by this user.
 // The caller closes the descriptor with closeFd.
-export function openRegularRead(path: string, deps: FsDeps = defaultDeps(), privateOnly = false): Result<OpenedFile, FsError> {
+export function openRegularRead(
+  path: string, deps: FsDeps = defaultDeps(), privateOnly = false, exactMode?: number,
+): Result<OpenedFile, FsError> {
   if (!isValidDirPath(path)) return err(BAD_INPUT);
   const opened = attemptFs(() => openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK));
   if (!opened.ok) return opened;
@@ -319,7 +321,7 @@ export function openRegularRead(path: string, deps: FsDeps = defaultDeps(), priv
   }
   const info = stat.value;
   const safe = privateOnly ? isOwnPrivateFile(info, deps.uid) : info.isFile() && info.uid === deps.uid;
-  if (!safe) {
+  if (!safe || (exactMode !== undefined && (info.mode & 0o7777) !== exactMode)) {
     closeFd(fd);
     return err(UNSAFE_FILE);
   }
@@ -342,9 +344,9 @@ function readAll(fd: number, size: number): Result<Buffer, FsError> {
 }
 
 // Text with invalid UTF-8 replaced. A file over the cap is refused, not cut.
-function readText(path: string, capBytes: number, deps: FsDeps, privateOnly: boolean): Result<string, FsError> {
+function readText(path: string, capBytes: number, deps: FsDeps, privateOnly: boolean, exactMode?: number): Result<string, FsError> {
   if (!Number.isInteger(capBytes) || capBytes < 0) return err(BAD_INPUT);
-  const opened = openRegularRead(path, deps, privateOnly);
+  const opened = openRegularRead(path, deps, privateOnly, exactMode);
   if (!opened.ok) return opened;
   const { fd, size } = opened.value;
   const body: Result<Buffer, FsError> = size > capBytes ? err({ code: "too_large", sys: null }) : readAll(fd, size);
@@ -365,10 +367,10 @@ export function isOwnPrivateFile(info: Pick<Stats, "isFile" | "uid" | "mode">, u
   return info.isFile() && info.uid === uid && (info.mode & GROUP_WORLD_BITS) === 0;
 }
 
-// A file that passes `isOwnPrivateFile`, within the byte cap. Anything else is a
-// failure code, never an error text.
-export function readOwnFile(path: string, capBytes: number, deps: FsDeps): Result<string, FileFailure> {
-  const text = readText(path, capBytes, deps, true);
+// A file that passes `isOwnPrivateFile`, the byte cap and any exact mode check.
+// Anything else is a failure code, never an error text.
+export function readOwnFile(path: string, capBytes: number, deps: FsDeps, exactMode?: number): Result<string, FileFailure> {
+  const text = readText(path, capBytes, deps, true, exactMode);
   if (text.ok) return text;
   if (text.error.code === "too_large") return err("too_large");
   return err(text.error.code === "not_found" ? "missing" : "unsafe");

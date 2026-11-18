@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
@@ -87,6 +87,29 @@ test("refresh is silent and records a missing Codex but still stores the rollout
   assertQuiet(await runBin(env, "refresh", t).done);
   assert.deepEqual([state(box)?.outcome, state(box)?.codexFound], ["missing", false]);
   assert.deepEqual(readCodexLatest(box.dataDir, NOW).map(({ at, src }) => [at, src]), [[at, "rollouts"]]);
+});
+
+test("refresh repairs malformed private state and stores a new rollout reading", posix, async (t) => {
+  const { box, env } = setup(t);
+  const at = NOW - REFRESH_INTERVAL_MS;
+  writeFileSync(join(box.dataDir, "refresh-state.json"), "{", { mode: 0o600 });
+  rollout(box, at, 18);
+  await pass(box, env);
+  assert.equal(state(box)?.lastAttemptAt, NOW);
+  assert.equal(state(box)?.outcome, "missing");
+  assert.equal(readCodexLatest(box.dataDir, NOW)[0]?.usedPercent, 18);
+});
+
+test("refresh leaves malformed state at mode 0644 intact and skips the rollout", posix, async (t) => {
+  const { box, env } = setup(t);
+  const path = join(box.dataDir, "refresh-state.json");
+  writeFileSync(path, "{");
+  chmodSync(path, 0o644);
+  rollout(box, NOW, 18);
+  const result = await refresh(box.dataDir, { homeDir: box.home, env });
+  assert.deepEqual(result, { ok: false, error: "unsafe" });
+  assert.equal(readFileSync(path, "utf8"), "{");
+  assert.deepEqual(readCodexLatest(box.dataDir, NOW), []);
 });
 
 test("off prevents all Codex starts from refresh and collect but admits a rollout next cycle", posix, async (t) => {
