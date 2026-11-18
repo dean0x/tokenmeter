@@ -47,11 +47,14 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
       - run: npm ci
+      - run: npm run build
       - name: Test the installed tarball
         shell: bash
         run: |
           smoke=$(mktemp -d)
-          archive=$(npm pack --json --pack-destination "$smoke" | jq -er '.[0].filename')
+          # The npm of Node 22.0 prints the prepack output on stdout, also with --json.
+          # The build ran above, so the pack skips the scripts.
+          archive=$(npm pack --json --ignore-scripts --pack-destination "$smoke" | jq -er '.[0].filename')
           mkdir "$smoke/project"
           cd "$smoke/project"
           printf '%s\n' '{"private":true}' > package.json
