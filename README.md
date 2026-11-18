@@ -2,11 +2,12 @@
 
 tokenmeter counts your Claude Code and Codex tokens on your own machine.
 It shows how much of your weekly limit you have used and where you are heading.
-It reads local files only. It has no runtime dependencies.
+Its token counts come from local logs. It has no runtime dependencies.
 
-It can do four things:
+Use it to:
 
 - Show the Claude week percent on the Claude Code status line, with a forecast.
+- Read Codex quota for a HUD.
 - Count tokens for today, the week and the month, for each model.
 - Show how much of the week each finished task used.
 - Estimate how much of the week a new task will use.
@@ -30,10 +31,11 @@ npm run build
 ./bin/tokenmeter.js status
 ```
 
-## No credentials, no network
+## Credentials and network access
 
-tokenmeter needs no credentials. It makes no network call. It starts no other program.
-A test checks that the source has no network code and no process code.
+tokenmeter needs no credentials. It does not read credential files or make HTTP calls itself.
+The optional Codex limits read runs the installed Codex CLI, which may contact its service.
+`record` and `statusline` start no other program.
 
 tokenmeter never prints or stores text from your sessions.
 It keeps numbers, the names of models, and short labels of folders.
@@ -54,7 +56,7 @@ The exit code is 0 for success, 2 for `usage_error` and 1 for every other error.
 
 | Command | What it does |
 |---|---|
-| `tokenmeter collect` | Reads new lines of the logs and updates the data folder. This is the only command that reads the logs. |
+| `tokenmeter collect` | Reads new lines of the logs and updates the data folder. |
 | `tokenmeter status` | Prints the last result of `collect`, with the latest Claude quota and the `periods` (days, weeks and months). It never reads the logs. |
 | `tokenmeter usage` | The same as `status`, with every model. `status` keeps the 8 busiest. |
 | `tokenmeter tasks sync` | Reads task windows and open items from stdin. |
@@ -63,10 +65,12 @@ The exit code is 0 for success, 2 for `usage_error` and 1 for every other error.
 | `tokenmeter doctor` | Prints counters only, to check that the logs are read. |
 | `tokenmeter record` | A filter for a status line. It copies stdin to stdout and stores the rate limits. |
 | `tokenmeter statusline` | A status line. It stores the rate limits and prints one short line. |
+| `tokenmeter hud` | Prints the stored Codex quota. It can start a background refresh. |
+| `tokenmeter config` | Prints the effective `app_server` setting. Add `app_server on` or `app_server off` to set it. |
 
-The commands that read the logs take `--claude-root` and `--codex-root`.
-These are `collect` and `doctor`. The defaults are `~/.claude/projects` and `~/.codex/sessions`.
-Every command except `record` and `statusline` takes `--data-dir`.
+`collect` and `doctor` take `--claude-root` and `--codex-root`.
+The defaults are `~/.claude/projects` and `~/.codex/sessions`.
+Every command except `record`, `statusline` and `hud` takes `--data-dir`.
 `status` and `usage` also take `--week-start`. See "Days, weeks and months".
 An unknown command or flag gives `usage_error`.
 `tasks sync` can also write one warning line to stderr, for a folder collision. See "The folder match".
@@ -129,8 +133,7 @@ Only the `five_hour` and `seven_day` windows of the status line count.
 Model-scoped weekly limits (Opus, Sonnet) and Claude Desktop transcripts do not.
 
 The Claude quota comes from the status line, with `record` or `statusline`.
-The Codex quota comes from the Codex session logs, with `collect`.
-Its time is the last time `collect` saw that percent in the logs, also when the percent did not change.
+`collect` gets Codex quota from the session logs. The [HUD refresh](#codex-quota-for-a-hud) can also read current limits from Codex.
 
 The forecast uses one reading of the week percent.
 The burn is the percent used, divided by the hours from the week start to the time of that reading.
@@ -716,6 +719,35 @@ tokenmeter estimate < items.json
 `status` answers from the last result in well under 3 seconds. It never reads the logs.
 Check `ok` and `schema` before you use `data`.
 The names of the fields are in snake_case. Times are in milliseconds since 1970.
+
+### Codex quota for a HUD
+
+Run `tokenmeter hud` with no flags or stdin. From a source checkout, run `npm run build` first.
+The command returns the stored quota at once. It does not write to the data folder or wait for Codex.
+
+Read `data.hud` for the format version (1). Read `data.codex` for the quota, or `null` if no usable reading exists.
+The `windows` list can contain 300-minute and 10080-minute windows. Each window reports a used percent (`pct`), reset time, and reading time.
+Its `source` is `rollouts` for session logs or `appserver` for a Codex reply. The quota also reports the newest reading time and `limit_reached`.
+
+If the newest reading is missing or at least 60 seconds old, a HUD call can start a detached refresh.
+The first refresh creates the data folder if necessary. The refresh reads only the tails of recent Codex session logs.
+It normally runs at most once per minute per data folder, and only in response to a HUD call.
+A full disk or simultaneous HUD calls before the first refresh takes its lock can cause extra starts.
+
+The Codex limits read is on by default. It needs Codex 0.56.0 or newer on `PATH` and does not run on Windows.
+The Codex lookup and the child process `PATH` use only folders that you or root own.
+Group and other users must not have write access to these folders or to the Codex executable.
+You or root must also own the executable and its folder.
+The refresher checks `codex --version` when necessary and runs `codex app-server` to request account rate limits over stdin and stdout.
+It tries the limits read at most once per minute per data folder. Some failures extend the wait before another attempt.
+
+```sh
+tokenmeter config
+tokenmeter config app_server off
+```
+
+The off switch stops Codex starts. The refresh still reads the session logs.
+Run `tokenmeter config app_server on` to enable the limits read again.
 
 ### Keep the numbers fresh
 

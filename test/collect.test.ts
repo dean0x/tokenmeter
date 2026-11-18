@@ -533,6 +533,7 @@ function sampleOf(clock: string, window: "five_hour" | "week", usedPercent: numb
     at: Date.parse(`2026-11-03T${clock}.000Z`),
     usedPercent,
     resetsAt: (window === "five_hour" ? RESET_5H_SECONDS : RESET_WEEK_SECONDS) * 1000,
+    reached: false,
   };
 }
 

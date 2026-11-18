@@ -857,7 +857,7 @@ test("the real pid check: a finished child is dead and this process is alive", (
   const child = spawnSync(process.execPath, ["--version"], { env: sb.env });
   assert.ok(child.pid !== undefined && child.pid > 0);
   const now = Date.now();
-  writeFileSync(path, JSON.stringify({ pid: child.pid, startedAtMs: now, token: "old" }));
+  writeFileSync(path, JSON.stringify({ pid: child.pid, startedAtMs: now, token: "old" }), { mode: 0o600 });
   const taken = valueOf(acquireLock(path));
   assert.notEqual(taken.token, "old");
   assert.equal(failureOf(acquireLock(path)), "lock_held");
@@ -866,7 +866,7 @@ test("the real pid check: a finished child is dead and this process is alive", (
 test("an unreadable lock body falls back to the file time", (t) => {
   const sb = makeSandbox(t);
   const path = sb.path("collect.lock");
-  writeFileSync(path, "garbage");
+  writeFileSync(path, "garbage", { mode: 0o600 });
   const live = { ...defaultDeps(), isAlive: () => true };
   assert.equal(failureOf(acquireLock(path, live)), "lock_held");
   const old = (Date.now() - 2 * LOCK_STALE_MS) / 1000;
@@ -1138,6 +1138,17 @@ test("readRows delivers objects and counts failures by reason without any line t
   assert.equal(scan.notObject, 4);
   assert.equal(scan.offset, scan.size);
   assert.ok(!JSON.stringify(scan).includes("CANARY"));
+});
+
+test("readRows refuses a file whose opened descriptor has a different identity", (t) => {
+  const box = makeSandbox(t);
+  const file = box.path("rows.jsonl");
+  writeFileSync(file, '{"a":1}\n');
+  const { dev, ino } = statSync(file);
+  const rows: unknown[] = [];
+  const scanned = readRows(file, { offset: 0, identity: { dev, ino: ino === 0 ? 1 : 0 } }, (row) => rows.push(row));
+  assert.deepEqual(scanned, { ok: false, error: { code: "unsafe_file", sys: null } });
+  assert.deepEqual(rows, []);
 });
 
 test("readRows applies the pre-filter before any parse", (t) => {

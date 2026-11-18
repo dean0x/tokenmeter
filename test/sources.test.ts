@@ -721,6 +721,7 @@ test("codex fixture: quota samples come in event order with percent and reset ti
     at: Date.parse(`2026-11-03T${clock}.000Z`),
     usedPercent,
     resetsAt: (window === "five_hour" ? RESET_5H_SECONDS : RESET_WEEK_SECONDS) * 1000,
+    reached: false,
   });
   assert.deepEqual(run.quota, [
     sample("08:01:00", "five_hour", 12.5),
@@ -813,9 +814,26 @@ test("codex quota: missing windows and missing rate limits give no samples and n
   }
 });
 
-test("codex quota: the sample holds only the fixed fields", () => {
-  const sample = quotaStep({ primary: windowOf(300, 10, RESET_5H_SECONDS) }).quota[0] as CodexQuotaSample;
-  assert.deepEqual(Object.keys(sample).sort(), ["at", "resetsAt", "usedPercent", "window"]);
+test("codex quota: a reached type marks both windows and does not retain its text", () => {
+  const step = quotaStep({
+    primary: windowOf(300, 10, RESET_5H_SECONDS),
+    secondary: windowOf(10080, 40, RESET_WEEK_SECONDS),
+    rate_limit_reached_type: "rate_limit_reached",
+  });
+  assert.deepEqual(step.quota, [
+    { window: "five_hour", at: AT_SECONDS * 1000, usedPercent: 10, resetsAt: RESET_5H_SECONDS * 1000, reached: true },
+    { window: "week", at: AT_SECONDS * 1000, usedPercent: 40, resetsAt: RESET_WEEK_SECONDS * 1000, reached: true },
+  ]);
+});
+
+test("codex quota: an empty or invalid reached type does not mark the reading", () => {
+  for (const reachedType of [undefined, null, "", true, 1, {}]) {
+    const step = quotaStep({
+      primary: windowOf(300, 10, RESET_5H_SECONDS),
+      rate_limit_reached_type: reachedType,
+    });
+    assert.equal(step.quota[0]?.reached, false);
+  }
 });
 
 test("codex quota: a counted event carries its samples too", () => {

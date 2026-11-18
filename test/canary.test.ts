@@ -6,15 +6,16 @@
 // and statusline included. The one place where the canary of the input is on
 // stdout is the pass-through of record: record copies its stdin, byte for byte.
 //
-// The static checks keep the package free of network and process code, of debug
-// output, of `.jsonl` files outside the fixtures, and of any name of the tools
-// that use the meter (the meter never depends on its users).
+// The static checks forbid network code, credential file names and debug output.
+// Only the spawn module can use `child_process`. The command checks verify which commands start a process.
+// The package has no `.jsonl` files outside the fixtures and names no tool that uses it.
 
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, utimesSync, writeFileSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { createHash } from "node:crypto";
+import { chmodSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, utimesSync, writeFileSync } from "node:fs";
+import { delimiter, dirname, join, relative, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { ERROR_CODES, asRow, parseJson } from "../src/core.ts";
 import { type CliIo, runCli } from "../src/cli.ts";
@@ -22,6 +23,7 @@ import { DEFAULT_BUDGET } from "../src/collect.ts";
 import { type FsDeps, defaultDeps } from "../src/fsafe.ts";
 import type { Zone } from "../src/periods.ts";
 import { type Sandbox, assertGuarded, installSuiteGuard, makeSandbox } from "./helpers.ts";
+import { probeStarts } from "./spawn-probe.ts";
 
 installSuiteGuard();
 
@@ -410,13 +412,43 @@ test("static: no .jsonl file on disk in src or bin", () => {
   assert.deepEqual(files.filter((file) => file.endsWith(".jsonl")).map((file) => relative(REPO, file)), []);
 });
 
-test("static: no network or process code in src or bin", () => {
-  const banned = ["fetch(", "node:http", "node:https", "node:net", "node:dns", "child_process", "node:tls", "node:dgram", "WebSocket"];
+test("static: only spawn.ts can use child_process, and no source names network code or credential files", () => {
+  const banned = [
+    "node:http", "node:https", "node:net", "node:dns", "node:tls", "node:dgram", "WebSocket",
+    "auth.json", "credentials.json", ".netrc",
+  ];
   const files = readAll(sourceFiles());
   assert.ok(files.length >= 14, "the source files are found");
   for (const [name, text] of files) {
     for (const word of banned) assert.equal(text.includes(word), false, `${name} holds ${word}`);
+    assert.equal(/fetch\s*\(/.test(text), false, `${name} uses fetch`);
+    if (name !== join("src", "spawn.ts")) assert.equal(text.includes("child_process"), false, `${name} holds child_process`);
   }
+});
+
+test("record and statusline start no process", (t) => {
+  const box = makeSandbox(t);
+  const env = { ...box.env, PATH: box.path("bin") };
+  const input = statuslineJson(false);
+  for (const command of ["record", "statusline"] as const) {
+    assert.deepEqual(probeStarts(box, command, env, input).starts, [], command);
+  }
+});
+
+test("hud starts one detached refresh with a filtered PATH and only the allowed env keys", { skip: process.platform === "win32" }, (t) => {
+  const box = makeSandbox(t);
+  mkdirSync(box.dataDir, { mode: 0o700 });
+  const folder = box.path("bin");
+  const shared = box.path("shared");
+  mkdirSync(folder, { mode: 0o700 });
+  mkdirSync(shared);
+  chmodSync(shared, 0o770);
+  const env = { ...box.env, PATH: [shared, folder].join(delimiter), LANG: "C", CANARY_ONLY: "canary" };
+  const bin = realpathSync.native(BIN);
+  assert.deepEqual(probeStarts(box, "hud", env).starts, [
+    ["spawn", process.execPath, [bin, "refresh"], box.dataDir, true, "ignore", folder,
+      ["HOME", "LANG", "PATH", "TMPDIR", "TOKENMETER_DATA_DIR"]],
+  ]);
 });
 
 test("static: every import is a file of the package or a node: module", () => {
@@ -432,9 +464,26 @@ test("static: no console output in src or bin", () => {
   for (const [name, text] of readAll(sourceFiles())) assert.equal(text.includes("console."), false, `${name} holds console.`);
 });
 
-test("static: no name of a tool that uses the meter in src, bin, README or the fixtures", () => {
-  const files = [...sourceFiles(), join(REPO, "README.md"), ...filesUnder(FIXTURES)];
-  for (const [name, text] of readAll(files)) assert.doesNotMatch(text, /devflow|factory|board/i, name);
+test("static: public code, tests and docs do not name consumer tools", () => {
+  // Use SHA-256 fingerprints so the public test does not list the names it checks.
+  const fingerprints = new Set([
+    "5898b9896e0d8147631dc1e22b7ed6a0c6cd1440fc4400fc1b08fbaafb1930ab",
+    "06c8aaa93d80a768829b6005973fa92e34612849b79910c8be8e3b006cf91c61",
+    "859169b38185780daa5497983ff20d2994390058d8a71f2847ac7846f970971e",
+  ]);
+  const checked = new Set<string>();
+  const files = gitFiles(REPO, ["--cached"]).filter((path) => /^(?:src|test|bin)\//.test(path) || path.endsWith(".md"));
+  for (const [name, text] of readAll(files.map((path) => join(REPO, path)))) {
+    for (const size of [5, 7]) {
+      const substrings = new RegExp(`(?=([a-z]{${size}}))`, "g");
+      for (const match of text.toLowerCase().matchAll(substrings)) {
+        const part = match[1];
+        if (part === undefined || checked.has(part)) continue;
+        assert.ok(!fingerprints.has(createHash("sha256").update(part).digest("hex")), `${name} names a consumer`);
+        checked.add(part);
+      }
+    }
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -607,11 +656,14 @@ test("publish probes: unexpected files, manifest fields and registry URLs fail t
 
 test("README: it names every command, every error code and the limits of what it counts", () => {
   const text = readFileSync(join(REPO, "README.md"), "utf8");
-  for (const command of ["collect", "status", "usage", "tasks sync", "tasks", "estimate", "doctor", "record", "statusline"]) {
+  for (const command of ["collect", "status", "usage", "tasks sync", "tasks", "estimate", "doctor", "record", "statusline", "hud", "config", "config app_server off"]) {
     assert.ok(text.includes(`tokenmeter ${command}`), `the command ${command}`);
   }
   for (const code of ERROR_CODES) assert.ok(text.includes(code), `the error code ${code}`);
-  for (const phrase of ["Node 22.0", "no credentials", "no network", "five_hour", "seven_day", "Opus", "Sonnet", "Claude Desktop", "TOKENMETER_DATA_DIR"]) {
+  for (const phrase of [
+    "Node 22.0", "no credentials", "five_hour", "seven_day", "Opus", "Sonnet", "Claude Desktop", "TOKENMETER_DATA_DIR",
+    "codex app-server", "on by default", "npm run build",
+  ]) {
     assert.ok(text.includes(phrase), phrase);
   }
   // The second use names no program: the status line command is a placeholder.

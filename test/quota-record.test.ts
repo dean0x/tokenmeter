@@ -38,11 +38,13 @@ import {
   parseStatusline,
   pickLatestSample,
   quotaMonthFile,
+  readCodexLatest,
   readLatestQuota,
   readObservations,
   readQuotaSamples,
   recordStatuslineQuota,
   sampleLine,
+  storeAppServerReading,
   storeCodexQuota,
 } from "../src/quota.ts";
 import { RECORD_COPY_CAP_BYTES, RECORD_DEADLINE_MS, type RecordIo, runRecord } from "../src/record.ts";
@@ -1143,6 +1145,174 @@ test("codex latest: a stored Codex window that is out of range does not hold bac
   must(storeCodexQuota(w.dir, [codex], BASE_DEPS));
   assert.deepEqual(observed(w, "week"), codex);
 });
+
+// ---------------------------------------------------------------------------
+// Codex latest reader and merge
+// ---------------------------------------------------------------------------
+
+test("codex latest: the HUD reader ignores a newer version with valid windows", (t) => {
+  const w = makeWorld(t);
+  writeLatest(w, { version: 2, claude: {}, codex: { week: storedPoint(40, WEEK_RESET_MS, NOW) } });
+  assert.deepEqual(readCodexLatest(w.dir, NOW, BASE_DEPS), []);
+});
+
+test("codex latest: the Codex writer replaces a newer version with version 1", (t) => {
+  const w = makeWorld(t);
+  const path = writeLatest(w, { version: 2, claude: {}, codex: { week: storedPoint(40, WEEK_RESET_MS, NOW) } });
+  const sample = { window: "week", at: NOW, usedPercent: 10, resetsAt: WEEK_RESET_MS } as const;
+  assert.equal(must(storeCodexQuota(w.dir, [sample], BASE_DEPS)).latestWritten, true);
+  assert.equal(JSON.parse(readText(path)).version, 1);
+  assert.deepEqual(readCodexLatest(w.dir, NOW, BASE_DEPS), [{ ...sample, src: "rollouts", reached: false }]);
+});
+
+test("writer: the statusline writer replaces a newer latest file with version 1", (t) => {
+  const w = makeWorld(t);
+  const path = writeLatest(w, { ...latestBody(storedPoint(40, FIVE_RESET_MS, NOW), null), version: 2 });
+  const quota = quotaOf(rawPoint(10, FIVE_RESET_MS), null);
+  assert.equal(must(recordStatuslineQuota(w.dir, quota, NOW, BASE_DEPS)).latestWritten, true);
+  assert.equal(JSON.parse(readText(path)).version, 1);
+  assert.deepEqual(readLatestQuota(w.dir, NOW, BASE_DEPS).five_hour, { known: true, ...quota.five_hour, at: NOW });
+});
+
+test("codex latest: a version 1 reading without metadata defaults to rollouts and not reached", (t) => {
+  const w = makeWorld(t);
+  const at = NOW - 8 * DAY_MS;
+  const resetsAt = at + HOUR_MS;
+  writeLatest(w, { ...latestBody(null, null), codex: { five_hour: storedPoint(25, resetsAt, at) } });
+  assert.deepEqual(readCodexLatest(w.dir, NOW, BASE_DEPS), [
+    { window: "five_hour", usedPercent: 25, resetsAt, at, src: "rollouts", reached: false },
+  ]);
+});
+
+test("codex latest: the reader drops old readings and keeps future readings within clock slack", (t) => {
+  const w = makeWorld(t);
+  const oldAt = NOW - 8 * DAY_MS - 1;
+  const futureAt = NOW + MINUTE_MS;
+  writeLatest(w, {
+    ...latestBody(null, null),
+    codex: { five_hour: storedPoint(25, oldAt + HOUR_MS, oldAt), week: storedPoint(40, WEEK_RESET_MS, futureAt) },
+  });
+  const read = (now: number) => readCodexLatest(w.dir, now, BASE_DEPS);
+  assert.deepEqual(read(NOW).map((point) => point.window), ["week"]);
+  assert.deepEqual(read(NOW - 1).map((point) => point.window), ["five_hour"]);
+});
+
+test("codex latest: the reader drops a window with invalid metadata", (t) => {
+  const w = makeWorld(t);
+  writeLatest(w, {
+    ...latestBody(null, null),
+    codex: {
+      five_hour: { ...storedPoint(25, FIVE_RESET_MS, NOW), src: "other" },
+      week: { ...storedPoint(40, WEEK_RESET_MS, NOW), reached: "true" },
+    },
+  });
+  assert.deepEqual(readCodexLatest(w.dir, NOW, BASE_DEPS), []);
+  assert.deepEqual(codexSeen(w, NOW), []);
+});
+
+test("codex latest: the reader drops windows with fractional times", (t) => {
+  const w = makeWorld(t);
+  writeLatest(w, {
+    ...latestBody(null, null),
+    codex: {
+      five_hour: storedPoint(25, FIVE_RESET_MS, NOW - 0.5),
+      week: storedPoint(40, WEEK_RESET_MS + 0.5, NOW),
+    },
+  });
+  assert.deepEqual(readCodexLatest(w.dir, NOW, BASE_DEPS), []);
+});
+
+test("codex latest: the reader refuses a loose file or a symlink", (t) => {
+  const w = makeWorld(t);
+  const body = { ...latestBody(null, null), codex: { week: storedPoint(40, WEEK_RESET_MS, NOW) } };
+  const path = writeLatest(w, body, 0o644);
+  const read = () => readCodexLatest(w.dir, NOW, BASE_DEPS);
+  assert.deepEqual(read(), []);
+  chmodSync(path, 0o600);
+  assert.equal(read().length, 1);
+  const target = join(w.dir, "other.json");
+  copyFileSync(path, target);
+  unlinkSync(path);
+  symlinkSync(target, path);
+  assert.deepEqual(read(), []);
+});
+
+test("codex latest: record preserves the reached flag of a rollout with unchanged quota numbers", (t) => {
+  const w = makeWorld(t);
+  const sample = { window: "week", at: NOW, usedPercent: 40, resetsAt: WEEK_RESET_MS, reached: false } as const;
+  must(storeCodexQuota(w.dir, [sample], BASE_DEPS));
+  const next = must(storeCodexQuota(w.dir, [{ ...sample, reached: true }], BASE_DEPS));
+  assert.deepEqual(next, { appended: 0, skipped: 1, full: 0, latestWritten: true });
+  must(recordStatuslineQuota(w.dir, quotaOf(rawPoint(10, FIVE_RESET_MS), null), NOW, BASE_DEPS));
+  assert.deepEqual(readCodexLatest(w.dir, NOW, BASE_DEPS), [
+    { ...sample, src: "rollouts", reached: true },
+  ]);
+});
+
+test("codex latest: a newer app-server reading replaces an older rollout, but an older reply does not", (t) => {
+  const w = makeWorld(t);
+  const log = { window: "week", at: NOW - MINUTE_MS, usedPercent: 60, resetsAt: WEEK_RESET_MS, reached: false } as const;
+  const reply = { ...log, at: NOW, usedPercent: 30, resetsAt: WEEK_RESET_MS - HOUR_MS, reached: true };
+  must(storeCodexQuota(w.dir, [log], BASE_DEPS));
+  const store = (sample: typeof reply) => must(storeAppServerReading(w.dir, [sample], BASE_DEPS));
+  assert.equal(store({ ...reply, at: log.at - 1 }).latestWritten, false);
+  assert.deepEqual(store(reply), { appended: 0, skipped: 1, full: 0, latestWritten: true });
+  assert.equal(modeOf(join(w.dir, QUOTA_LATEST_FILE)), 0o600);
+  assert.equal(modeOf(join(w.dir, quotaMonthFile(NOW))), 0o600);
+  must(recordStatuslineQuota(w.dir, quotaOf(rawPoint(10, FIVE_RESET_MS), null), NOW, BASE_DEPS));
+  assert.deepEqual(readCodexLatest(w.dir, NOW, BASE_DEPS), [{ ...reply, src: "appserver" }]);
+});
+
+test("codex latest: app-server wins at equal times, and only a later rollout candidate can replace it", (t) => {
+  const w = makeWorld(t);
+  const log = { window: "week", at: NOW, usedPercent: 60, resetsAt: WEEK_RESET_MS, reached: false } as const;
+  const reply = { ...log, usedPercent: 100, reached: true };
+  must(storeCodexQuota(w.dir, [log], BASE_DEPS));
+  const stored = must(storeAppServerReading(w.dir, [reply], BASE_DEPS));
+  assert.deepEqual(stored, { appended: 1, skipped: 0, full: 0, latestWritten: true });
+  const copy = { ...log, at: NOW + MINUTE_MS, usedPercent: 50 };
+  assert.equal(must(storeCodexQuota(w.dir, [copy, log], BASE_DEPS)).latestWritten, false);
+  assert.deepEqual(readCodexLatest(w.dir, NOW, BASE_DEPS), [{ ...reply, src: "appserver" }]);
+  const later = { ...log, at: copy.at, usedPercent: 70 };
+  assert.equal(must(storeCodexQuota(w.dir, [later], BASE_DEPS)).latestWritten, true);
+  assert.deepEqual(readCodexLatest(w.dir, later.at, BASE_DEPS), [{ ...later, src: "rollouts" }]);
+});
+
+for (const [source, store] of [["appserver", storeAppServerReading], ["rollouts", storeCodexQuota]] as const) {
+  test(`codex latest: ${source} replaces a reading from before a one-day clock rollback`, (t) => {
+    const { dir } = makeWorld(t);
+    const sample = { window: "week", at: NOW, usedPercent: 40, resetsAt: WEEK_RESET_MS, reached: false } as const;
+    const future = { ...sample, at: NOW + DAY_MS, usedPercent: 60 };
+    const seed = source === "appserver" ? storeCodexQuota : storeAppServerReading;
+    must(seed(dir, [future], { ...BASE_DEPS, nowMs: () => future.at }));
+    assert.deepEqual(readCodexLatest(dir, NOW, BASE_DEPS), []);
+    assert.equal(must(store(dir, [sample], { ...BASE_DEPS, nowMs: () => NOW })).latestWritten, true);
+    assert.deepEqual(readCodexLatest(dir, NOW, BASE_DEPS), [{ ...sample, src: source }]);
+  });
+}
+
+for (const first of ["record", "rollouts", "appserver"] as const) {
+  test(`codex latest: a ${first} write preserves both sections when another writer overlaps`, (t) => {
+    const { dir } = makeWorld(t);
+    const claude = quotaOf(rawPoint(10, FIVE_RESET_MS), null);
+    const sample = { window: "week", at: NOW, usedPercent: 40, resetsAt: WEEK_RESET_MS, reached: false } as const;
+    const record = (deps: FsDeps) => must(recordStatuslineQuota(dir, claude, NOW, deps));
+    const store = first === "rollouts" ? storeCodexQuota : storeAppServerReading;
+    const codex = (deps: FsDeps) => must(store(dir, [sample], deps));
+    const [write, overlap] = first === "record" ? [record, codex] : [codex, record];
+    const attempts: boolean[] = [];
+    const overlappingDeps = { ...BASE_DEPS, suffix: () => {
+      // Start the other writer after this writer has read its snapshot, before rename.
+      attempts.push(overlap(BASE_DEPS).latestWritten);
+      return BASE_DEPS.suffix();
+    } };
+    assert.equal(write(overlappingDeps).latestWritten, true);
+    assert.deepEqual(attempts, [false], "the other writer must not report a write that the first writer overwrites");
+    assert.equal(overlap(BASE_DEPS).latestWritten, true);
+    assert.deepEqual(readObservations(dir, NOW, BASE_DEPS).map(({ provider, usedPercent }) => [provider, usedPercent]),
+      [["claude", 10], ["codex", 40]]);
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Record in process (streams)

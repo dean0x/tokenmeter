@@ -5,6 +5,7 @@
 import { randomBytes } from "node:crypto";
 import {
   type Stats,
+  accessSync,
   closeSync,
   constants,
   fchmodSync,
@@ -62,6 +63,7 @@ const GROUP_WORLD_WRITE = 0o022;
 const GROUP_WORLD_BITS = 0o077;
 const STICKY_BIT = 0o1000;
 const APP_DIR = "tokenmeter";
+const MAX_DATA_DIR_ANCESTORS = 256;
 const SUFFIX_BYTES = 6;
 const TOKEN_BYTES = 8;
 const TOKEN_MAX_CHARS = 64;
@@ -240,10 +242,11 @@ export function resolveDataDirPath(input: DataDirInput): string {
 function parentIsSafe(parent: string): Result<null, FsError> {
   const stat = attemptFs(() => statSync(parent));
   if (!stat.ok) return err({ code: "data_dir_unsafe", sys: stat.error.sys });
-  const { mode } = stat.value;
-  const writable = (mode & GROUP_WORLD_WRITE) !== 0;
-  const sticky = (mode & STICKY_BIT) !== 0;
-  return writable && !sticky ? err({ code: "data_dir_unsafe", sys: null }) : ok(null);
+  return parentModeIsSafe(stat.value.mode) ? ok(null) : err({ code: "data_dir_unsafe", sys: null });
+}
+
+function parentModeIsSafe(mode: number): boolean {
+  return (mode & GROUP_WORLD_WRITE) === 0 || (mode & STICKY_BIT) !== 0;
 }
 
 // Creates the folder (parents and leaf 0700), checks the parent, and checks the
@@ -264,7 +267,10 @@ export function prepareDataDir(path: string, deps: FsDeps = defaultDeps()): Resu
     }
   });
   if (!leaf.ok) return leaf;
+  return checkDataDir(target, deps);
+}
 
+function checkDataDir(target: string, deps: FsDeps): Result<string, FsError> {
   const unsafe = (sys: string | null): Result<string, FsError> => err({ code: "data_dir_unsafe", sys });
   const opened = attemptFs(() => openSync(target, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW));
   if (!opened.ok) return unsafe(opened.error.sys);
@@ -279,12 +285,40 @@ export function prepareDataDir(path: string, deps: FsDeps = defaultDeps()): Resu
   return ok(target);
 }
 
-// The folder of a command that only reads. A folder that is not there gives
-// not_found and is never made. Any other folder is checked as prepareDataDir does.
+// A read-only command never creates the data folder.
 export function existingDataDir(path: string, deps: FsDeps = defaultDeps()): Result<string, FsError> {
-  const found = lstatEntry(path);
-  if (!found.ok && found.error.code === "not_found") return err(found.error);
-  return prepareDataDir(path, deps);
+  if (!isValidDirPath(path)) return err(BAD_INPUT);
+  const target = resolve(path);
+  const found = lstatEntry(target);
+  if (!found.ok && found.error.code === "not_found") return found;
+  const parent = parentIsSafe(dirname(target));
+  return parent.ok ? checkDataDir(target, deps) : parent;
+}
+
+function canWriteIn(path: string): boolean {
+  return attemptFs(() => accessSync(path, constants.W_OK | constants.X_OK)).ok;
+}
+
+// Check write access without creating the data folder. The caller checks an existing folder first.
+export function dataDirWritable(path: string, exists: boolean): boolean {
+  if (!isValidDirPath(path)) return false;
+  if (exists) return canWriteIn(path);
+
+  let parent = dirname(path);
+  for (let depth = 0; depth < MAX_DATA_DIR_ANCESTORS; depth += 1) {
+    const entry = lstatEntry(parent);
+    if (entry.ok) {
+      const info = entry.value.isSymbolicLink() ? attemptFs(() => statSync(parent)) : entry;
+      // If the direct parent does not exist, the refresher creates it at 0700.
+      return info.ok && info.value.isDirectory() && (depth !== 0 || parentModeIsSafe(info.value.mode))
+        && canWriteIn(parent);
+    }
+    if (entry.error.sys !== "ENOENT") return false;
+    const next = dirname(parent);
+    if (next === parent) return false;
+    parent = next;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +336,9 @@ export interface OpenedFile {
 // Opens read-only without following a link and without blocking on a pipe,
 // then checks through the descriptor: a regular file owned by this user.
 // The caller closes the descriptor with closeFd.
-export function openRegularRead(path: string, deps: FsDeps = defaultDeps()): Result<OpenedFile, FsError> {
+export function openRegularRead(
+  path: string, deps: FsDeps = defaultDeps(), privateOnly = false, exactMode?: number,
+): Result<OpenedFile, FsError> {
   if (!isValidDirPath(path)) return err(BAD_INPUT);
   const opened = attemptFs(() => openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK));
   if (!opened.ok) return opened;
@@ -313,7 +349,8 @@ export function openRegularRead(path: string, deps: FsDeps = defaultDeps()): Res
     return stat;
   }
   const info = stat.value;
-  if (!info.isFile() || info.uid !== deps.uid) {
+  const safe = privateOnly ? isOwnPrivateFile(info, deps.uid) : info.isFile() && info.uid === deps.uid;
+  if (!safe || (exactMode !== undefined && (info.mode & 0o7777) !== exactMode)) {
     closeFd(fd);
     return err(UNSAFE_FILE);
   }
@@ -336,9 +373,9 @@ function readAll(fd: number, size: number): Result<Buffer, FsError> {
 }
 
 // Text with invalid UTF-8 replaced. A file over the cap is refused, not cut.
-export function safeRead(path: string, capBytes: number, deps: FsDeps = defaultDeps()): Result<string, FsError> {
+function readText(path: string, capBytes: number, deps: FsDeps, privateOnly: boolean, exactMode?: number): Result<string, FsError> {
   if (!Number.isInteger(capBytes) || capBytes < 0) return err(BAD_INPUT);
-  const opened = openRegularRead(path, deps);
+  const opened = openRegularRead(path, deps, privateOnly, exactMode);
   if (!opened.ok) return opened;
   const { fd, size } = opened.value;
   const body: Result<Buffer, FsError> = size > capBytes ? err({ code: "too_large", sys: null }) : readAll(fd, size);
@@ -347,22 +384,22 @@ export function safeRead(path: string, capBytes: number, deps: FsDeps = defaultD
   return ok(DECODER.decode(body.value));
 }
 
+export function safeRead(path: string, capBytes: number, deps: FsDeps = defaultDeps()): Result<string, FsError> {
+  return readText(path, capBytes, deps, false);
+}
+
 type FileFailure = "missing" | "unsafe" | "too_large";
 
-// The one trust rule for a data file that is read back or appended to: a regular
-// file, not a link (`info` comes from lstat), owned by this user, with no group
-// or world bits.
+// A regular file, owned by this user, with no group or world bits.
+// Use lstat or a no-follow descriptor to reject links.
 export function isOwnPrivateFile(info: Pick<Stats, "isFile" | "uid" | "mode">, uid: number): boolean {
   return info.isFile() && info.uid === uid && (info.mode & GROUP_WORLD_BITS) === 0;
 }
 
-// A file that passes `isOwnPrivateFile`, within the byte cap. Anything else is a
-// failure code, never an error text.
-export function readOwnFile(path: string, capBytes: number, deps: FsDeps): Result<string, FileFailure> {
-  const stat = lstatEntry(path);
-  if (!stat.ok) return err(stat.error.code === "not_found" ? "missing" : "unsafe");
-  if (!isOwnPrivateFile(stat.value, deps.uid)) return err("unsafe");
-  const text = safeRead(path, capBytes, deps);
+// A file that passes `isOwnPrivateFile`, the byte cap and any exact mode check.
+// Anything else is a failure code, never an error text.
+export function readOwnFile(path: string, capBytes: number, deps: FsDeps, exactMode?: number): Result<string, FileFailure> {
+  const text = readText(path, capBytes, deps, true, exactMode);
   if (text.ok) return text;
   if (text.error.code === "too_large") return err("too_large");
   return err(text.error.code === "not_found" ? "missing" : "unsafe");
@@ -455,6 +492,14 @@ export function writeAtomic(path: string, text: string, deps: FsDeps = defaultDe
   const renamed = renameFile(staged.value, path);
   if (!renamed.ok) removeQuiet(staged.value);
   return renamed;
+}
+
+// Replace only a missing or private file in the caller's checked data folder.
+export function writeOwnFile(path: string, text: string, deps: FsDeps): Result<null, FsError> {
+  const stat = lstatEntry(path);
+  if (stat.ok && !isOwnPrivateFile(stat.value, deps.uid)) return err(UNSAFE_FILE);
+  if (!stat.ok && stat.error.sys !== "ENOENT") return stat;
+  return writeAtomic(path, text, deps);
 }
 
 // Makes the renames and removals in a folder durable. A file system that cannot
@@ -569,7 +614,7 @@ function parseLockBody(text: string): LockBody | null {
 
 // A body over the cap reads as empty, so the file time decides.
 function readLockFile(path: string, deps: FsDeps): Result<LockRead, FsError> {
-  const opened = openRegularRead(path, deps);
+  const opened = openRegularRead(path, deps, true);
   if (!opened.ok) return opened;
   const { fd, size, mtimeMs } = opened.value;
   const body: Result<Buffer, FsError> = size > LOCK_BODY_CAP_BYTES ? ok(Buffer.alloc(0)) : readAll(fd, size);
@@ -610,6 +655,12 @@ function judgeLock(path: string, deps: FsDeps): Result<LockVerdict, FsError> {
   if (deps.nowMs() - startedAt >= LOCK_STALE_MS) return ok(stale);
   if (body !== null && !deps.isAlive(body.pid)) return ok(stale);
   return ok({ kind: "held" });
+}
+
+// A read-only check. Only acquireLock can claim an available lock.
+export function lockAvailable(path: string, deps: FsDeps): boolean {
+  const verdict = judgeLock(path, deps);
+  return verdict.ok && verdict.value.kind !== "held";
 }
 
 // Removes the lock only if it still holds the content judged stale. A small

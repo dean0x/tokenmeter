@@ -24,6 +24,10 @@ export interface LineOptions {
   // A line is delivered only if it holds at least one of these substrings.
   // Omitted or empty means every line passes. The test runs on bytes, before any decode.
   readonly prefilter?: readonly string[];
+  // A tail offset need not be on a line boundary. Drop the first fragment.
+  readonly discardFirstLine?: boolean;
+  // Check the opened descriptor against the file found during discovery.
+  readonly identity?: { readonly dev: number; readonly ino: number };
 }
 
 export interface LineScan {
@@ -108,6 +112,7 @@ function scanOpened(
   let pending: Buffer[] = [];
   let pendingLen = 0;
   let skipping = false;
+  let discardFirst = options.discardFirstLine === true && options.offset > 0;
 
   const maxIterations = Math.max(0, Math.ceil((limit - pos) / CHUNK_BYTES)) + READ_SLACK_ITERATIONS;
   for (let iteration = 0; iteration < maxIterations && pos < limit; iteration += 1) {
@@ -123,7 +128,10 @@ function scanOpened(
     for (let found = 0; found < n; found += 1) {
       const newline = view.indexOf(NEWLINE, start);
       if (newline === -1) break;
-      if (skipping) {
+      if (discardFirst) {
+        discardFirst = false;
+        skipping = false;
+      } else if (skipping) {
         skipping = false;
         counts.skippedLong += 1;
       } else if (pendingLen + (newline - start) > LINE_CAP_BYTES) {
@@ -175,6 +183,10 @@ export function readLines(
   const opened = openRegularRead(path, deps);
   if (!opened.ok) return opened;
   try {
+    const { identity } = options;
+    if (identity !== undefined && (opened.value.dev !== identity.dev || opened.value.ino !== identity.ino)) {
+      return err({ code: "unsafe_file", sys: null });
+    }
     return scanOpened(opened.value, options, onLine);
   } finally {
     closeFd(opened.value.fd);
