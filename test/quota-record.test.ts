@@ -1278,6 +1278,42 @@ test("codex latest: app-server wins at equal times, and only a later rollout can
   assert.deepEqual(readCodexLatest(w.dir, later.at, BASE_DEPS), [{ ...later, src: "rollouts" }]);
 });
 
+for (const [source, store] of [["appserver", storeAppServerReading], ["rollouts", storeCodexQuota]] as const) {
+  test(`codex latest: ${source} replaces a reading from before a one-day clock rollback`, (t) => {
+    const { dir } = makeWorld(t);
+    const sample = { window: "week", at: NOW, usedPercent: 40, resetsAt: WEEK_RESET_MS, reached: false } as const;
+    const future = { ...sample, at: NOW + DAY_MS, usedPercent: 60 };
+    const seed = source === "appserver" ? storeCodexQuota : storeAppServerReading;
+    must(seed(dir, [future], { ...BASE_DEPS, nowMs: () => future.at }));
+    assert.deepEqual(readCodexLatest(dir, NOW, BASE_DEPS), []);
+    assert.equal(must(store(dir, [sample], { ...BASE_DEPS, nowMs: () => NOW })).latestWritten, true);
+    assert.deepEqual(readCodexLatest(dir, NOW, BASE_DEPS), [{ ...sample, src: source }]);
+  });
+}
+
+for (const first of ["record", "rollouts", "appserver"] as const) {
+  test(`codex latest: a ${first} write preserves both sections when another writer overlaps`, (t) => {
+    const { dir } = makeWorld(t);
+    const claude = quotaOf(rawPoint(10, FIVE_RESET_MS), null);
+    const sample = { window: "week", at: NOW, usedPercent: 40, resetsAt: WEEK_RESET_MS, reached: false } as const;
+    const record = (deps: FsDeps) => must(recordStatuslineQuota(dir, claude, NOW, deps));
+    const store = first === "rollouts" ? storeCodexQuota : storeAppServerReading;
+    const codex = (deps: FsDeps) => must(store(dir, [sample], deps));
+    const [write, overlap] = first === "record" ? [record, codex] : [codex, record];
+    const attempts: boolean[] = [];
+    const overlappingDeps = { ...BASE_DEPS, suffix: () => {
+      // Start the other writer after this writer has read its snapshot, before rename.
+      attempts.push(overlap(BASE_DEPS).latestWritten);
+      return BASE_DEPS.suffix();
+    } };
+    assert.equal(write(overlappingDeps).latestWritten, true);
+    assert.deepEqual(attempts, [false], "the other writer must not report a write that the first writer overwrites");
+    assert.equal(overlap(BASE_DEPS).latestWritten, true);
+    assert.deepEqual(readObservations(dir, NOW, BASE_DEPS).map(({ provider, usedPercent }) => [provider, usedPercent]),
+      [["claude", 10], ["codex", 40]]);
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Record in process (streams)
 // ---------------------------------------------------------------------------

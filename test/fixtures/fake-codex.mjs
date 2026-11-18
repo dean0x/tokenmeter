@@ -38,6 +38,7 @@ function version(mode) {
 }
 
 function rpc() {
+  appendFileSync("app-server-calls", "1\n");
   const replies = JSON.parse(readFileSync("rpc-replies.json", "utf8"));
   writeFileSync("rpc-input", "");
   writeFileSync("rpc-pid", String(process.pid));

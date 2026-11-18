@@ -111,6 +111,42 @@ test("the state round-trips codexFound and the outcome at mode 0600", (t) => {
   assert.equal(statSync(box.path("data", "refresh-state.json")).mode & 0o777, 0o600);
 });
 
+test("both gates reopen after the clock moves back a day", (t) => {
+  const { dir } = setup(t);
+  enableAppServer(dir);
+  const deps = depsAt(AT);
+  const saved = state({ lastAttemptAt: AT + DAY, nextRefreshAt: AT + DAY + MINUTE,
+    nextAppServerAt: AT + 2 * DAY, outcome: "shape" });
+  assert.equal(writeRefreshState(dir, saved, deps).ok, true);
+  const prior = readRefreshState(dir, deps);
+  assert.ok(prior.ok);
+  assert.equal(refreshGate(dir, null, prior, NO_BINARY_CHECK, deps), true);
+  assert.equal(appServerGate(dir, prior.value, KEY, deps), "open");
+  assert.equal(prior.value, null);
+});
+
+test("each deadline has an upper bound, and a valid 24-hour backoff stays in force", (t) => {
+  const { dir } = setup(t);
+  enableAppServer(dir);
+  const deps = depsAt(AT);
+  const saved = state({ nextAppServerAt: AT + DAY, outcome: "shape" });
+  assert.equal(writeRefreshState(dir, saved, deps).ok, true);
+  assert.deepEqual(readRefreshState(dir, deps), ok(saved));
+  assert.equal(appServerGate(dir, saved, KEY, deps), "backoff");
+
+  for (const beyond of [{ lastAttemptAt: AT + MINUTE + 1 }, { nextRefreshAt: AT + MINUTE + 1 },
+    { nextAppServerAt: AT + DAY + 1 }]) {
+    assert.equal(writeRefreshState(dir, { ...saved, ...beyond }, deps).ok, true);
+    assert.deepEqual(readRefreshState(dir, deps), ok(null));
+  }
+});
+
+test("a reading past the clock slack does not hold the refresh gate closed", (t) => {
+  const { dir } = setup(t);
+  assert.equal(refreshGate(dir, AT + MINUTE, ok(null), NO_BINARY_CHECK, depsAt(AT)), false);
+  assert.equal(refreshGate(dir, AT + DAY, ok(null), NO_BINARY_CHECK, depsAt(AT)), true);
+});
+
 test("a malformed private state opens the refresh gate when the reading is absent or stale", (t) => {
   const { box, dir } = setup(t);
   const deps = depsAt(AT + MINUTE);

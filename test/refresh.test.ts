@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
@@ -66,13 +66,15 @@ function runBin(env: NodeJS.ProcessEnv, arg = "refresh", t?: TestContext) {
   return { child, done };
 }
 
-function state(box: Sandbox) {
-  const stored = readRefreshState(box.dataDir);
+const depsAt = (now: number) => ({ ...defaultDeps(), nowMs: () => now });
+
+function state(box: Sandbox, now = Date.now()) {
+  const stored = readRefreshState(box.dataDir, depsAt(now));
   return stored.ok ? stored.value : null;
 }
 
 async function pass(box: Sandbox, env: NodeJS.ProcessEnv, now = NOW) {
-  const result = await refresh(box.dataDir, { homeDir: box.home, env }, { ...defaultDeps(), nowMs: () => now });
+  const result = await refresh(box.dataDir, { homeDir: box.home, env }, depsAt(now));
   assert.ok(result.ok);
 }
 
@@ -117,10 +119,11 @@ test("off prevents all Codex starts from refresh and collect but admits a rollou
   assert.ok(writeAppServerSetting(box.dataDir, "off").ok);
   await pass(box, env);
   rollout(box, NOW + 1, 32);
-  await pass(box, env, NOW + REFRESH_INTERVAL_MS);
-  const data = readCodexLatest(box.dataDir, NOW + REFRESH_INTERVAL_MS);
+  const next = NOW + REFRESH_INTERVAL_MS;
+  await pass(box, env, next);
+  const data = readCodexLatest(box.dataDir, next);
   assert.deepEqual(data.map(({ usedPercent, at, src }) => [usedPercent, at, src]), [[32, NOW + 1, "rollouts"]]);
-  assert.equal(state(box)?.outcome, "off");
+  assert.equal(state(box, next)?.outcome, "off");
   assert.equal((await runBin(env, "collect", t).done).code, 0);
   assert.equal(existsSync(join(box.dataDir, "version-calls")), false);
 });
@@ -142,10 +145,11 @@ test("the rollout read continues while sign-in backoff prevents a Codex start", 
   assert.equal(auth?.outcome, "auth");
   assert.equal(auth?.nextAppServerAt, NOW + 15 * REFRESH_INTERVAL_MS);
   rollout(box, NOW, 43);
-  await pass(box, env, NOW + REFRESH_INTERVAL_MS);
-  assert.equal(readCodexLatest(box.dataDir, NOW)[0]?.usedPercent, 43);
-  assert.equal(state(box)?.nextAppServerAt, auth?.nextAppServerAt);
-  assert.equal(readFileSync(join(box.dataDir, "rpc-input"), "utf8").split("account/rateLimits/read").length - 1, 1);
+  const next = NOW + REFRESH_INTERVAL_MS;
+  await pass(box, env, next);
+  assert.equal(readCodexLatest(box.dataDir, next)[0]?.usedPercent, 43);
+  assert.equal(state(box, next)?.nextAppServerAt, auth?.nextAppServerAt);
+  assert.equal(readFileSync(join(box.dataDir, "app-server-calls"), "utf8"), "1\n");
 });
 
 test("a new refresher reuses the version result for the same binary", posix, async (t) => {
@@ -176,11 +180,13 @@ test("the off switch replaces a long backoff with the normal wait", posix, async
   replies(box, { error: { code: -32600 } });
   await pass(box, env);
   assert.ok(writeAppServerSetting(box.dataDir, "off").ok);
-  await pass(box, env, NOW + REFRESH_INTERVAL_MS);
-  assert.equal(state(box)?.outcome, "off");
+  const next = NOW + REFRESH_INTERVAL_MS;
+  await pass(box, env, next);
+  assert.equal(state(box, next)?.outcome, "off");
   assert.ok(writeAppServerSetting(box.dataDir, "on").ok);
-  await pass(box, env, NOW + 2 * REFRESH_INTERVAL_MS);
-  assert.equal(state(box)?.outcome, "auth");
+  const later = next + REFRESH_INTERVAL_MS;
+  await pass(box, env, later);
+  assert.equal(state(box, later)?.outcome, "auth");
 });
 
 test("two refreshes produce one app-server call and a fresh reading stops a new attempt", posix, async (t) => {
@@ -194,7 +200,7 @@ test("two refreshes produce one app-server call and a fresh reading stops a new 
   assert.ok(previous);
   assert.equal(previous.outcome, "ok");
   assert.equal(readCodexLatest(box.dataDir, Date.now())[0]?.src, "appserver");
-  assert.equal(readFileSync(join(box.dataDir, "version-calls"), "utf8"), "1\n");
+  assert.equal(readFileSync(join(box.dataDir, "app-server-calls"), "utf8"), "1\n");
   assert.ok(writeRefreshState(box.dataDir, { ...previous, nextRefreshAt: 0, nextAppServerAt: 0 }).ok);
   assertQuiet(await runBin(env, "refresh", t).done);
   assert.equal(state(box)?.nextRefreshAt, 0);
@@ -210,10 +216,13 @@ test("stores the rollout before a hung Codex times out and kills the Codex proce
   const attempt = state(box);
   assert.ok(attempt && attempt.nextAppServerAt >= attempt.lastAttemptAt + REFRESH_INTERVAL_MS);
   assertQuiet(await run.done);
-  assert.equal(state(box)?.outcome, "timeout");
+  const timedOut = state(box);
+  assert.ok(timedOut && timedOut.outcome === "timeout");
   assert.equal(defaultDeps().isAlive(pid), false);
-  assertQuiet(await runBin(env, "refresh", t).done);
-  assert.equal(readFileSync(join(box.dataDir, "version-calls"), "utf8"), "1\n");
+  const early = timedOut.lastAttemptAt + REFRESH_INTERVAL_MS - 1;
+  await pass(box, env, early);
+  assert.equal(readFileSync(join(box.dataDir, "app-server-calls"), "utf8"), "1\n");
+  assert.deepEqual(state(box, early), timedOut);
 });
 
 async function waitForServer(box: Sandbox): Promise<number> {
@@ -244,10 +253,21 @@ test("refresh leaves an absent token store absent and preserves the pending back
   const { box, env } = setup(t);
   const pendingDays = '{"version":1,"backfilled":false,"cutThrough":null,"days":{}}\n';
   const files = ["days.json", "ledger.json", "store.json", "collect.lock"];
-  for (const file of files) writeFileSync(join(box.dataDir, file), pendingDays, { mode: 0o600 });
+  const metadata = (file: string) => {
+    const { ino, mtimeMs } = statSync(join(box.dataDir, file));
+    return { ino, mtimeMs };
+  };
+  const initialTime = new Date("2020-01-01T00:00:00Z");
+  for (const file of files) {
+    const path = join(box.dataDir, file);
+    writeFileSync(path, pendingDays, { mode: 0o600 });
+    utimesSync(path, initialTime, initialTime);
+  }
+  const before = files.map(metadata);
   await pass(box, env);
   assert.equal(state(box)?.outcome, "missing");
   for (const file of files) assert.equal(readFileSync(join(box.dataDir, file), "utf8"), pendingDays);
+  assert.deepEqual(files.map(metadata), before);
 
   const empty = setup(t);
   rollout(empty.box, NOW, 18);

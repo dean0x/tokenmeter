@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import type { AppServerError } from "./appserver.ts";
 import { readAppServerSetting } from "./config.ts";
-import { asRow, err, ok, parseJson, type Result } from "./core.ts";
+import { FUTURE_SLACK_MS, asRow, err, ok, parseJson, type Result } from "./core.ts";
 import {
   acquireLock, defaultDeps, lockAvailable, readOwnFile, writeOwnFile,
   type FsDeps, type FsError, type Lock,
@@ -12,6 +12,7 @@ const REFRESH_LOCK_FILE = "refresh.lock";
 const STATE_CAP_BYTES = 4 * 1024;
 const BIN_KEY = /^[a-f0-9]{64}$/;
 export const REFRESH_INTERVAL_MS = 60_000;
+const MAX_BACKOFF_MS = 24 * 60 * REFRESH_INTERVAL_MS;
 export type RefreshOutcome = AppServerError | "ok" | "off";
 
 const BACKOFF_MS: Readonly<Record<RefreshOutcome, number>> = {
@@ -21,8 +22,8 @@ const BACKOFF_MS: Readonly<Record<RefreshOutcome, number>> = {
   error: REFRESH_INTERVAL_MS,
   missing: 10 * REFRESH_INTERVAL_MS,
   auth: 15 * REFRESH_INTERVAL_MS,
-  old: 24 * 60 * REFRESH_INTERVAL_MS,
-  shape: 24 * 60 * REFRESH_INTERVAL_MS,
+  old: MAX_BACKOFF_MS,
+  shape: MAX_BACKOFF_MS,
 };
 
 export interface RefreshState {
@@ -56,6 +57,9 @@ export function readRefreshState(dataDir: string, deps: FsDeps = defaultDeps()):
     || (binKey !== null && (typeof binKey !== "string" || !BIN_KEY.test(binKey))) || typeof codexFound !== "boolean") {
     return ok(null);
   }
+  const now = deps.nowMs();
+  if (lastAttemptAt > now + FUTURE_SLACK_MS || nextRefreshAt > now + REFRESH_INTERVAL_MS
+    || nextAppServerAt > now + MAX_BACKOFF_MS) return ok(null);
   return ok({ lastAttemptAt, nextRefreshAt, nextAppServerAt, outcome, binKey, codexFound });
 }
 
@@ -85,7 +89,7 @@ function binaryRetryDue(state: RefreshState, now: number, resolveKey: () => stri
 
 // Reuse this check under the lock with a fresh state read and before any state write.
 export function refreshDue(readingAt: number | null, state: RefreshState | null, now: number, resolveBinKey: () => string | null): boolean {
-  if (readingAt !== null && now - readingAt < REFRESH_INTERVAL_MS) return false;
+  if (readingAt !== null && readingAt <= now + FUTURE_SLACK_MS && now - readingAt < REFRESH_INTERVAL_MS) return false;
   if (state === null) return true;
   return now >= state.nextRefreshAt || binaryRetryDue(state, now, resolveBinKey);
 }

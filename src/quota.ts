@@ -48,10 +48,12 @@ import {
 import {
   type FsDeps,
   type FsError,
+  acquireLock,
   appendLine,
   defaultDeps,
   lstatEntry,
   readOwnFile,
+  releaseLock,
   writeAtomic,
 } from "./fsafe.ts";
 import type { CodexQuotaSample, QuotaWindow } from "./sources.ts";
@@ -63,6 +65,7 @@ import type { CodexQuotaSample, QuotaWindow } from "./sources.ts";
 const KIB = 1024;
 
 export const QUOTA_LATEST_FILE = "quota-latest.json";
+const QUOTA_LATEST_LOCK = "quota-latest.lock";
 export const QUOTA_LATEST_REFRESH_MS = 60_000;
 export const QUOTA_LATEST_CAP_BYTES = 4 * KIB;
 export const QUOTA_MONTH_CAP_BYTES = KIB * KIB;
@@ -450,6 +453,20 @@ function valuesOf(section: StoredSection): LatestSection {
   return { five_hour: value(section.five_hour), week: value(section.week) };
 }
 
+// All writers use the same lock. A busy lock skips the update without a wait.
+function withLatestLock<T>(
+  dataDir: string, deps: FsDeps, skipped: T, update: (stored: StoredFile) => Result<T, FsError>,
+): Result<T, FsError> {
+  const lock = acquireLock(join(dataDir, QUOTA_LATEST_LOCK), deps);
+  if (!lock.ok) return lock.error.code === "lock_held" ? ok(skipped) : lock;
+  try {
+    const stored = loadStored(dataDir, deps);
+    return update(stored.ok ? stored.value : { claude: EMPTY_STORED, codex: EMPTY_STORED });
+  } finally {
+    releaseLock(lock.value, deps);
+  }
+}
+
 // Writes the whole latest file. The Codex section is left out while it holds nothing,
 // so a folder that only record writes keeps the file it always had.
 function writeLatest(dataDir: string, claude: LatestSection, codex: LatestSection, deps: FsDeps): Result<null, FsError> {
@@ -498,27 +515,25 @@ export function recordStatuslineQuota(
   nowMs: number,
   deps: FsDeps = defaultDeps(),
 ): Result<QuotaWriteReport, FsError> {
-  const stored = loadStored(dataDir, deps);
-  const before = valuesOf(stored.ok ? stored.value.claude : EMPTY_STORED);
+  const skipped = { appended: 0, skipped: 0, full: 0, latestWritten: false };
+  return withLatestLock(dataDir, deps, skipped, (stored) => {
+    const before = valuesOf(stored.claude);
+    const fresh: QuotaSample[] = [];
+    const next: LatestSection = { five_hour: null, week: null };
+    let write = false;
+    for (const window of QUOTA_WINDOWS) {
+      const plan = planWindow(quota[window], before[window], nowMs);
+      next[window] = plan.next;
+      if (plan.sample !== null) fresh.push({ provider: "claude", window, at: nowMs, ...plan.sample });
+      if (plan.write) write = true;
+    }
 
-  const fresh: QuotaSample[] = [];
-  const next: Record<QuotaWindow, StoredValue | null> = { five_hour: null, week: null };
-  let write = false;
-  for (const window of QUOTA_WINDOWS) {
-    const plan = planWindow(quota[window], before[window], nowMs);
-    next[window] = plan.next;
-    if (plan.sample !== null) fresh.push({ provider: "claude", window, at: nowMs, ...plan.sample });
-    if (plan.write) write = true;
-  }
-
-  const appended = appendSamples(dataDir, fresh, deps);
-  let latest: Result<null, FsError> = ok(null);
-  if (write) {
-    latest = writeLatest(dataDir, next, valuesOf(stored.ok ? stored.value.codex : EMPTY_STORED), deps);
-  }
-  if (!appended.ok) return appended;
-  if (!latest.ok) return latest;
-  return ok({ appended: appended.value.appended, skipped: 0, full: appended.value.full, latestWritten: write });
+    const appended = appendSamples(dataDir, fresh, deps);
+    const latest = write ? writeLatest(dataDir, next, valuesOf(stored.codex), deps) : ok(null);
+    if (!appended.ok) return appended;
+    if (!latest.ok) return latest;
+    return ok({ appended: appended.value.appended, skipped: 0, full: appended.value.full, latestWritten: write });
+  });
 }
 
 // A sample without its time: the same provider, window, percent and reset time
@@ -542,7 +557,8 @@ function storedKeys(path: string, deps: FsDeps): Set<string> {
 
 // Compare sources by time. The app-server wins a tie. Only two rollout points
 // use the reset and percent rule, which keeps restamped child copies in order.
-function replacesCodexPoint(old: StoredPoint, next: StoredPoint): boolean {
+function replacesCodexPoint(old: StoredPoint, next: StoredPoint, nowMs: number): boolean {
+  if (old.at > nowMs + FUTURE_SLACK_MS) return true;
   if (next.src === "appserver") return next.at >= old.at;
   if (old.src === "appserver") return next.at > old.at;
   return !beats(old, next);
@@ -553,6 +569,7 @@ function latestCodexPoint(
   old: StoredValue | null,
   samples: readonly RolloutQuotaSample[],
   src: CodexSource,
+  nowMs: number,
 ): StoredPoint | null {
   let best: RolloutQuotaSample | null = null;
   for (const sample of samples) {
@@ -563,7 +580,7 @@ function latestCodexPoint(
   const { usedPercent, resetsAt, at, reached = false } = best;
   const next = { usedPercent, resetsAt, at, src, reached };
   if (old !== null && !isStoredReason(old) && checkQuotaPoint(old.usedPercent, old.resetsAt, old.at).ok) {
-    if (!replacesCodexPoint(old, next)) return null;
+    if (!replacesCodexPoint(old, next, nowMs)) return null;
   }
   return next;
 }
@@ -581,19 +598,22 @@ function refreshCodexLatest(
   src: CodexSource,
   deps: FsDeps,
 ): Result<boolean, FsError> {
-  const stored = loadStored(dataDir, deps);
-  const old = valuesOf(stored.ok ? stored.value.codex : EMPTY_STORED);
-  const next: LatestSection = { five_hour: old.five_hour, week: old.week };
-  let write = false;
-  for (const window of QUOTA_WINDOWS) {
-    const point = latestCodexPoint(window, old[window], samples, src);
-    if (point === null || samePoint(old[window], point)) continue;
-    next[window] = point;
-    write = true;
-  }
-  if (!write) return ok(false);
-  const written = writeLatest(dataDir, valuesOf(stored.ok ? stored.value.claude : EMPTY_STORED), next, deps);
-  return written.ok ? ok(true) : written;
+  if (samples.length === 0) return ok(false);
+  return withLatestLock(dataDir, deps, false, (stored) => {
+    const nowMs = deps.nowMs();
+    const old = valuesOf(stored.codex);
+    const next: LatestSection = { five_hour: old.five_hour, week: old.week };
+    let write = false;
+    for (const window of QUOTA_WINDOWS) {
+      const point = latestCodexPoint(window, old[window], samples, src, nowMs);
+      if (point === null || samePoint(old[window], point)) continue;
+      next[window] = point;
+      write = true;
+    }
+    if (!write) return ok(false);
+    const written = writeLatest(dataDir, valuesOf(stored.claude), next, deps);
+    return written.ok ? ok(true) : written;
+  });
 }
 
 // Both sources share the monthly dedupe keys. Repeats can update the latest file
