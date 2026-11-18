@@ -169,7 +169,7 @@ export const DEFAULT_BUDGET: CollectBudget = { bytes: SCAN_BUDGET_BYTES, ms: SCA
 
 const LOCK_FILE = "collect.lock";
 const CLAUDE_PREFILTER: readonly string[] = ['"usage"'];
-const CODEX_PREFILTER: readonly string[] = ["token_count", "session_meta", "turn_context"];
+export const CODEX_PREFILTER: readonly string[] = ["token_count", "session_meta", "turn_context"];
 const MAX_FILES_PER_PASS = 100_000;
 const SUBAGENTS_FOLDER = "subagents";
 const JSONL_SUFFIX = ".jsonl";
@@ -197,6 +197,7 @@ interface WalkClock {
 }
 
 interface Finder {
+  readonly allowFirstFile: boolean;
   readonly horizonMs: number;
   readonly maxEntries: number;
   readonly maxFiles: number;
@@ -243,15 +244,15 @@ function haltWalk(finder: Finder, provider: Provider): void {
   finder.incomplete[provider] = true;
 }
 
-// A folder is listed only while the walk of its provider goes on. The deadline is
-// checked here, between folders, and only once the provider has a file, so that a
-// pass always has a file to read.
+// Collect checks its deadline only after it finds a file for this provider.
+function walkStopped(finder: Finder, provider: Provider): boolean {
+  if (!finder.halted[provider] && (!finder.allowFirstFile || finder.foundBy[provider] > 0)
+    && finder.clock.nowMs() >= finder.clock.deadlineMs) haltWalk(finder, provider);
+  return finder.halted[provider];
+}
+
 function listFolder(finder: Finder, provider: Provider, path: string): readonly string[] {
-  if (finder.halted[provider]) return [];
-  if (finder.foundBy[provider] > 0 && finder.clock.nowMs() >= finder.clock.deadlineMs) {
-    haltWalk(finder, provider);
-    return [];
-  }
+  if (walkStopped(finder, provider)) return [];
   const listing = listDir(path, finder.maxEntries);
   if (!listing.ok) {
     finder.incomplete[provider] = true;
@@ -280,7 +281,7 @@ function enterFolder(finder: Finder, provider: Provider, realRoot: string, path:
 
 // A regular file that is not a link. A link is counted and skipped. At the file
 // cap the walk ends, before it looks at the file.
-function addFile(finder: Finder, provider: Provider, path: string, checkAge: boolean): void {
+function addFile(finder: Finder, provider: Provider, path: string, checkAge: boolean, realRoot?: string): void {
   if (finder.found.length >= finder.maxFiles) {
     haltWalk(finder, provider);
     return;
@@ -296,6 +297,7 @@ function addFile(finder: Finder, provider: Provider, path: string, checkAge: boo
     return;
   }
   if (!stats.isFile() || (checkAge && stats.mtimeMs < finder.horizonMs)) return;
+  if (realRoot !== undefined && !isInside(realRoot, path)) return;
   finder.found.push({ path, provider, size: stats.size, mtimeMs: stats.mtimeMs, dev: stats.dev, ino: stats.ino });
   finder.foundBy[provider] += 1;
 }
@@ -368,18 +370,75 @@ function newestFirst(a: Candidate, b: Candidate): number {
   return a.path < b.path ? -1 : 1;
 }
 
+const CODEX_WALK_LIMITS = { maxDays: 14, maxFilesPerDay: 200, walkMs: 1000 };
+const CODEX_MTIME_AGE_MS = 8 * DAY_MS;
+
+type CodexWalkLimits = Readonly<typeof CODEX_WALK_LIMITS>;
+
+function descendingNames(finder: Finder, path: string, pattern: RegExp): string[] {
+  return listFolder(finder, "codex", path).filter((name) => pattern.test(name)).sort().reverse();
+}
+
+// A rollout folder gives its start day, not its last use. Search the newest day
+// folders by name, then rank the recent files by mtime. Do not floor by day date.
+export function findCodexFiles(
+  root: string,
+  nowMs: number,
+  limits: CodexWalkLimits = CODEX_WALK_LIMITS,
+  deps: FsDeps = defaultDeps(),
+): Result<readonly Candidate[], FsError> {
+  const { maxDays, maxFilesPerDay, walkMs } = limits;
+  if (!Number.isSafeInteger(nowMs) || nowMs < 0
+    || !isCount(maxDays) || maxDays > CODEX_WALK_LIMITS.maxDays
+    || !isCount(maxFilesPerDay) || maxFilesPerDay > CODEX_WALK_LIMITS.maxFilesPerDay
+    || !isCount(walkMs) || walkMs > CODEX_WALK_LIMITS.walkMs) return err({ code: "bad_input", sys: null });
+  const clock = { nowMs: deps.nowMs, deadlineMs: deps.nowMs() + walkMs };
+  const { state, real } = openRoot(root);
+  if (state === "unsafe") return err({ code: "unsafe_file", sys: null });
+  if (real === null || maxDays === 0 || maxFilesPerDay === 0) return ok([]);
+  const finder = makeFinder(nowMs - CODEX_MTIME_AGE_MS, MAX_ENTRIES_PER_FOLDER, maxDays * maxFilesPerDay, clock, false);
+  findCodexByMtime(finder, real, maxDays, maxFilesPerDay);
+  return ok(finder.found.sort(newestFirst));
+}
+
+function findCodexByMtime(finder: Finder, real: string, maxDays: number, maxFilesPerDay: number): void {
+  let days = 0;
+  for (const year of descendingNames(finder, real, FOUR_DIGITS)) {
+    if (walkStopped(finder, "codex")) return;
+    const yearPath = join(real, year);
+    if (!enterFolder(finder, "codex", real, yearPath)) continue;
+    for (const month of descendingNames(finder, yearPath, TWO_DIGITS)) {
+      if (walkStopped(finder, "codex")) return;
+      const monthPath = join(yearPath, month);
+      if (!enterFolder(finder, "codex", real, monthPath)) continue;
+      for (const day of descendingNames(finder, monthPath, TWO_DIGITS)) {
+        if (walkStopped(finder, "codex")) return;
+        const dayPath = join(monthPath, day);
+        if (!enterFolder(finder, "codex", real, dayPath)) continue;
+        days += 1;
+        for (const name of descendingNames(finder, dayPath, CODEX_FILE).slice(0, maxFilesPerDay)) {
+          if (walkStopped(finder, "codex")) return;
+          addFile(finder, "codex", join(dayPath, name), true, real);
+        }
+        if (days >= maxDays) return;
+      }
+    }
+  }
+}
+
 interface Discovery {
   readonly candidates: readonly Candidate[];
   readonly roots: { readonly claude: RootState; readonly codex: RootState };
   readonly finder: Finder;
 }
 
-function discover(input: CollectInput, horizonMs: number, clock: WalkClock): Discovery {
-  const finder: Finder = {
+function makeFinder(horizonMs: number, maxEntries: number, maxFiles: number, clock: WalkClock, allowFirstFile: boolean): Finder {
+  return {
     horizonMs,
-    maxEntries: input.maxEntriesPerFolder ?? MAX_ENTRIES_PER_FOLDER,
-    maxFiles: input.maxFilesPerPass ?? MAX_FILES_PER_PASS,
+    maxEntries,
+    maxFiles,
     clock,
+    allowFirstFile,
     found: [],
     foundBy: { claude: 0, codex: 0 },
     skippedLinks: 0,
@@ -387,6 +446,12 @@ function discover(input: CollectInput, horizonMs: number, clock: WalkClock): Dis
     incomplete: { claude: false, codex: false },
     halted: { claude: false, codex: false },
   };
+}
+
+function discover(input: CollectInput, horizonMs: number, clock: WalkClock): Discovery {
+  const finder = makeFinder(
+    horizonMs, input.maxEntriesPerFolder ?? MAX_ENTRIES_PER_FOLDER, input.maxFilesPerPass ?? MAX_FILES_PER_PASS, clock, true,
+  );
   const claude = openRoot(input.roots.claude);
   const codex = openRoot(input.roots.codex);
   if (claude.real !== null) findClaude(finder, claude.real);
