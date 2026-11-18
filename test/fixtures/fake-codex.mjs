@@ -1,7 +1,8 @@
 // Test-only Codex stand-in. The wrapper never looks up Node on PATH.
 import { spawn } from "node:child_process";
-import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
 const script = fileURLToPath(import.meta.url);
@@ -28,14 +29,30 @@ function descendant() {
 function version(mode) {
   appendFileSync("version-calls", "1\n");
   if (mode === "old") process.stdout.write("codex-cli 0.56.0-alpha.1\n");
+  else if (mode === "rpc-old") process.stdout.write("codex-cli 0.55.0\n");
   else if (mode === "bad") process.stdout.write("unclear 0.165.0\n");
   else process.stdout.write("codex-cli 0.165.0\n");
   if (mode === "large") process.stdout.write("x".repeat(4_096));
   if (mode === "fail") process.exitCode = 1;
 }
 
+function rpc() {
+  const replies = JSON.parse(readFileSync("rpc-replies.json", "utf8"));
+  writeFileSync("rpc-input", "");
+  const input = createInterface({ input: process.stdin });
+  input.on("line", (line) => {
+    appendFileSync("rpc-input", line + "\n");
+    const method = JSON.parse(line).method;
+    if (method === "initialize") process.stdout.write(replies.initialize.join("\n") + "\n");
+    if (method === "account/rateLimits/read" && replies.limits.length > 0) {
+      process.stdout.write(replies.limits.join("\n") + "\n");
+    }
+  });
+}
+
 function main(mode, arg) {
   if (arg === "--version") version(mode);
+  else if (arg === "app-server" && (mode === "rpc" || mode === "rpc-old")) rpc();
   else if (mode === "env") process.stdout.write(JSON.stringify({ env: process.env, cwd: process.cwd() }) + "\n");
   else if (mode === "eof") {
     // In Codex 0.165.0, the wrapper and its only child exit cleanly within 20 ms of EOF.
