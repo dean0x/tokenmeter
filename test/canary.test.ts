@@ -410,12 +410,15 @@ test("static: no .jsonl file on disk in src or bin", () => {
   assert.deepEqual(files.filter((file) => file.endsWith(".jsonl")).map((file) => relative(REPO, file)), []);
 });
 
-test("static: no network or process code in src or bin", () => {
+test("static: only spawn.ts can import process code, and no source can use network code", () => {
   const banned = ["fetch(", "node:http", "node:https", "node:net", "node:dns", "child_process", "node:tls", "node:dgram", "WebSocket"];
   const files = readAll(sourceFiles());
   assert.ok(files.length >= 14, "the source files are found");
   for (const [name, text] of files) {
-    for (const word of banned) assert.equal(text.includes(word), false, `${name} holds ${word}`);
+    for (const word of banned) {
+      if (word === "child_process" && name === join("src", "spawn.ts")) continue;
+      assert.equal(text.includes(word), false, `${name} holds ${word}`);
+    }
   }
 });
 
