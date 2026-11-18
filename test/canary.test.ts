@@ -611,7 +611,7 @@ test("README: it names every command, every error code and the limits of what it
     assert.ok(text.includes(`tokenmeter ${command}`), `the command ${command}`);
   }
   for (const code of ERROR_CODES) assert.ok(text.includes(code), `the error code ${code}`);
-  for (const phrase of ["Node 22.18", "no credentials", "no network", "five_hour", "seven_day", "Opus", "Sonnet", "Claude Desktop", "TOKENMETER_DATA_DIR"]) {
+  for (const phrase of ["Node 22.0", "no credentials", "no network", "five_hour", "seven_day", "Opus", "Sonnet", "Claude Desktop", "TOKENMETER_DATA_DIR"]) {
     assert.ok(text.includes(phrase), phrase);
   }
   // The second use names no program: the status line command is a placeholder.

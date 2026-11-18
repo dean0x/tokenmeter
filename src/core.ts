@@ -44,7 +44,7 @@ export interface ErrorRecord {
 
 // One fixed hint per code. A hint never holds input text.
 const ERROR_HINTS: Readonly<Record<ErrorCode, string>> = {
-  node_too_old: "Node 22.18 or newer is required.",
+  node_too_old: "Node 22.0 or newer is required.",
   usage_error: "The command or a flag is not valid.",
   internal_error: "An internal error occurred.",
   not_installed: "The tokenmeter command was not found.",

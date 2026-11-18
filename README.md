@@ -13,7 +13,7 @@ It can do four things:
 
 ## Install and run
 
-Use Node 22.18 or newer. Install the package at a fixed version:
+Use Node 22.0 or newer. Install the package at a fixed version:
 
 ```sh
 npm install --global @dean0x/tokenmeter@0.1.0
@@ -21,7 +21,7 @@ npm install --global @dean0x/tokenmeter@0.1.0
 
 The examples below use the installed command `tokenmeter`.
 
-From a source checkout, install the development dependencies first.
+From a source checkout, install the development dependencies first. The tests need Node 22.18 or newer.
 Run `npm run build` before you run the command.
 
 ```sh
@@ -116,7 +116,7 @@ It holds no path of a log file, no session id and no text from a session.
 | Estimate log at the cap | ok, `estimate_log_at_cap` above 0 | A month file of the estimate log holds 1 MiB and takes no new line. See the section about the estimate log. |
 | Another `collect` runs, or took the lock over | `lock_held` | Nothing was changed. Try again later. |
 | Bad command, flag or input | `usage_error` | The exit code is 2. |
-| Node older than 22.18 | `node_too_old` | Install a newer Node. |
+| Node older than 22.0 | `node_too_old` | Install a newer Node. |
 | Unexpected failure | `internal_error` | No text of the failure is printed. |
 
 A window of the Claude quota that has no usable value shows a reason code instead:

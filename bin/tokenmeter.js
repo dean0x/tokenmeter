@@ -7,8 +7,8 @@
 // If Node is too old or the import fails, it prints a fixed short line.
 // Other commands check the Node version first. Then dist/cli.js prints one JSON envelope.
 
-const [major = 0, minor = 0] = process.versions.node.split(".").map(Number);
-const nodeOk = major > 22 || (major === 22 && minor >= 18);
+const [major = 0] = process.versions.node.split(".").map(Number);
+const nodeOk = major >= 22;
 
 function failure(code, hint) {
   process.stdout.write(`${JSON.stringify({ schema: "tokenmeter.v1", ok: false, error: { code, hint } })}\n`);
@@ -55,7 +55,7 @@ if (process.argv[2] === "record") {
       () => printLine("tokenmeter: unavailable"),
     );
   } else {
-    printLine("tokenmeter: needs Node 22.18");
+    printLine("tokenmeter: needs Node 22.0");
   }
 } else if (nodeOk) {
   import("../dist/cli.js").then(
@@ -63,5 +63,5 @@ if (process.argv[2] === "record") {
     () => failure("internal_error", "An internal error occurred."),
   );
 } else {
-  failure("node_too_old", "Node 22.18 or newer is required.");
+  failure("node_too_old", "Node 22.0 or newer is required.");
 }
