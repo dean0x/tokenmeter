@@ -264,7 +264,10 @@ export function prepareDataDir(path: string, deps: FsDeps = defaultDeps()): Resu
     }
   });
   if (!leaf.ok) return leaf;
+  return checkDataDir(target, deps);
+}
 
+function checkDataDir(target: string, deps: FsDeps): Result<string, FsError> {
   const unsafe = (sys: string | null): Result<string, FsError> => err({ code: "data_dir_unsafe", sys });
   const opened = attemptFs(() => openSync(target, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW));
   if (!opened.ok) return unsafe(opened.error.sys);
@@ -279,12 +282,14 @@ export function prepareDataDir(path: string, deps: FsDeps = defaultDeps()): Resu
   return ok(target);
 }
 
-// The folder of a command that only reads. A folder that is not there gives
-// not_found and is never made. Any other folder is checked as prepareDataDir does.
+// A read-only command never creates the data folder.
 export function existingDataDir(path: string, deps: FsDeps = defaultDeps()): Result<string, FsError> {
-  const found = lstatEntry(path);
-  if (!found.ok && found.error.code === "not_found") return err(found.error);
-  return prepareDataDir(path, deps);
+  if (!isValidDirPath(path)) return err(BAD_INPUT);
+  const target = resolve(path);
+  const found = lstatEntry(target);
+  if (!found.ok && found.error.code === "not_found") return found;
+  const parent = parentIsSafe(dirname(target));
+  return parent.ok ? checkDataDir(target, deps) : parent;
 }
 
 // ---------------------------------------------------------------------------

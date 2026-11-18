@@ -6,6 +6,7 @@
 // `statusline` imports only dist/statusline.js. It prints one short line and exits 0.
 // If Node is too old or the import fails, it prints a fixed short line.
 // `refresh` does quota work without output and does not open stdin.
+// `hud` reads stored quota and prints one JSON envelope without opening stdin.
 // Other commands check the Node version first. Then dist/cli.js prints one JSON envelope.
 
 const [major = 0] = process.versions.node.split(".").map(Number);
@@ -60,6 +61,11 @@ if (process.argv[2] === "record") {
   }
 } else if (process.argv[2] === "refresh") {
   if (nodeOk) import("../dist/refresh.js").then((module) => module.refreshMain()).catch(() => undefined);
+} else if (nodeOk && process.argv[2] === "hud") {
+  import("../dist/hud.js").then(
+    (hud) => hud.hudMain(import.meta.filename),
+    () => failure("internal_error", "An internal error occurred."),
+  );
 } else if (nodeOk) {
   import("../dist/cli.js").then(
     (cli) => cli.cliMain(),

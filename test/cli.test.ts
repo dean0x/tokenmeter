@@ -176,6 +176,29 @@ test("config rejects invalid keys and values without creating a data folder", as
   assert.equal(existsSync(w.sb.dataDir), false);
 });
 
+test("config reports off for a damaged, group-readable, or linked file", async (t) => {
+  const w = makeWorld(t);
+  mkdirSync(w.sb.dataDir, { mode: 0o700 });
+  const config = join(w.sb.dataDir, "config.json");
+  writeFileSync(config, "{", { mode: 0o600 });
+  const expectOff = async () => {
+    const run = await cli(w, ["config"]);
+    assert.equal(run.code, 0, run.text);
+    assert.deepEqual(run.env.data, { app_server: "off" });
+  };
+  await expectOff();
+  writeFileSync(config, '{"version":1,"app_server":"on"}');
+  chmodSync(config, 0o640);
+  await expectOff();
+  if (process.platform !== "win32") {
+    const other = w.sb.path("other-config.json");
+    writeFileSync(other, '{"version":1,"app_server":"on"}', { mode: 0o600 });
+    fs.unlinkSync(config);
+    symlinkSync(other, config);
+    await expectOff();
+  }
+});
+
 function collectArgs(w: World): string[] {
   return ["collect", "--claude-root", w.claude, "--codex-root", w.codex];
 }

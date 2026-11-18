@@ -97,6 +97,25 @@ function childEnv(searchPath: string, source: NodeJS.ProcessEnv): NodeJS.Process
   return env;
 }
 
+// Submit a refresh without pipes or a reference that keeps the caller alive.
+export function startRefresh(ownBin: string, dataDir: string, source: NodeJS.ProcessEnv): Result<null, "error"> {
+  if (!isAbsolute(ownBin) || !isAbsolute(dataDir)) return err("error");
+  try {
+    const bin = realpathSync.native(ownBin);
+    const searchPath = pathFolders(source["PATH"] ?? "").join(delimiter);
+    const child = spawn(process.execPath, [bin, "refresh"], {
+      shell: false, detached: true, cwd: dataDir, stdio: "ignore",
+      env: { ...childEnv(searchPath, source), TOKENMETER_DATA_DIR: dataDir },
+    });
+    // A child start can fail after submission. Do not report that to the HUD.
+    child.on("error", () => undefined);
+    child.unref();
+    return ok(null);
+  } catch {
+    return err("error");
+  }
+}
+
 function signalGroup(pid: number | undefined, signal: "SIGTERM" | "SIGKILL"): boolean {
   if (pid === undefined || pid <= 0) return false;
   try {
