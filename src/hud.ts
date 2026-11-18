@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { SCHEMA_ID } from "./core.ts";
+import { ok, SCHEMA_ID } from "./core.ts";
 import { defaultDeps, existingDataDir, resolveDataDirPath } from "./fsafe.ts";
 import { readRefreshState, refreshGate } from "./gate.ts";
 import { readCodexLatest, type CodexLatestWindow } from "./quota.ts";
@@ -27,18 +27,19 @@ function readHud(ownBin: string) {
   const deps = defaultDeps();
   const path = resolveDataDirPath({ homeDir: homedir(), env, platform: process.platform, flag: null });
   const dir = existingDataDir(path, deps);
-  // The refresher needs a safe working folder. This command never creates it.
-  if (!dir.ok) return null;
+  if (!dir.ok && dir.error.code !== "not_found") return null;
+  const dataDir = dir.ok ? dir.value : path;
   const now = deps.nowMs();
-  const samples = readCodexLatest(dir.value, now, deps);
+  const samples = dir.ok ? readCodexLatest(dataDir, now, deps) : [];
   let at: number | null = null;
   for (const sample of samples) at = Math.max(at ?? 0, sample.at);
-  const state = readRefreshState(dir.value, deps);
+  const state = dir.ok ? readRefreshState(dataDir, deps) : ok(null);
   const binKey = () => {
     const bin = resolveCodex(env);
     return bin.ok ? bin.value.binKey : null;
   };
-  if (refreshGate(dir.value, at, state, binKey, deps)) startRefresh(ownBin, dir.value, env);
+  // Only the refresher can create the data folder.
+  if (refreshGate(dataDir, at, state, binKey, deps)) startRefresh(ownBin, dataDir, env, dir.ok);
   if (at === null || (state.ok && state.value?.codexFound === false && now - at >= MISSING_MAX_AGE_MS)) return null;
   return codexData(samples, at);
 }

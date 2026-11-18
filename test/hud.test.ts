@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdirSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync, readdirSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { writeAppServerSetting } from "../src/config.ts";
@@ -12,6 +12,7 @@ import { storeAppServerReading, storeCodexQuota } from "../src/quota.ts";
 import { resolveCodex } from "../src/spawn.ts";
 import { writeFakeCodex } from "./fixtures/fake-codex.mjs";
 import { installSuiteGuard, makeSandbox, type Sandbox } from "./helpers.ts";
+import { probeStarts } from "./spawn-probe.ts";
 
 installSuiteGuard();
 const ROOT = resolve(import.meta.dirname, "..");
@@ -19,6 +20,7 @@ const BIN = join(ROOT, "bin", "tokenmeter.js");
 const NOW = Date.now();
 const MINUTE = 60_000;
 const DAY = 24 * 60 * MINUTE;
+const ROLLOUT_RESET = Math.floor((NOW + MINUTE) / 1000);
 const CLOCK = `--import=data:text/javascript,${encodeURIComponent(`Date.now = () => ${NOW};`)}`;
 const POSIX = { skip: process.platform === "win32" };
 const EMPTY = { schema: SCHEMA_ID, ok: true, data: { hud: 1, codex: null } };
@@ -59,9 +61,9 @@ function storeRollout(box: Sandbox, at: number, reached = false): void {
   }]).ok);
 }
 
-function expectedRollout(at: number, limit_reached = false) {
+function expectedRollout(at: number, limit_reached = false, resets_at = at + MINUTE) {
   return { schema: SCHEMA_ID, ok: true, data: { hud: 1, codex: {
-    at, limit_reached, windows: [{ window_minutes: 300, pct: 24, resets_at: at + MINUTE, at, source: "rollouts" }],
+    at, limit_reached, windows: [{ window_minutes: 300, pct: 24, resets_at, at, source: "rollouts" }],
   } } };
 }
 
@@ -79,18 +81,23 @@ function finished(box: Sandbox, outcome: RefreshOutcome): boolean {
   return state.ok && state.value?.outcome === outcome && !existsSync(join(box.dataDir, "refresh.lock"));
 }
 
-test("hud emits an empty envelope and does not create a missing data folder", (t) => {
+test("hud starts one refresher but does not create the missing data folder itself", (t) => {
   const box = makeSandbox(t);
-  assert.deepEqual(runHud(box.env), EMPTY);
+  const { stdout, starts } = probeStarts(box, "hud", { ...box.env, PATH: box.path("bin") });
+  const bin = realpathSync.native(BIN);
+  assert.deepEqual(envelope(stdout), EMPTY);
   assert.equal(existsSync(box.dataDir), false);
+  assert.deepEqual(starts, [["spawn", process.execPath, [bin, "refresh"], dirname(bin), true, "ignore"]]);
 });
 
-test("hud ignores quota files behind a linked data folder", POSIX, (t) => {
+test("hud ignores a linked data folder and starts no refresher", POSIX, (t) => {
   const { box, env } = setup(t);
-  storeRollout(box, NOW);
+  storeRollout(box, NOW - MINUTE);
   const linked = box.path("linked-data");
   symlinkSync(box.dataDir, linked);
-  assert.deepEqual(runHud({ ...env, TOKENMETER_DATA_DIR: linked }), EMPTY);
+  const { stdout, starts } = probeStarts(box, "hud", { ...env, TOKENMETER_DATA_DIR: linked });
+  assert.deepEqual(envelope(stdout), EMPTY);
+  assert.deepEqual(starts, []);
 });
 
 test("hud keeps a nine-minute rollout and drops it at ten minutes when Codex is missing", (t) => {
@@ -149,28 +156,38 @@ test("hud keeps both sources in window order and uses only the newest time for t
   }
 });
 
-test("hud returns stored data and refreshes rollouts without starting Codex when the switch is off", POSIX, async (t) => {
-  const { box, env } = setup(t);
-  const fake = writeFakeCodex(env.PATH, "rpc");
-  assert.equal(resolveCodexPath(env), fake);
-  assert.ok(writeAppServerSetting(box.dataDir, "off").ok);
+function writeRollout(box: Sandbox): void {
   const day = new Date(NOW).toISOString().slice(0, 10).split("-");
   const sessions = join(box.home, ".codex", "sessions", ...day);
   mkdirSync(sessions, { recursive: true });
   writeFileSync(join(sessions, "rollout-test.jsonl"), JSON.stringify({
     timestamp: new Date(NOW).toISOString(), type: "event_msg",
     payload: { type: "token_count", rate_limits: { primary: {
-      used_percent: 24, window_minutes: 300, resets_at: Math.floor((NOW + MINUTE) / 1000),
+      used_percent: 24, window_minutes: 300, resets_at: ROLLOUT_RESET,
     } } },
   }) + "\n");
+}
+
+test("the first detached refresh creates a private data folder and stores the rollout reading", POSIX, async (t) => {
+  const box = makeSandbox(t);
+  const env = { ...box.env, PATH: box.path("bin") };
+  writeRollout(box);
+  assert.deepEqual(runHud(env), EMPTY);
+  await waitFor(() => finished(box, "missing"));
+  assert.equal(statSync(box.dataDir).mode & 0o777, 0o700);
+  assert.deepEqual(runHud(env), expectedRollout(NOW, false, ROLLOUT_RESET * 1000));
+});
+
+test("hud returns stored data and refreshes rollouts without starting Codex when the switch is off", POSIX, async (t) => {
+  const { box, env } = setup(t);
+  const fake = writeFakeCodex(env.PATH, "rpc");
+  assert.equal(resolveCodexPath(env), fake);
+  assert.ok(writeAppServerSetting(box.dataDir, "off").ok);
+  writeRollout(box);
   assert.deepEqual(runHud(env), EMPTY);
   await waitFor(() => finished(box, "off"));
   assert.equal(existsSync(join(box.dataDir, "version-calls")), false);
-  const second = asRow(asRow(runHud(env).data)?.codex);
-  assert.equal(second?.at, NOW);
-  assert.deepEqual(second.windows, [{
-    window_minutes: 300, pct: 24, resets_at: Math.floor((NOW + MINUTE) / 1000) * 1000, at: NOW, source: "rollouts",
-  }]);
+  assert.deepEqual(runHud(env), expectedRollout(NOW, false, ROLLOUT_RESET * 1000));
 });
 
 function resolveCodexPath(env: NodeJS.ProcessEnv): string | null {
@@ -206,7 +223,8 @@ test("hud closes stdout within 300 ms with stdin open and a detached refresh sti
 });
 
 test("doctor, status and hud emit envelopes from the installed tarball", POSIX, (t) => {
-  const box = makeSandbox(t);
+  const { box } = setup(t);
+  deferRefresh(box, "missing", false);
   const env = { ...box.env, npm_config_cache: box.path("npm-cache"), npm_config_offline: "true" };
   const npm = (args: string[], cwd: string): void => {
     const result = spawnSync("npm", args, { cwd, env, encoding: "utf8", timeout: 8_000 });
