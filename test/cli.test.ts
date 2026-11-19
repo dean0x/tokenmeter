@@ -764,8 +764,9 @@ test("periods: the day, the week and the month of the collected rows agree with 
   const run = await cli(w, ["status"], { io: { locale: "en-US" } });
   assert.equal(run.code, 0, run.text);
   const { periods, subscriptions } = run.env.data;
-  assert.deepEqual(Object.keys(periods), ["week_start", "days", "weeks", "months"]);
+  assert.deepEqual(Object.keys(periods), ["week_start", "days", "weeks", "months", "cut"]);
   assert.equal(periods.week_start, "sun");
+  assert.deepEqual(periods.cut, { days: 0, weeks: 0, months: 0 });
   const [day] = periods.days;
   const [week] = periods.weeks;
   const [month] = periods.months;

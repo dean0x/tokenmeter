@@ -281,7 +281,7 @@ test("a month over a year end and a short month are found by calendar date", () 
 // ---------------------------------------------------------------------------
 
 test("no day row gives empty lists and the week start", () => {
-  assert.deepEqual(periodsOf(inputOf(new DayRows(true), { weekStart: "mon" })), { week_start: "mon", days: [], weeks: [], months: [] });
+  assert.deepEqual(periodsOf(inputOf(new DayRows(true), { weekStart: "mon" })), { week_start: "mon", days: [], weeks: [], months: [], cut: { days: 0, weeks: 0, months: 0 } });
 });
 
 test("a day row past the day horizon, or days after today, is left out", () => {
@@ -341,6 +341,7 @@ test("the lists drop their oldest rows when the budget is short, the days first,
   const rows = fullHorizon(DAYS_MAX_MODELS);
   const whole = periodsOf(inputOf(rows, { maxBytes: Number.MAX_SAFE_INTEGER }));
   assert.equal(whole.days.length, DAYS_HORIZON_DAYS, "with no limit nothing is dropped");
+  assert.deepEqual(whole.cut, { days: 0, weeks: 0, months: 0 });
   const monthsBytes = jsonBytes(whole.months);
   const weeksBytes = jsonBytes(whole.weeks);
 
@@ -363,8 +364,19 @@ test("the lists drop their oldest rows when the budget is short, the days first,
   assert.ok(months.months.length > 0 && months.months.length < whole.months.length, `${months.months.length} months`);
   assert.equal(months.months[months.months.length - 1]?.start, whole.months[whole.months.length - 1]?.start);
 
+  for (const fit of [days, weeks, months]) {
+    assert.deepEqual(fit.cut, {
+      days: whole.days.length - fit.days.length,
+      weeks: whole.weeks.length - fit.weeks.length,
+      months: whole.months.length - fit.months.length,
+    });
+  }
+
   // No room at all.
-  assert.deepEqual(periodsOf(inputOf(rows, { maxBytes: 0 })), { week_start: "sun", days: [], weeks: [], months: [] });
+  assert.deepEqual(periodsOf(inputOf(rows, { maxBytes: 0 })), {
+    week_start: "sun", days: [], weeks: [], months: [],
+    cut: { days: whole.days.length, weeks: whole.weeks.length, months: whole.months.length },
+  });
 });
 
 test("the worst store and the largest other fields still give an output under the reader cap of 1 MiB", () => {
