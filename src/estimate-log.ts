@@ -34,7 +34,7 @@ import {
   utcMonthOf,
 } from "./core.ts";
 import { type EstimateLogLine, settledLines } from "./estimator.ts";
-import { type FsDeps, appendLine, defaultDeps, isOwnPrivateFile, listDir, lstatEntry, readOwnFile, removeFile } from "./fsafe.ts";
+import { type FsDeps, appendLine, defaultDeps, listDir, lstatEntry, readOwnFile, removeFile } from "./fsafe.ts";
 
 const KIB = 1024;
 export const ESTIMATE_LOG_CAP_BYTES = KIB * KIB;
@@ -221,26 +221,15 @@ export interface AppendReport {
   readonly failed: number;
 }
 
-// The size of a month file that the read would accept, 0 for a missing file, null
-// for any other file (a link, a folder, a foreign owner, group or world bits) and
-// for anything that cannot be looked at.
-function sizeBeforeAppend(path: string, uid: number): number | null {
-  const stat = lstatEntry(path);
-  if (!stat.ok) return stat.error.code === "not_found" ? 0 : null;
-  return isOwnPrivateFile(stat.value, uid) ? stat.value.size : null;
-}
-
 function appendOne(dataDir: string, line: EstimateLogLine, access: MonthAccess, deps: FsDeps): keyof AppendReport {
   const file = estimateLogFile(line.at);
   if (file === null || !access.listingComplete || access.unreadMonths.some((month) => fileOfMonth(month) === file)) return "failed";
   const text = logLineText(line);
   const back = parseLogLine(text, line.at);
   if (back === null || logLineText(back) !== text) return "failed";
-  const path = join(dataDir, file);
-  const size = sizeBeforeAppend(path, deps.uid);
-  if (size === null) return "failed";
-  if (size >= ESTIMATE_LOG_CAP_BYTES) return "full";
-  return appendLine(path, text, deps).ok ? "appended" : "failed";
+  const result = appendLine(join(dataDir, file), text, deps, ESTIMATE_LOG_CAP_BYTES);
+  if (result.ok) return "appended";
+  return result.error.code === "too_large" ? "full" : "failed";
 }
 
 // Appends each line to the file of its month, only where the pass read the month

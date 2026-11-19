@@ -241,15 +241,6 @@ function compareScored(a: Scored, b: Scored): number {
   );
 }
 
-// The item with the lowest score, or null for no item.
-function lowest<T>(items: readonly T[], scoredOf: (item: T) => Scored): T | null {
-  let best: T | null = null;
-  for (const item of items) {
-    if (best === null || compareScored(scoredOf(item), scoredOf(best)) < 0) best = item;
-  }
-  return best;
-}
-
 // A score is an error over the error of "all". It is null when that divisor is
 // zero or not finite, or when the result is not finite.
 export function scoreRatio(error: number, baseline: number): number | null {
@@ -781,7 +772,7 @@ function projectErrors(
 }
 
 interface ProjectFit {
-  readonly candidate: Candidate;
+  readonly candidate: Omit<Candidate, "score"> & { readonly score: number | null };
   readonly wins: boolean;
   readonly kept: readonly Candidate[];
 }
@@ -823,8 +814,10 @@ function blendFit(
   if (span === null) return null;
   const errors = projectErrors(sorted, costs, project, group);
   if (errors === null) return null;
+  const gate = projectGate(fitted, errors);
   const score = scoreOf(group, [...errors.values()]);
-  if (score === null) return null;
+  // An eligible subset can decide the gate even when the whole project has a zero baseline.
+  if (score === null && !gate.wins) return null;
   const middle = weightedPoint(sorted, project, group.length, 5);
   const upper = weightedPoint(sorted, project, group.length, 8);
   if (middle === null || upper === null) return null;
@@ -839,7 +832,7 @@ function blendFit(
       rawRatio: medianOf(observed.map((sample) => sample.ratio)),
       rangeFor: (item) => projectOf(item.tags) === project ? range : null,
     },
-    ...projectGate(fitted, errors),
+    ...gate,
   };
 }
 
@@ -920,7 +913,7 @@ export type SignalEstimate =
     };
 
 interface Applied {
-  readonly candidate: Candidate;
+  readonly candidate: Pick<Candidate, "model" | "count" | "rawRatio">;
   readonly range: ItemRange;
 }
 
@@ -969,12 +962,12 @@ function rangedEstimate(key: string, subscription: Subscription, perPct: number,
 }
 
 function bestApplied(item: EstimateItem, candidates: readonly Candidate[]): Applied | null {
-  const applied: Applied[] = [];
+  let best: { candidate: Candidate; range: ItemRange } | null = null;
   for (const candidate of candidates) {
     const range = candidate.rangeFor(item);
-    if (range !== null) applied.push({ candidate, range });
+    if (range !== null && (best === null || compareScored(candidate, best.candidate) < 0)) best = { candidate, range };
   }
-  return lowest(applied, ({ candidate }) => candidate);
+  return best;
 }
 
 function estimateOne(
@@ -994,8 +987,11 @@ function estimateOne(
   if (blend?.wins && project !== null) {
     best = bestApplied(item, blend.kept);
     if (best === null) {
-      best = bestApplied(item, [blend.candidate]);
-      basisProject = project;
+      const range = blend.candidate.rangeFor(item);
+      if (range !== null) {
+        best = { candidate: blend.candidate, range };
+        basisProject = project;
+      }
     }
   } else {
     best = bestApplied(item, candidates);
@@ -1461,8 +1457,8 @@ export interface StageCheck {
 }
 
 export interface SelfCheck extends StageCheck {
-  // The same check for each stage tag that links to a task: the latest line of
-  // the stage that links to the task. A line with no stage counts only above. The
+  // Each stage uses its latest linked line unless its project scope differs from
+  // the task's project. A line with no stage does not count in the stages. The
   // lines on the spent basis have the stage run, so they count here and not above:
   // the top level reads the latest line that is not on the spent basis, and skips
   // a task that has none. At most MAX_STAGES stages, the ones with the most scored
@@ -1638,13 +1634,17 @@ function keptChecks(checks: readonly (readonly [string, StageCheck])[], cap: num
   return new Map(ranked);
 }
 
+function matchesProject(line: EstimateLogLine, project: string | null): boolean {
+  const scope = line.basisProject ?? null;
+  return scope === null || scope === project;
+}
+
 function projectChecks(top: readonly ScoredPair[], subscription: Subscription): ReadonlyMap<string, StageCheck> {
   const groups = new Map<string, ScoredPair[]>();
   for (const pair of top) {
     const { task, line } = pair;
     const project = task.tags === undefined ? null : projectOf(task.tags);
-    const scope = line.basisProject ?? null;
-    if (project === null || (scope !== null && scope !== project)) continue;
+    if (project === null || !matchesProject(line, project)) continue;
     const group = groups.get(project);
     if (group === undefined) groups.set(project, [pair]);
     else group.push(pair);
@@ -1665,7 +1665,9 @@ export function selfCheck(
   const recent = recentLinked(lines, finished);
   const pairsOfStage = new Map<string, ScoredPair[]>();
   for (const { task, byStage } of recent) {
+    const project = task.tags === undefined ? null : projectOf(task.tags);
     for (const [stage, line] of byStage) {
+      if (!matchesProject(line, project)) continue;
       const pairs = pairsOfStage.get(stage);
       if (pairs === undefined) pairsOfStage.set(stage, [{ task, line }]);
       else pairs.push({ task, line });

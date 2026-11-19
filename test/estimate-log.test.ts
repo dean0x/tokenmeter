@@ -345,6 +345,18 @@ test("TP-25 and TP-133: a file below the cap takes one maximum-size scoped line 
   assert.deepEqual(readEstimateLog(dir, NOW, DEPS).lines, [line]);
 });
 
+test("a project line stays separate when the last record has no newline", (t) => {
+  const { dir } = folder(t);
+  const previous = logged("A", NOW - 1);
+  const next = logged("B", NOW, { basisProject: "alpha" });
+  for (const tail of [logLineText(previous), "{"]) {
+    put(dir, fileOf(NOW), tail);
+    assert.deepEqual(appendEstimateLines(dir, [next], ALL_READ, DEPS), { appended: 1, full: 0, failed: 0 });
+    assert.equal(readFileSync(join(dir, fileOf(NOW)), "utf8"), `${tail}\n${linesText(next)}`);
+    assert.deepEqual(readEstimateLog(dir, NOW, DEPS).lines, tail === "{" ? [next] : [previous, next]);
+  }
+});
+
 test("TP-122: an invalid or noncanonical line counts as failed and leaves the file unchanged", (t) => {
   const { dir } = folder(t);
   const file = fileOf(NOW);

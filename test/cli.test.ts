@@ -987,6 +987,8 @@ test("TP-64/132: 500 long project estimates keep the snapshot and output within 
     const output = Buffer.byteLength(run.text);
     t.diagnostic(`${command}: fixed=${fixed}, output=${output}, rows=${[periods.days.length, periods.weeks.length, periods.months.length]}, cut=${JSON.stringify(periods.cut)}`);
     assert.ok(output <= STATUS_OUTPUT_MAX_BYTES, `${command}: ${output} bytes`);
+    assert.ok(periods.days.length > 0 && periods.days.length < DAYS_HORIZON_DAYS);
+    assert.deepEqual(periods.cut, { days: DAYS_HORIZON_DAYS - periods.days.length, weeks: 0, months: 0 });
     assert.ok(fixed <= FIXED_OUTPUT_CEILING_BYTES, `${command} fixed part: ${fixed} bytes`);
     assert.ok(STATUS_OUTPUT_MAX_BYTES - fixed >= MIN_PERIOD_ROOM_BYTES, `${command} period room: ${STATUS_OUTPUT_MAX_BYTES - fixed} bytes`);
     assert.deepEqual(self_check.projects, projects);

@@ -538,12 +538,26 @@ export function removeOldTemps(dir: string, nowMs: number, minAgeMs: number, cap
   return ok(removed);
 }
 
-// Appends one line plus a newline. The file is opened without following a link
-// and checked through the descriptor before the single write.
-export function appendLine(path: string, line: string, deps: FsDeps = defaultDeps()): Result<null, FsError> {
+// A private log may end with a complete or partial record but no newline.
+// Keep that record separate from the next one. Read at most one byte.
+function privateLogPrefix(fd: number, info: Stats, uid: number, cap: number): Result<string, FsError> {
+  if (!isOwnPrivateFile(info, uid)) return err(UNSAFE_FILE);
+  if (info.size >= cap) return err({ code: "too_large", sys: null });
+  if (info.size === 0) return ok("");
+  const last = Buffer.alloc(1);
+  const read = attemptFs(() => readSync(fd, last, 0, 1, info.size - 1));
+  if (!read.ok) return read;
+  if (read.value !== 1) return err({ code: "io_error", sys: null });
+  return ok(last[0] === 0x0a ? "" : "\n");
+}
+
+// Append one record in a single write. A private log checks its byte cap and
+// last separator on the same descriptor as the write.
+export function appendLine(path: string, line: string, deps: FsDeps = defaultDeps(), privateLogCap?: number): Result<null, FsError> {
   if (!isValidFilePath(path) || /[\r\n]/.test(line)) return err(BAD_INPUT);
-  const flags =
-    constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+  if (privateLogCap !== undefined && !(Number.isSafeInteger(privateLogCap) && privateLogCap > 0)) return err(BAD_INPUT);
+  const access = privateLogCap === undefined ? constants.O_WRONLY : constants.O_RDWR;
+  const flags = access | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK;
   const opened = attemptFs(() => openSync(path, flags, FILE_MODE));
   if (!opened.ok) return opened;
   const fd = opened.value;
@@ -556,7 +570,12 @@ export function appendLine(path: string, line: string, deps: FsDeps = defaultDep
     closeFd(fd);
     return err(UNSAFE_FILE);
   }
-  const data = Buffer.from(`${line}\n`, "utf8");
+  const prefix = privateLogCap === undefined ? ok("") : privateLogPrefix(fd, stat.value, deps.uid, privateLogCap);
+  if (!prefix.ok) {
+    closeFd(fd);
+    return prefix;
+  }
+  const data = Buffer.from(`${prefix.value}${line}\n`, "utf8");
   const wrote = attemptFs(() => writeSync(fd, data));
   const closed = attemptFs(() => closeSync(fd));
   if (!wrote.ok) return wrote;

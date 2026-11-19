@@ -1456,9 +1456,10 @@ test("TP-129: a reused label scores by each task's own tags, but mismatched scop
     { ...finishedTask("K", day(2), day(3), 200), tags: { project: "alpha", repo: "beta" } },
     { ...finishedTask("K", day(6), day(7), 200), tags: { repo: "beta" } },
   ];
-  const lines = [logged("K", day(1)), logged("K", day(4), [100, 400], { basisProject: "beta" })];
+  const lines = [logged("K", day(1), [100, 400], { stage: "plan" }), logged("K", day(4), [100, 400], { basisProject: "beta", stage: "plan" })];
   const both = selfCheck(lines, tasks);
   assert.deepEqual([both.projects.get("alpha")?.scored, both.projects.get("beta")?.scored], [1, 1]);
+  assert.equal(both.stages.get("plan")?.scored, 2);
 
   const mismatch = logged("K", day(5), [1, 2], { basisProject: "alpha", stage: "plan" });
   const check = selfCheck([...lines, mismatch], tasks);
@@ -2274,6 +2275,16 @@ test("TP-108: a project cannot win with no eligible shared fit", () => {
   assert.equal(only(estimateFromSignals([ALPHA], history, CAL)).basis, "none");
 });
 
+test("TP-108: an eligible type can decide the gate when the whole project has a zero baseline", () => {
+  const common = Array.from({ length: 21 }, () => tagged(task(500, null), "alpha"));
+  const typed = Array.from({ length: 9 }, (_, i) => tagged(task(501 + i, "beta"), "alpha"));
+  const peers = Array.from({ length: 10 }, () => task(5000, "beta"));
+  const history = [...common, ...typed, ...peers];
+  const row = scoped({ ...ALPHA, tags: { project: "alpha", type: "beta" } }, history);
+  assert.deepEqual([ownScope(row), row.count, row.basisName], ["alpha", 30, "all"]);
+  assert.equal(projectFits(history, "claude").get("alpha")?.candidate.score, null);
+});
+
 test("TP-105: only project tasks at or above the floor count toward the minimum", () => {
   const shared = costSeries(30, 30);
   const small = costSeries(8, 500, "alpha");
@@ -2389,7 +2400,7 @@ test("TP-146: the rank counts under-floor costs and a nine-task fit clamps to th
   const outside = costs(shared);
   const baseline = median(own.map((cost, i) => Math.abs(Math.log(cost) - median([...outside, ...withoutIndex(own, i)].map(Math.log)))));
   const score = projectFits([...shared, ...project], "claude", floor).get("alpha")?.candidate.score;
-  assert.ok(score !== undefined);
+  assert.ok(typeof score === "number");
   close(score, median(own.map((_, i) => blendError(outside, own, i))) / baseline);
 });
 
