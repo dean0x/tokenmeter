@@ -33,6 +33,10 @@ export type Subscription = "claude" | "codex";
 const TYPE_TAG = "type";
 const PROJECT_TAG = "project";
 const REPO_TAG = "repo";
+const MIN_PROJECT_TASKS = 9;
+export const MAX_PROJECTS = 8;
+const PROJECT_BLEND_TASKS = 9;
+const PROJECT_GAIN = 0.9;
 // The tag that names the work stage of an open item.
 const STAGE_TAG = "stage";
 
@@ -718,7 +722,7 @@ interface FitPass {
   readonly samples: readonly Sample[];
   readonly fitted: readonly Fitted[];
   readonly observed: readonly Observed[];
-  readonly projectFits: {
+  readonly projectGroups: {
     readonly fit: ReadonlyMap<string, readonly Sample[]>;
     readonly rank: ReadonlyMap<string, readonly Observed[]>;
   };
@@ -730,7 +734,135 @@ function fitAll(history: readonly EstimateTask[], subscription: Subscription, fl
   const samples = forFit.length < MIN_GROUP_TASKS ? [] : withBaseline(forFit);
   const singles = singleCandidates(samples);
   const fitted = [...allCandidates(samples), ...typeCandidates(samples), ...singles, ...pairCandidates(samples, singles)];
-  return { samples, fitted, observed, projectFits: { fit: groupByProject(samples), rank: groupByProject(observed) } };
+  return { samples, fitted, observed, projectGroups: { fit: groupByProject(samples), rank: groupByProject(observed) } };
+}
+
+// A project task gets the shared weight k plus the project weight N. When one
+// task is left out, both N and the project count exclude it.
+function weightedPoint(
+  sorted: readonly Sample[], project: string, count: number, tenths: 5 | 8, omit?: Sample,
+): number | null {
+  const size = sorted.length - (omit === undefined ? 0 : 1);
+  const target = tenths * size * (count + PROJECT_BLEND_TASKS);
+  let weight = 0;
+  for (const sample of sorted) {
+    if (sample === omit) continue;
+    weight += sample.project === project ? size + PROJECT_BLEND_TASKS : PROJECT_BLEND_TASKS;
+    if (10 * weight >= target) return sample.weighted;
+  }
+  return null;
+}
+
+// Exact order statistics in weighted tokens. With a task left out, an index
+// outside the remaining list takes the nearest end.
+function rankRange(sorted: readonly number[], omit = sorted.length): Span | null {
+  const leftOut = omit < sorted.length;
+  const count = sorted.length - (leftOut ? 1 : 0);
+  const lowRank = Math.floor((count + 1) / 10);
+  const highRank = Math.ceil(9 * (count + 1) / 10);
+  const pick = (rank: number) => sorted[rank <= omit ? rank - 1 : rank] ?? Number.NaN;
+  const low = pick(leftOut ? Math.max(1, lowRank) : lowRank);
+  const high = pick(leftOut ? Math.min(count, highRank) : highRank);
+  return low > 0 && Number.isFinite(low) && Number.isFinite(high) && low <= high ? { low, high } : null;
+}
+
+function projectErrors(
+  sorted: readonly Sample[], costs: readonly number[], project: string, group: readonly Sample[],
+): ReadonlyMap<Sample, number> | null {
+  const errors = new Map<Sample, number>();
+  for (const sample of group) {
+    // Equal costs are interchangeable for the rank ends, not for the fit sample.
+    const span = rankRange(costs, firstAtOrAbove(costs, sample.weighted));
+    const center = weightedPoint(sorted, project, group.length - 1, 5, sample);
+    if (span === null || center === null) return null;
+    errors.set(sample, Math.abs(sample.y - Math.log(clampTo(center, span))));
+  }
+  return errors;
+}
+
+interface ProjectFit {
+  readonly candidate: Candidate;
+  readonly wins: boolean;
+  readonly kept: readonly Candidate[];
+}
+
+function projectGate(fitted: readonly Fitted[], errors: ReadonlyMap<Sample, number>): Omit<ProjectFit, "candidate"> {
+  let eligible = false;
+  const kept: Candidate[] = [];
+  for (const fit of fitted) {
+    const group: Sample[] = [];
+    const blendErrors: number[] = [];
+    const sharedErrors: number[] = [];
+    fit.group.forEach((sample, i) => {
+      const error = errors.get(sample);
+      if (error === undefined) return;
+      group.push(sample);
+      blendErrors.push(error);
+      sharedErrors.push(fit.errors[i] ?? Number.NaN);
+    });
+    const { candidate } = fit;
+    const feature = candidate.model.kind === "single" || candidate.model.kind === "pair";
+    if (group.length === 0 || (!feature && group.length < MIN_PROJECT_TASKS)) continue;
+    const blendScore = scoreOf(group, blendErrors);
+    const sharedScore = scoreOf(group, sharedErrors);
+    if (blendScore === null || sharedScore === null) continue;
+    if (group.length >= MIN_PROJECT_TASKS) {
+      eligible = true;
+      if (blendScore > PROJECT_GAIN * sharedScore) return { wins: false, kept: [] };
+    }
+    if (feature && sharedScore < blendScore) kept.push(candidate);
+  }
+  return { wins: eligible, kept: eligible ? kept : [] };
+}
+
+function blendFit(
+  project: string, group: readonly Sample[], observed: readonly Observed[], sorted: readonly Sample[], fitted: readonly Fitted[],
+): ProjectFit | null {
+  const costs = sortedCostsOf(observed);
+  const span = rankRange(costs);
+  if (span === null) return null;
+  const errors = projectErrors(sorted, costs, project, group);
+  if (errors === null) return null;
+  const score = scoreOf(group, [...errors.values()]);
+  if (score === null) return null;
+  const middle = weightedPoint(sorted, project, group.length, 5);
+  const upper = weightedPoint(sorted, project, group.length, 8);
+  if (middle === null || upper === null) return null;
+  const typical = clampTo(middle, span);
+  const budget = Math.max(typical, clampTo(upper, span));
+  const range = { ...span, typical, budget, clamped: false };
+  return {
+    candidate: {
+      model: { kind: "all" },
+      score,
+      count: group.length,
+      rawRatio: medianOf(observed.map((sample) => sample.ratio)),
+      rangeFor: (item) => projectOf(item.tags) === project ? range : null,
+    },
+    ...projectGate(fitted, errors),
+  };
+}
+
+function projectFitsOf({ samples, fitted, projectGroups }: FitPass): ReadonlyMap<string, ProjectFit> {
+  const qualified = [...projectGroups.fit]
+    .filter(([, group]) => group.length >= MIN_PROJECT_TASKS)
+    .sort(([a, groupA], [b, groupB]) => groupB.length - groupA.length || compareText(a, b))
+    .slice(0, MAX_PROJECTS);
+  const blends = new Map<string, ProjectFit>();
+  if (qualified.length === 0) return blends;
+  const sorted = [...samples].sort((a, b) => a.weighted - b.weighted);
+  for (const [project, group] of qualified) {
+    const observed = projectGroups.rank.get(project);
+    if (observed === undefined) continue;
+    const blend = blendFit(project, group, observed, sorted, fitted);
+    if (blend !== null) blends.set(project, blend);
+  }
+  return blends;
+}
+
+// The bounded project candidates and their verdicts on the shared score scale.
+export function projectFits(history: readonly EstimateTask[], subscription: Subscription, floor = 0): ReadonlyMap<string, ProjectFit> {
+  return projectFitsOf(fitAll(history, subscription, floor));
 }
 
 // Every candidate that qualifies, scored on its own tasks. The score table
@@ -777,6 +909,7 @@ export type SignalEstimate =
       // finite number above 0. Low end <= typical <= budget <= high end.
       readonly typicalPct: number | null;
       readonly budgetPct: number | null;
+      readonly basisProject?: string;
     }
   | {
       readonly key: string;
@@ -810,6 +943,7 @@ interface Shown {
   readonly high: number;
   readonly open: boolean;
   readonly rough: boolean;
+  readonly basisProject?: string;
 }
 
 function rangedEstimate(key: string, subscription: Subscription, perPct: number, shown: Shown): SignalEstimate {
@@ -830,7 +964,17 @@ function rangedEstimate(key: string, subscription: Subscription, perPct: number,
     open,
     rough,
     ...costsOf(shown.range, low, open, perPct),
+    ...(shown.basisProject === undefined ? {} : { basisProject: shown.basisProject }),
   };
+}
+
+function bestApplied(item: EstimateItem, candidates: readonly Candidate[]): Applied | null {
+  const applied: Applied[] = [];
+  for (const candidate of candidates) {
+    const range = candidate.rangeFor(item);
+    if (range !== null) applied.push({ candidate, range });
+  }
+  return lowest(applied, ({ candidate }) => candidate);
 }
 
 function estimateOne(
@@ -838,16 +982,24 @@ function estimateOne(
   subscription: Subscription,
   perPct: number,
   candidates: readonly Candidate[],
+  projects: ReadonlyMap<string, ProjectFit>,
   spentBase: SpentBase,
 ): SignalEstimate {
-  const started = spentEstimate(item, subscription, perPct, spentBase);
-  if (started !== null) return started;
-  const applied: Applied[] = [];
-  for (const candidate of candidates) {
-    const range = candidate.rangeFor(item);
-    if (range !== null) applied.push({ candidate, range });
+  const started = spentRange(item, perPct, spentBase);
+  if (started !== null) return rangedEstimate(item.key, subscription, perPct, { ...started, rough: true });
+  const project = projectOf(item.tags);
+  const blend = project === null ? undefined : projects.get(project);
+  let basisProject: string | undefined;
+  let best: Applied | null;
+  if (blend?.wins && project !== null) {
+    best = bestApplied(item, blend.kept);
+    if (best === null) {
+      best = bestApplied(item, [blend.candidate]);
+      basisProject = project;
+    }
+  } else {
+    best = bestApplied(item, candidates);
   }
-  const best = lowest(applied, ({ candidate }) => candidate);
   if (best === null) return noBasis(item.key, subscription);
   // A running item has used some tokens already, so its low end cannot be less.
   const spent = item.spent ?? 0;
@@ -864,6 +1016,7 @@ function estimateOne(
     high: Math.max(best.range.high, low),
     open,
     rough: open || best.range.clamped,
+    ...(basisProject === undefined ? {} : { basisProject }),
   });
 }
 
@@ -914,7 +1067,7 @@ function spentBaseOf(observed: readonly Observed[]): SpentBase {
 // cost as much as the item has used, with their median and 80th percentile as the
 // typical and budget costs. With fewer than SPENT_MIN_TASKS such tasks the range is
 // open from the cost so far. The rule has no memory: it reads the cost so far only.
-function spentEstimate(item: EstimateItem, subscription: Subscription, perPct: number, base: SpentBase): SignalEstimate | null {
+function spentRange(item: EstimateItem, perPct: number, base: SpentBase): Omit<Shown, "rough" | "basisProject"> | null {
   const { spent } = item;
   if (spent === undefined || !Number.isFinite(spent) || !(spent >= SPENT_START_PCT * perPct) || base.costs.length === 0) return null;
   const costs = base.costs.slice(firstAtOrAbove(base.costs, spent));
@@ -928,7 +1081,7 @@ function spentEstimate(item: EstimateItem, subscription: Subscription, perPct: n
         budget: percentile(costs, BUDGET_FRACTION),
         clamped: false,
       };
-  return rangedEstimate(item.key, subscription, perPct, {
+  return {
     basis: "wide",
     basisName: BASIS_SPENT,
     count: costs.length,
@@ -937,8 +1090,7 @@ function spentEstimate(item: EstimateItem, subscription: Subscription, perPct: n
     low: range.low,
     high: range.high,
     open,
-    rough: true,
-  });
+  };
 }
 
 // One estimate for each open item, in the order given. Each item takes the
@@ -948,9 +1100,9 @@ function spentEstimate(item: EstimateItem, subscription: Subscription, perPct: n
 // type and all is the 10th to 90th percentile of their costs. Each range has a
 // typical cost (the median) and a budget cost (the 80th percentile). The percent range and the raw
 // range have the same factors. With no ready calibration there is no basis. A
-// finished task under FIT_FLOOR_PCT of the week is left out of every fit. A running
-// item that has used SPENT_START_PCT of the week or more takes the spent basis
-// instead of any other (see spentEstimate).
+// finished task under FIT_FLOOR_PCT of the week is left out of every fit. A project
+// that wins the gate uses its rank range or a better shared feature fit. A running
+// item that has used SPENT_START_PCT of the week or more takes the spent basis.
 export function estimateFromSignals(
   items: readonly EstimateItem[],
   history: readonly EstimateTask[],
@@ -959,10 +1111,11 @@ export function estimateFromSignals(
 ): readonly SignalEstimate[] {
   const perPct = perPctOf(calibrations[subscription]);
   if (perPct === null || items.length === 0) return items.map((item) => noBasis(item.key, subscription));
-  const { fitted, observed } = fitAll(history, subscription, perPct * FIT_FLOOR_PCT);
-  const candidates = fitted.map(({ candidate }) => candidate);
-  const spentBase = spentBaseOf(observed);
-  return items.map((item) => estimateOne(item, subscription, perPct, candidates, spentBase));
+  const pass = fitAll(history, subscription, perPct * FIT_FLOOR_PCT);
+  const candidates = pass.fitted.map(({ candidate }) => candidate);
+  const projects = projectFitsOf(pass);
+  const spentBase = spentBaseOf(pass.observed);
+  return items.map((item) => estimateOne(item, subscription, perPct, candidates, projects, spentBase));
 }
 
 
