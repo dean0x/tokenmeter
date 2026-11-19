@@ -31,6 +31,8 @@ export type Subscription = "claude" | "codex";
 
 // The tag that names the type of a task.
 const TYPE_TAG = "type";
+const PROJECT_TAG = "project";
+const REPO_TAG = "repo";
 // The tag that names the work stage of an open item.
 const STAGE_TAG = "stage";
 
@@ -89,6 +91,11 @@ export function pctOfWeek(calibration: Calibration, weightedTokens: number): num
 
 function typeOf(tags: Readonly<Record<string, string>>): string | null {
   return Object.hasOwn(tags, TYPE_TAG) ? (tags[TYPE_TAG] ?? null) : null;
+}
+
+export function projectOf(tags: Readonly<Record<string, string>>): string | null {
+  if (Object.hasOwn(tags, PROJECT_TAG)) return tags[PROJECT_TAG] ?? null;
+  return Object.hasOwn(tags, REPO_TAG) ? (tags[REPO_TAG] ?? null) : null;
 }
 
 // The stage tag of an item, read as an own entry only: a stage label such as
@@ -396,6 +403,7 @@ interface Observed {
   // Raw tokens for each weighted token.
   readonly ratio: number;
   readonly type: string | null;
+  readonly project: string | null;
   // log(1 + value) of each feature that the task carries.
   readonly z: ReadonlyMap<string, number>;
 }
@@ -428,6 +436,7 @@ function observedOf(history: readonly EstimateTask[], subscription: Subscription
       weighted: weightedTokens,
       ratio: rawTokens(totals) / weightedTokens,
       type: typeOf(entry.tags),
+      project: projectOf(entry.tags),
       z,
     });
   }

@@ -47,12 +47,31 @@ import {
   newLogLines,
   nextQueueState,
   pctOfWeek,
+  projectOf,
   queueSum,
   rangeShifts,
   scoreCandidates,
   scoreRatio,
   selfCheck,
 } from "../src/estimator.ts";
+
+test("TP-101: the own project tag takes precedence over the own repo tag", () => {
+  assert.equal(projectOf({ project: "alpha" }), "alpha");
+  assert.equal(projectOf({ repo: "beta" }), "beta");
+  assert.equal(projectOf({ project: "alpha", repo: "beta" }), "alpha");
+  assert.equal(projectOf({}), null);
+});
+
+test("TP-102: project tags use own entries and keep member names as values", () => {
+  const inherited: Record<string, string> = {};
+  Object.setPrototypeOf(inherited, { project: "alpha", repo: "beta" });
+  assert.equal(projectOf({ project: "__proto__" }), "__proto__");
+  assert.equal(projectOf({ project: "constructor" }), "constructor");
+  assert.equal(projectOf({ repo: "toString" }), "toString");
+  assert.equal(projectOf(inherited), null);
+  const ownRepo = Object.setPrototypeOf({ repo: "gamma" }, { project: "alpha" });
+  assert.equal(projectOf(ownRepo), "gamma");
+});
 
 // ---------------------------------------------------------------------------
 // Helpers
