@@ -852,7 +852,7 @@ test("periods: a folder with no days file gives empty lists", async (t) => {
   fs.unlinkSync(join(dataDir(w), "days.json"));
   const missing = await cli(w, ["status"], { io: { locale: "en-US" } });
   assert.equal(missing.code, 0, missing.text);
-  assert.deepEqual(missing.env.data.periods, { week_start: "sun", days: [], weeks: [], months: [] });
+  assert.deepEqual(missing.env.data.periods, { week_start: "sun", days: [], weeks: [], months: [], cut: { days: 0, weeks: 0, months: 0 } });
   assert.equal(missing.env.data.periods_error, null);
 });
 
@@ -944,27 +944,55 @@ function longKey(index: number): string {
   return String(index).padStart(4, "0").padEnd(64, "k");
 }
 
-test("TP-64: collect with 500 open items of 64 character keys keeps status.json under 1 MiB, and status and usage within the output budget", async (t) => {
+// A raise to this ceiling needs a reason in its PR.
+const FIXED_OUTPUT_CEILING_BYTES = 13 * 16 * 1024;
+const MIN_PERIOD_ROOM_BYTES = 60 * 1024;
+const LONG_PROJECTS = Array.from({ length: 8 }, (_, i) => `alpha${i}`.padEnd(64, "a"));
+
+function plantProjectChecks(path: string): object {
+  const snapshot = JSON.parse(readFileSync(path, "utf8"));
+  const check = {
+    n: 5, hit_rate: 0.8123456789123456, error_factor: 2.123456789123456, bias: 1.123456789123456,
+    band_low: 0.4, band_high: 1, width: 2.123456789123456, useful_rate: 0.6123456789123456,
+  };
+  const projects = Object.fromEntries(LONG_PROJECTS.map((project) => [project, check]));
+  snapshot.data.self_check = { ...snapshot.data.self_check, n: 30, projects };
+  writeFileSync(path, JSON.stringify(snapshot), { mode: 0o600 });
+  return projects;
+}
+
+test("TP-64/132: 500 long project estimates keep the snapshot and output within their byte budgets", async (t) => {
   const w = makeWorld(t);
-  const open = Array.from({ length: SYNC_MAX_OPEN_ITEMS }, (_, index) => ({ key: longKey(index), tags: {} }));
-  assert.ok(open.every((item) => item.key.length === 64));
-  await syncCostTasks(w, THREE_COSTS, open);
+  const alpha = "alpha".padEnd(64, "a");
+  const beta = "beta".padEnd(64, "b");
+  const tags = Object.fromEntries(LONG_PROJECTS.slice(1).map((value, i) => [`alpha${i}`, value]));
+  const open = Array.from({ length: SYNC_MAX_OPEN_ITEMS }, (_, index) => ({
+    key: longKey(index), tags: { ...tags, project: index % 2 === 0 ? alpha : beta },
+  }));
+  await syncCostTasks(w, projectCosts(alpha, beta), open, 100);
   await collectOk(w);
-  // The worst store of days beside it: the periods take the bytes that the other fields leave.
+  const path = join(dataDir(w), "status.json");
+  const collected = statSync(path).size;
+  const projects = plantProjectChecks(path);
+  const stored = statSync(path).size;
+  t.diagnostic(`status.json: ${collected} bytes collected, ${stored} bytes with project checks`);
+  assert.ok(collected <= MIB && stored <= MIB, `status.json is ${stored} bytes`);
   writeFileSync(join(dataDir(w), "days.json"), JSON.stringify(worstDays().toJson()), { mode: 0o600 });
 
-  const stored = statSync(join(dataDir(w), "status.json")).size;
-  t.diagnostic(`status.json: ${stored} bytes`);
-  assert.ok(stored <= MIB, `status.json is ${stored} bytes`);
   for (const command of ["status", "usage"] as const) {
     const run = await cli(w, [command]);
     assert.equal(run.code, 0, run.text.slice(0, 200));
-    t.diagnostic(`${command}: ${Buffer.byteLength(run.text)} bytes`);
-    assert.ok(Buffer.byteLength(run.text) <= STATUS_OUTPUT_MAX_BYTES, `${command}: ${Buffer.byteLength(run.text)} bytes`);
+    const { periods, estimates, queue, self_check } = run.env.data;
+    const fixed = Buffer.byteLength(JSON.stringify({ ...run.env, data: { ...run.env.data, periods: null, periods_error: null } })) + 1;
+    const output = Buffer.byteLength(run.text);
+    t.diagnostic(`${command}: fixed=${fixed}, output=${output}, rows=${[periods.days.length, periods.weeks.length, periods.months.length]}, cut=${JSON.stringify(periods.cut)}`);
+    assert.ok(output <= STATUS_OUTPUT_MAX_BYTES, `${command}: ${output} bytes`);
+    assert.ok(fixed <= FIXED_OUTPUT_CEILING_BYTES, `${command} fixed part: ${fixed} bytes`);
+    assert.ok(STATUS_OUTPUT_MAX_BYTES - fixed >= MIN_PERIOD_ROOM_BYTES, `${command} period room: ${STATUS_OUTPUT_MAX_BYTES - fixed} bytes`);
+    assert.deepEqual(self_check.projects, projects);
+    assert.deepEqual(estimates.map((row: Record<string, unknown>) => [row.key, row.basis_project]), open.map((item) => [item.key, item.tags.project]));
+    assert.equal(queue.count, SYNC_MAX_OPEN_ITEMS, "the queue counts every item");
   }
-  const { estimates, queue } = await dataOf(w, "status");
-  assert.equal(estimates.length, SYNC_MAX_OPEN_ITEMS, "every item has its estimate");
-  assert.equal(queue.count, SYNC_MAX_OPEN_ITEMS, "the queue counts every item");
 });
 
 // Days 2026-11-01 and 2026-11-02 beside the collected 2026-11-03.
@@ -1385,7 +1413,9 @@ function seedCostTasks(w: World, tasks: readonly CostTask[]): object[] {
 async function syncCostTasks(w: World, tasks: readonly CostTask[], open: readonly object[], weekPct = 10): Promise<void> {
   const windows = seedCostTasks(w, tasks);
   recordPoints(w, 5, weekPct);
-  const synced = await cli(w, ["tasks", "sync"], { stdin: JSON.stringify({ windows, open }) });
+  const stdin = JSON.stringify({ windows, open });
+  assert.ok(Buffer.byteLength(stdin) <= SYNC_MAX_BYTES);
+  const synced = await cli(w, ["tasks", "sync"], { stdin });
   assert.equal(synced.code, 0, synced.text);
   assert.equal(synced.env.data.windows, tasks.length);
 }
