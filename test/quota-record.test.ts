@@ -49,6 +49,7 @@ import {
 } from "../src/quota.ts";
 import { RECORD_COPY_CAP_BYTES, RECORD_DEADLINE_MS, type RecordIo, runRecord } from "../src/record.ts";
 import { type Sandbox, assertGuarded, installSuiteGuard, makeSandbox } from "./helpers.ts";
+import { TIMING_RUNS, judgeTiming, measurePaired, writeBaselineScript } from "./timing.ts";
 
 installSuiteGuard();
 
@@ -1657,17 +1658,44 @@ test("bin: an unknown command prints a JSON usage_error, and node_too_old on an 
   assert.equal(old.code, 1);
 });
 
-test("bin record: p95 of 20 runs is under 500 ms", async (t) => {
+test("bin record: the median start stays near a bare Node start", async (t) => {
   const sb = makeSandbox(t);
-  const times: number[] = [];
-  for (let i = 0; i < 20; i += 1) {
-    const r = await runBin(["record"], realStatus({ five: 10 + i / 2, week: 30 + i / 4 }), sb.env);
-    assert.equal(r.code, 0);
-    assert.equal(r.stderr, "");
-    times.push(r.ms);
-  }
-  times.sort((a, b) => a - b);
-  const p95 = times[Math.ceil(0.95 * times.length) - 1] ?? Number.POSITIVE_INFINITY;
-  t.diagnostic(`p95 ${p95.toFixed(0)} ms, median ${(times[10] ?? 0).toFixed(0)} ms, max ${(times[19] ?? 0).toFixed(0)} ms`);
-  assert.ok(p95 < 500, `p95 ${p95.toFixed(0)} ms`);
+  const baseline = writeBaselineScript(sb.path("baseline.js"));
+  const { baselineMs, commandMs } = await measurePaired(
+    TIMING_RUNS,
+    async () => {
+      const r = await runBin([], "", sb.env, baseline);
+      assert.equal(r.code, 0);
+      return r.ms;
+    },
+    async (i) => {
+      const r = await runBin(["record"], realStatus({ five: 10 + i / 2, week: 30 + i / 4 }), sb.env);
+      assert.equal(r.code, 0);
+      assert.equal(r.stderr, "");
+      return r.ms;
+    },
+  );
+  const verdict = judgeTiming(commandMs, baselineMs);
+  t.diagnostic(verdict.detail);
+  assert.ok(verdict.ok, verdict.detail);
+});
+
+test("bin record: the timing check fails for a planted 1 s start delay", async (t) => {
+  const sb = makeSandbox(t);
+  const baseline = writeBaselineScript(sb.path("baseline.js"));
+  const preload = sb.path("slow-start.cjs");
+  writeFileSync(preload, "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000);\n");
+  const slowEnv = { ...sb.env, NODE_OPTIONS: `--require=${preload}` };
+  const { baselineMs, commandMs } = await measurePaired(
+    3,
+    async () => (await runBin([], "", sb.env, baseline)).ms,
+    async (i) => {
+      const r = await runBin(["record"], realStatus({ five: 10 + i, week: 30 + i }), slowEnv);
+      assert.equal(r.code, 0);
+      return r.ms;
+    },
+  );
+  const verdict = judgeTiming(commandMs, baselineMs);
+  t.diagnostic(verdict.detail);
+  assert.equal(verdict.ok, false, verdict.detail);
 });

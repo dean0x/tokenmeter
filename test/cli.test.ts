@@ -50,6 +50,7 @@ import { FILE_CAPS, loadDayRows } from "../src/store.ts";
 import { RECORD_DEADLINE_MS, type RecordIo, runRecord } from "../src/record.ts";
 import { NO_DATA_LINE, renderStatusline, runStatusline } from "../src/statusline.ts";
 import { type Sandbox, assertGuarded, installSuiteGuard, makeSandbox } from "./helpers.ts";
+import { TIMING_RUNS, judgeTiming, measurePaired, writeBaselineScript } from "./timing.ts";
 
 installSuiteGuard();
 
@@ -3290,17 +3291,24 @@ test("bin statusline: when the module cannot be imported it still prints a short
   assert.equal(run.stdout, "tokenmeter: unavailable\n");
 });
 
-test("bin statusline: p95 of 20 runs is under 500 ms", async (t) => {
+test("bin statusline: the median start stays near a bare Node start", async (t) => {
   const w = makeWorld(t);
-  const times: number[] = [];
-  for (let i = 0; i < 20; i += 1) {
-    const run = await runBin(["statusline"], w.sb.env, realStatusline(30 + i / 4));
-    assert.equal(run.code, 0);
-    assert.equal(run.stderr, "");
-    times.push(run.ms);
-  }
-  times.sort((a, b) => a - b);
-  const p95 = times[Math.ceil(0.95 * times.length) - 1] ?? Number.POSITIVE_INFINITY;
-  t.diagnostic(`p95 ${p95.toFixed(0)} ms, median ${(times[10] ?? 0).toFixed(0)} ms, max ${(times[19] ?? 0).toFixed(0)} ms`);
-  assert.ok(p95 < 500, `p95 ${p95.toFixed(0)} ms`);
+  const baseline = writeBaselineScript(w.sb.path("baseline.js"));
+  const { baselineMs, commandMs } = await measurePaired(
+    TIMING_RUNS,
+    async () => {
+      const run = await runBin([], w.sb.env, "", baseline);
+      assert.equal(run.code, 0);
+      return run.ms;
+    },
+    async (i) => {
+      const run = await runBin(["statusline"], w.sb.env, realStatusline(30 + i / 4));
+      assert.equal(run.code, 0);
+      assert.equal(run.stderr, "");
+      return run.ms;
+    },
+  );
+  const verdict = judgeTiming(commandMs, baselineMs);
+  t.diagnostic(verdict.detail);
+  assert.ok(verdict.ok, verdict.detail);
 });
