@@ -153,7 +153,7 @@ Then `collect` counts the event in `codex_cache_invalid`, and the event stays.
 Codex has no 1-hour cache write, so that column is always 0.
 A Codex row that `collect` stored before this rule keeps its old split. tokenmeter does not count it again.
 
-## Tasks, and the type tag
+## Tasks and tags
 
 A task is a window of time in some folders.
 `tokenmeter tasks sync` reads this JSON from stdin:
@@ -182,6 +182,14 @@ An open item can carry a `stage` tag, the work stage of the item, for example `i
 See "The estimate log and the self-check".
 `tokenmeter estimate` reads `{"items": [{"key": "I-1", "tags": {"type": "feature"}, "features": {"size": 150}}]}` from stdin.
 It uses the type and the features to find similar tasks. See "The estimate".
+
+A task or item can have a `project` tag, for example `"tags": {"project": "alpha"}`.
+If it has no `project` tag, tokenmeter uses its `repo` tag. If it has both, `project` wins.
+Tag names and values are case-sensitive. tokenmeter never takes the project from a folder, a folder key or a path.
+An item with neither tag uses only the shared candidates.
+
+Choose a short, neutral value. tokenmeter keeps project values in task history, `status.json` and the estimate log.
+No command removes a project value from these records on its own.
 
 ### Features
 
@@ -229,11 +237,10 @@ A candidate is one way to predict the cost of an item:
 A fit works on the log of the cost and the log of 1 plus the feature value.
 An item can use a candidate only when it has the features or the type that the candidate needs.
 
-A finished task that cost less than 0.1 percent of the week is under the floor. It stays out of every candidate.
-Such a task says little about a task that is worth a plan.
+A finished task that cost less than 0.1 percent of the week is under the floor. It stays out of the fits.
 The floor is a part of the week, so it moves when the size of the week changes. A task near it can enter or leave the fits.
 With fewer than 3 finished tasks at or over the floor, every item gets the basis `none`, unless it is on the `spent` basis.
-The `spent` basis, the self-check and the queue use no floor.
+The project range ends, the `spent` basis, the self-check and the queue use no floor.
 
 The selector scores each candidate with leave-one-out.
 For each finished task, it predicts the cost from the other tasks.
@@ -248,6 +255,28 @@ The range is an honest 80% range. It is meant to hold the cost of 8 of 10 new ta
   Then each end moves outward by half of the extreme error.
 - For type and all, the range is the 10th to 90th percentile of the costs of the group.
 
+A project needs at least 9 finished tasks at or over the floor for its own range.
+The selector tries at most 8 projects: those with the most fit tasks, with ties by name.
+
+The gate compares leave-one-out scores on the same project tasks.
+A shared candidate enters the gate if it covers at least 9 project fit tasks and both scores are valid.
+At least one shared candidate must enter the gate.
+The project score must be at most 90% of each such shared score. Otherwise the shared candidates stay.
+A shared feature or pair fit that beats the project score on the tasks it covers stays where it applies.
+
+The project range uses the costs of all its finished tasks with a cost, even below the floor.
+For `m` such tasks, take the costs at ranks `floor((m + 1) / 10)` and `ceil(9 * (m + 1) / 10)`, from rank 1.
+Both ends must be finite. The low end must be positive and no greater than the high end.
+
+For the typical and budget costs, blend the fit tasks of the project with all fit tasks.
+With `n` project fit tasks, give the project group weight `n / (n + 9)` and the shared group the rest.
+Each group splits its weight evenly among its tasks.
+Clamp the weighted 50th and 80th percentiles into the range. The budget is at least the typical cost.
+
+The 80% rank rule applies only to items on the project basis. A kept fit uses its own range.
+The rank rule does not account for the gate or changes in task costs over time.
+The `spent` basis and the queue sum stay shared.
+
 A fit does not predict outside the feature values that it learned from.
 When a feature value of an item is above the largest or under the smallest value of the finished tasks of the fit, the range is the range at that largest or smallest value.
 A pair does this for each of its two features.
@@ -259,7 +288,8 @@ The estimate log keeps the basis of the fit, so a clamp writes no new line.
 The basis word says how much to trust the range:
 
 - `similar`: a feature fit or a pair fit.
-- `wide`: type or all, the spent basis, or a rough range (an open range, or a range that was clamped). The range has a low confidence.
+- `wide`: type, all, a project range, `spent` or a rough range. The range has low confidence.
+  An open range or a range with a clamp is rough.
 - `none`: no basis. The estimate has no range.
 
 An item that has not started keeps a wide range: the signals at intake are weak.
@@ -274,12 +304,15 @@ An estimate with a basis has these fields, in this order, after `key`, `subscrip
 - `raw_low` and `raw_high`: the same range in raw tokens.
   The raw range is the weighted range times the median raw tokens for each weighted token of the finished tasks of the candidate.
   So the two ranges have the same factor between their ends.
-  For the `spent` basis, the median is over all finished tasks.
+  For a project range, the median uses all project tasks with a cost. For `spent`, it uses all finished tasks.
   In a snapshot that an older tokenmeter wrote, `raw_low` and `raw_high` are `null` until the next `collect`.
-- `count`: the number of finished tasks that the range rests on.
+- `count`: the number of finished tasks that the range rests on. A project range counts only the fit tasks of the project.
 - `typical_pct`: the typical cost, in percent of the week.
-  For type, all and `spent`, it is the median of the costs. For a fit, it is the prediction moved by the median leave-one-out error.
-- `budget_pct`: the cost to plan with, in percent of the week. It is the 80th percentile in the same way: about 8 of 10 tasks cost this much or less.
+  For shared type, shared all and `spent`, it is the median cost.
+  For a feature or pair fit, it is the prediction with the median leave-one-out error applied.
+- `budget_pct`: the cost to plan with, in percent of the week. It uses the 80th percentile instead of the 50th.
+- `basis_project`: the project value when the estimate uses the project range. Then `basis` is `wide` and `basis_name` is `all`.
+  This field is `null` for a shared range, a kept fit or `spent`. tokenmeter reads an absent snapshot field as `null`.
 
 So `low_pct`, `typical_pct`, `budget_pct` and `high_pct` are in this order, from the least to the most.
 An open range (see below) has `null` for `high_pct`, `raw_high`, `typical_pct` and `budget_pct`.
@@ -395,10 +428,17 @@ A line has these fields:
 - `key`, `basis` and `basis_name`: as in the estimate.
 - `features`: the names of the features of the item, at most 16. It holds no values.
 - `stage`: the `stage` tag of the item, or `null` when the item has none. A line with the basis name `spent` has the stage `run`.
+- `basis_project`: the project value for a project range, or `null` for a shared range or no basis. An older line without this field reads it as `null`.
 - `low` and `high`: the range in weighted tokens. Both are `null` with no basis.
 
-`collect` writes a line only when the key is new, or when the basis, the basis name, the feature names or the stage differ from the latest line of that key.
-A change of stage with the same basis writes one new line. A repeat in the same stage writes none.
+`collect` checks the latest line for the key. It writes one line if there is no match for the key.
+It also writes one if the basis, basis name, feature names, stage or `basis_project` differs.
+A repeat with the same values writes none.
+
+The first use of a project range writes one extra line per affected open item, even if the basis name stays the same.
+Each later gate change that moves an item to or from a project range writes one more line.
+
+A change of stage with the same basis writes one new line.
 While an item is on the `spent` basis, its stage is `run` whatever its tag says. So a change of its `stage` tag writes no line.
 An item that loses its `stage` tag writes a line with `stage` `null`.
 A range that moves is not a change. An item with no basis gets a line too.
@@ -415,6 +455,8 @@ A line is not valid when it has more than 16 feature names, or when a feature na
 It is not valid either when its basis name is a pair that holds a name which is not valid, for example `spent+size`, or when its `stage` is neither `null` nor a label.
 This is true for the lines that an older tokenmeter wrote too.
 A line with no `stage` reads as `stage` `null`.
+A line is not valid if `basis_project` is neither `null` nor a label. It is also not valid if it has a project value but no basis.
+`collect` refuses a line that cannot read back as written. It counts that line in `append_failed` and leaves the file unchanged.
 It counts a data folder with more than 1000 names, or a data folder that it cannot list, in `estimate_log_damaged` too.
 The append follows the read. `collect` writes no line to a month file that it did not read.
 It writes no line at all when it could not list the data folder in full.
@@ -436,7 +478,8 @@ To clear `estimate_log_damaged`, find the cause and run `collect` again:
 - A data folder with more than 1000 names, or that you cannot list: remove the names that do not belong to tokenmeter, or correct the permissions of the folder.
 
 The count goes to 0 in the first `collect` that reads all the files.
-Until then, `self_check` is `null`, `collect` deletes no month file, and it writes no line to a month file that it did not read.
+Until then, all fields of `self_check` are `null`.
+`collect` deletes no month file and writes no line to a month file that it did not read.
 
 After the append, `collect` deletes the month files that it does not need.
 For each of the 30 most recent finished tasks, it keeps the month of the latest line that links to the task, and the month of the latest line of each stage that links to it.
@@ -455,7 +498,7 @@ The first `collect` after the update writes one line for each open item that has
 This growth happens once.
 
 `status` shows `self_check` in `data`:
-`{"n":10,"hit_rate":0.8,"error_factor":1.4,"bias":1.2,"band_low":0.5,"band_high":1,"width":2.5,"useful_rate":0.5,"stages":{"issue":{"n":5,"hit_rate":0.6,"error_factor":1.6,"bias":1.3,"band_low":0.4,"band_high":1,"width":3,"useful_rate":0.4}}}`.
+`{"n":10,"hit_rate":0.8,"error_factor":1.4,"bias":1.2,"band_low":0.5,"band_high":1,"width":2.5,"useful_rate":0.5,"stages":{"issue":{"n":5,"hit_rate":0.6,"error_factor":1.6,"bias":1.3,"band_low":0.4,"band_high":1,"width":3,"useful_rate":0.4}},"projects":{}}`.
 
 - `n`: the tasks, among the 30 most recent finished tasks, that had a range in the log before they ended.
   A line belongs to the first finished task of its label that ended after the line time. A task uses the latest line that belongs to it and has not the basis name `spent`.
@@ -481,7 +524,7 @@ This growth happens once.
   A range that is wider than that hits, but it does not help a week plan. So `useful_rate` is never more than `hit_rate`.
 - `stages`: the same eight values for each stage that a line of these 30 tasks names. A stage object has `n`, `hit_rate`, `error_factor`, `bias`, `band_low`, `band_high`, `width` and `useful_rate`.
   A stage uses the latest line of that stage that belongs to the task, over the same 30 most recent finished tasks.
-  A line with no stage counts only in the top-level numbers. These numbers use the latest line of any stage, except a `spent` line: the top level skips it.
+  A line with no stage does not count in `stages`. The top level uses the latest line, with or without a stage, but skips `spent` lines.
   A `spent` line has the stage `run`, so it counts in that stage only.
   An item with the stage tag `run` and an item on the `spent` basis count in the same `run` row. The row is one of the 8 places, like any stage.
   The `run` row measures the spent range at the start of the rule: the log keeps one line for each basis and stage, so a larger cost so far writes no new line.
@@ -490,18 +533,26 @@ This growth happens once.
   `stages` shows at most 8 stages: the ones with the most scored tasks, and the ties go by name. They are in name order.
   A name of only digits, such as `2`, comes before the other names, in number order.
   A stage past the eighth is not shown. Its lines stay in the log.
+- `projects`: the same eight fields for each project, from the top-level scores of the same 30 recent tasks.
+  A shared line can count for the project of its task. A line that names a different project can count at the top level but not in `projects`.
+  The rule still links lines by label. It does not look for a different line when the project does not match.
+  The map keeps at most 8 projects with the most scored tasks, with ties by name.
+  It is `{}` when no scored task has a project that meets these rules.
 
-`hit_rate`, `error_factor`, `bias`, `band_low`, `band_high`, `width` and `useful_rate` are `null` under 5 scored tasks, at the top level and in each stage.
+`hit_rate`, `error_factor`, `bias`, `band_low`, `band_high`, `width` and `useful_rate` are `null` under 5 scored tasks.
+This applies at the top level and in each stage and project.
 `width` is `null` too when it is not a finite number. The other values stay.
 `stages` is `{}` when `collect` read the log and no line with a stage belongs to one of these tasks, for example before the first item with a `stage` tag finishes.
-All nine values are `null` when the log is damaged, `stages` too.
+When `collect` cannot read the log in full, all fields are `null`. This includes `stages` and `projects`.
 In a snapshot that an older tokenmeter wrote, `self_check` is `null`.
 A snapshot of an older version can lack the newer values of `self_check`, at the top level and in the stages.
 One version has only `n`, `hit_rate` and `error_factor`. A later one has no `width` and no `useful_rate`.
 A value that is not there reads as `null`, and the other values stay.
-A wrong value in `self_check` makes the whole `self_check` `null`. The one exception is `stages`: a wrong `stages` value reads as `null`, and the other values stay.
+A wrong value in `self_check` makes the whole `self_check` `null`, except for `stages` and `projects`.
+A bad or absent map reads as `null`. The other fields stay.
 A band that is not the band of its `n` is a wrong value. So is a number, or a `stages` object, when `n` is `null`.
 So is a `width` under 1, a `useful_rate` outside 0 to 1, and a `useful_rate` above `hit_rate`.
+When `n` is `null`, `projects` reads as `null` without a change to the other fields.
 `tokenmeter estimate` does not read or write the log.
 
 ### Going back to an older tokenmeter
@@ -517,6 +568,7 @@ If you go back to an older tokenmeter:
   The next `collect` of the newer tokenmeter builds the file again with the backfill. See "The backfill" for what the backfill can find.
 - It accepts a feature named `spent` and the stage `run`. Do not send a feature `spent`: the newer tokenmeter refuses it.
 - It reads each field of an estimate and of the self-check by name. So it drops `typical_pct` and `budget_pct`, and `width` and `useful_rate`.
+- A build before 0.2.0 drops `basis_project` from estimate rows and `projects` from `self_check`. It ignores `basis_project` in the log.
 - It does not know `queue`. It passes `queue` through unchecked, as it finds it in the snapshot, until its next `collect` writes a snapshot without it.
 
 `tokenmeter tasks sync` refuses a window or an open item with a `stage` tag that is not a label, and counts it.
@@ -604,7 +656,7 @@ A damaged or newer `days.json` does not stop the command. All the other fields s
 `periods_error` is `null` when `periods` is there.
 
 ```json
-{"week_start":"sun","days":[],"weeks":[],"months":[]}
+{"week_start":"sun","days":[],"weeks":[],"months":[],"cut":{"days":0,"weeks":0,"months":0}}
 ```
 
 Each list is oldest first and starts at the first day with data. It has no hole after that day: a day with no tokens is a row of zeros.
@@ -637,6 +689,8 @@ The lists have caps: 410 days, 60 weeks and 15 months, the newest rows.
 The reader of the status caps its input at 1 MiB. So the whole output of `status` and `usage` stays under 900 KiB.
 The other fields of the output take their bytes first. The periods get the bytes that are left.
 The months take them first, then the weeks, then the days. A list that does not fit leaves out its oldest rows.
+`periods.cut` gives the number of rows that the byte budget left out of each list: `days`, `weeks` and `months`.
+Each count is 0 when the budget leaves out no rows. Rows outside the fixed count caps do not count.
 With the most models and the longest names in the 400 days, the weeks and the months together take about 375 KB.
 A store with 5 models in each day takes about 720 KB for all three lists.
 So the oldest day rows drop first when the other fields are large.
