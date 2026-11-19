@@ -415,6 +415,13 @@ interface Sample extends Observed {
   readonly baseline: number;
 }
 
+// The leave-one-out errors have the same order as the samples in the group.
+interface Fitted {
+  readonly candidate: Candidate;
+  readonly group: readonly Sample[];
+  readonly errors: readonly number[];
+}
+
 function isFeatureValue(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
@@ -572,9 +579,10 @@ function rangeAt(prediction: number, shifts: Shifts, clamped: boolean): ItemRang
 }
 
 // Type and all: the 10th, 50th, 80th and 90th percentile of the weighted tokens of the group.
-function groupCandidate(model: RankedModel, group: readonly Sample[]): Candidate | null {
+function groupCandidate(model: RankedModel, group: readonly Sample[]): Fitted | null {
   if (group.length < MIN_GROUP_TASKS) return null;
-  const standing = standingOf(group, leaveOneOut(group).map(({ error }) => error));
+  const errors = leaveOneOut(group).map(({ error }) => error);
+  const standing = standingOf(group, errors);
   if (standing === null) return null;
   const costs = sortedAscending(group.map((sample) => sample.weighted));
   const range: ItemRange = {
@@ -585,14 +593,15 @@ function groupCandidate(model: RankedModel, group: readonly Sample[]): Candidate
     clamped: false,
   };
   const type = model.kind === "type" ? model.type : null;
-  return {
+  const candidate: Candidate = {
     ...standing,
     model,
     rangeFor: (item) => (type === null || typeOf(item.tags) === type ? range : null),
   };
+  return { candidate, group, errors };
 }
 
-function singleCandidate(feature: string, samples: readonly Sample[]): Candidate | null {
+function singleCandidate(feature: string, samples: readonly Sample[]): Fitted | null {
   const { group, zs } = carrying(samples, feature);
   const fit = fitLine(zs, ysOf(group));
   if (fit === null) return null;
@@ -600,7 +609,7 @@ function singleCandidate(feature: string, samples: readonly Sample[]): Candidate
   if (standing === null) return null;
   const shifts = shiftsOf(fit.errors);
   const bounds = boundsOf(zs);
-  return {
+  const candidate: Candidate = {
     ...standing,
     model: { kind: "single", feature },
     rangeFor: (item) => {
@@ -611,6 +620,7 @@ function singleCandidate(feature: string, samples: readonly Sample[]): Candidate
       return rangeAt(fit.intercept + fit.slope * inside, shifts, inside !== z);
     },
   };
+  return { candidate, group, errors: fit.errors };
 }
 
 // The score of one line fitted to a group, or null.
@@ -619,7 +629,7 @@ function lineScore(group: readonly Sample[], zs: readonly number[]): number | nu
   return fit === null ? null : scoreOf(group, fit.errors);
 }
 
-function pairCandidate(names: readonly [string, string], samples: readonly Sample[]): Candidate | null {
+function pairCandidate(names: readonly [string, string], samples: readonly Sample[]): Fitted | null {
   const [first, second] = names;
   const { group, z1s, z2s } = carryingBoth(samples, first, second);
   if (group.length < MIN_PAIR_TASKS) return null;
@@ -633,7 +643,7 @@ function pairCandidate(names: readonly [string, string], samples: readonly Sampl
   const shifts = shiftsOf(fit.errors);
   const bounds1 = boundsOf(z1s);
   const bounds2 = boundsOf(z2s);
-  return {
+  const candidate: Candidate = {
     ...standing,
     model: { kind: "pair", features: names },
     rangeFor: (item) => {
@@ -645,6 +655,7 @@ function pairCandidate(names: readonly [string, string], samples: readonly Sampl
       return rangeAt(fit.intercept + fit.slopes[0] * inside1 + fit.slopes[1] * inside2, shifts, inside1 !== z1 || inside2 !== z2);
     },
   };
+  return { candidate, group, errors: fit.errors };
 }
 
 // The names of the features that tasks carry, with their task counts: at most
@@ -662,12 +673,12 @@ function scoredFeatureNames(samples: readonly Sample[]): string[] {
 }
 
 // The candidate on the whole history.
-function allCandidates(samples: readonly Sample[]): Candidate[] {
+function allCandidates(samples: readonly Sample[]): Fitted[] {
   return kept([groupCandidate({ kind: "all" }, samples)]);
 }
 
 // One candidate for each type with enough tasks, by type name.
-function typeCandidates(samples: readonly Sample[]): Candidate[] {
+function typeCandidates(samples: readonly Sample[]): Fitted[] {
   const byType = new Map<string, Sample[]>();
   for (const sample of samples) {
     if (sample.type === null) continue;
@@ -680,16 +691,46 @@ function typeCandidates(samples: readonly Sample[]): Candidate[] {
 }
 
 // One candidate for each scored feature name, by name.
-function singleCandidates(samples: readonly Sample[]): Candidate[] {
+function singleCandidates(samples: readonly Sample[]): Fitted[] {
   return kept(scoredFeatureNames(samples).sort(compareText).map((name) => singleCandidate(name, samples)));
 }
 
 // One candidate for each pair of the MAX_PAIR_NAMES features with the best single
 // scores, by name.
-function pairCandidates(samples: readonly Sample[], singles: readonly Candidate[]): Candidate[] {
-  const best = [...singles].sort(compareScored).slice(0, MAX_PAIR_NAMES);
+function pairCandidates(samples: readonly Sample[], singles: readonly Fitted[]): Fitted[] {
+  const best = singles.map(({ candidate }) => candidate).sort(compareScored).slice(0, MAX_PAIR_NAMES);
   const names = best.flatMap((candidate) => (candidate.model.kind === "single" ? [candidate.model.feature] : [])).sort(compareText);
   return kept(names.flatMap((first, at) => names.slice(at + 1).map((second) => pairCandidate([first, second], samples))));
+}
+
+function groupByProject<T extends Observed>(tasks: readonly T[]): ReadonlyMap<string, readonly T[]> {
+  const groups = new Map<string, T[]>();
+  for (const task of tasks) {
+    if (task.project === null) continue;
+    const group = groups.get(task.project);
+    if (group === undefined) groups.set(task.project, [task]);
+    else group.push(task);
+  }
+  return groups;
+}
+
+interface FitPass {
+  readonly samples: readonly Sample[];
+  readonly fitted: readonly Fitted[];
+  readonly observed: readonly Observed[];
+  readonly projectFits: {
+    readonly fit: ReadonlyMap<string, readonly Sample[]>;
+    readonly rank: ReadonlyMap<string, readonly Observed[]>;
+  };
+}
+
+function fitAll(history: readonly EstimateTask[], subscription: Subscription, floor: number): FitPass {
+  const observed = observedOf(history, subscription);
+  const forFit = floor === 0 ? observed : observedOf(history, subscription, floor);
+  const samples = forFit.length < MIN_GROUP_TASKS ? [] : withBaseline(forFit);
+  const singles = singleCandidates(samples);
+  const fitted = [...allCandidates(samples), ...typeCandidates(samples), ...singles, ...pairCandidates(samples, singles)];
+  return { samples, fitted, observed, projectFits: { fit: groupByProject(samples), rank: groupByProject(observed) } };
 }
 
 // Every candidate that qualifies, scored on its own tasks. The score table
@@ -698,11 +739,7 @@ function pairCandidates(samples: readonly Sample[], singles: readonly Candidate[
 // under `floor` weighted tokens is left out of every candidate; with no floor
 // every task with a cost counts.
 export function scoreCandidates(history: readonly EstimateTask[], subscription: Subscription, floor = 0): readonly Candidate[] {
-  const observed = observedOf(history, subscription, floor);
-  if (observed.length < MIN_GROUP_TASKS) return [];
-  const samples = withBaseline(observed);
-  const singles = singleCandidates(samples);
-  return [...allCandidates(samples), ...typeCandidates(samples), ...singles, ...pairCandidates(samples, singles)];
+  return fitAll(history, subscription, floor).fitted.map(({ candidate }) => candidate);
 }
 
 // ---------------------------------------------------------------------------
@@ -867,8 +904,7 @@ interface SpentBase {
   readonly rawRatio: number;
 }
 
-function spentBaseOf(history: readonly EstimateTask[], subscription: Subscription): SpentBase {
-  const observed = observedOf(history, subscription);
+function spentBaseOf(observed: readonly Observed[]): SpentBase {
   return { costs: sortedCostsOf(observed), rawRatio: medianOf(observed.map((entry) => entry.ratio)) };
 }
 
@@ -923,8 +959,9 @@ export function estimateFromSignals(
 ): readonly SignalEstimate[] {
   const perPct = perPctOf(calibrations[subscription]);
   if (perPct === null || items.length === 0) return items.map((item) => noBasis(item.key, subscription));
-  const candidates = scoreCandidates(history, subscription, perPct * FIT_FLOOR_PCT);
-  const spentBase = spentBaseOf(history, subscription);
+  const { fitted, observed } = fitAll(history, subscription, perPct * FIT_FLOOR_PCT);
+  const candidates = fitted.map(({ candidate }) => candidate);
+  const spentBase = spentBaseOf(observed);
   return items.map((item) => estimateOne(item, subscription, perPct, candidates, spentBase));
 }
 
