@@ -1,6 +1,6 @@
 {
   "name": "@dean0x/tokenmeter",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Count Claude Code and Codex tokens on your own machine, with weekly limit forecasts",
   "keywords": [
     "claude-code",

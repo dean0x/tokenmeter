@@ -17,7 +17,7 @@ Use it to:
 Use Node 22.0 or newer. Install the package at a fixed version:
 
 ```sh
-npm install --global @dean0x/tokenmeter@0.1.0
+npm install --global @dean0x/tokenmeter@0.2.0
 ```
 
 The examples below use the installed command `tokenmeter`.
