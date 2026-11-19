@@ -953,10 +953,12 @@ test("TP-64: collect with 500 open items of 64 character keys keeps status.json 
   writeFileSync(join(dataDir(w), "days.json"), JSON.stringify(worstDays().toJson()), { mode: 0o600 });
 
   const stored = statSync(join(dataDir(w), "status.json")).size;
+  t.diagnostic(`status.json: ${stored} bytes`);
   assert.ok(stored <= MIB, `status.json is ${stored} bytes`);
   for (const command of ["status", "usage"] as const) {
     const run = await cli(w, [command]);
     assert.equal(run.code, 0, run.text.slice(0, 200));
+    t.diagnostic(`${command}: ${Buffer.byteLength(run.text)} bytes`);
     assert.ok(Buffer.byteLength(run.text) <= STATUS_OUTPUT_MAX_BYTES, `${command}: ${Buffer.byteLength(run.text)} bytes`);
   }
   const { estimates, queue } = await dataOf(w, "status");
