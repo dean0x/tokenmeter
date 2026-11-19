@@ -1313,6 +1313,8 @@ interface EstimateLogLineBase {
   readonly features: readonly string[];
   // The stage tag of the item, or null when it had none.
   readonly stage: string | null;
+  // The project of the basis, if any. An absent scope has the same meaning as null.
+  readonly basisProject?: string | null;
 }
 
 // A line of an estimate with a basis, and the range that it showed in weighted tokens.
@@ -1325,6 +1327,7 @@ export interface RangedLogLine extends EstimateLogLineBase {
 // A line of an estimate with no basis: it showed no range.
 export interface NoBasisLogLine extends EstimateLogLineBase {
   readonly basis: "none";
+  readonly basisProject?: null;
   readonly low: null;
   readonly high: null;
 }
@@ -1337,7 +1340,7 @@ function logLineOf(item: EstimateItem, estimate: SignalEstimate, at: number): Es
   const features = Object.keys(item.features).sort(compareText);
   const stage = stageOf(item.tags);
   if (estimate.basis === "none") {
-    return { at, key: item.key, basis: "none", basisName: BASIS_NONE, features, stage, low: null, high: null };
+    return { at, key: item.key, basis: "none", basisName: BASIS_NONE, features, stage, basisProject: null, low: null, high: null };
   }
   return {
     at,
@@ -1347,6 +1350,7 @@ function logLineOf(item: EstimateItem, estimate: SignalEstimate, at: number): Es
     features,
     // A spent line has a fixed stage, so the stage tag of the item cannot start a new line.
     stage: estimate.basisName === BASIS_SPENT ? SPENT_STAGE : stage,
+    basisProject: estimate.basisProject ?? null,
     low: estimate.weightedLow,
     // An open range logs its low end as its high end. The item has already used
     // more than the range of its basis, so the self-check scores the line a miss
@@ -1355,12 +1359,13 @@ function logLineOf(item: EstimateItem, estimate: SignalEstimate, at: number): Es
   };
 }
 
-// The same basis, the same name, the same feature names and the same stage. The
+// The same basis, basis name, project scope, feature names and stage. The
 // range is not part of it: a range moves with every new finished task.
 function sameBasis(a: EstimateLogLine, b: EstimateLogLine): boolean {
   return (
     a.basis === b.basis &&
     a.basisName === b.basisName &&
+    (a.basisProject ?? null) === (b.basisProject ?? null) &&
     a.stage === b.stage &&
     a.features.length === b.features.length &&
     a.features.every((name, index) => name === b.features[index])
@@ -1392,8 +1397,8 @@ function latestByKey(lines: readonly EstimateLogLine[]): Map<string, EstimateLog
 }
 
 // The lines to write for the estimates of a pass: one for each key that has no
-// line yet, and one for each key whose basis, basis name, feature names or stage
-// differ from its latest line in the log. `estimates` is in the order of `items`.
+// line yet, and one for each key whose basis, basis name, project scope, feature
+// names or stage differ from its latest line. `estimates` is in the order of `items`.
 export function newLogLines(
   items: readonly EstimateItem[],
   estimates: readonly SignalEstimate[],

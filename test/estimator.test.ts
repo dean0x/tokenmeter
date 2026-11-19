@@ -1251,8 +1251,8 @@ test("TP-23: a line is written only when the key, the basis or the feature names
   const items = [item("A", null, { size: 5 }), item("B", null)];
   const first = newLogLines(items, [estimateOf("A", "size", 100, 400), estimateOf("B", "all", 10, 20)], [], LOG_NOW);
   assert.deepEqual(first, [
-    { at: LOG_NOW, key: "A", basis: "similar", basisName: "size", features: ["size"], stage: null, low: 100, high: 400 },
-    { at: LOG_NOW, key: "B", basis: "wide", basisName: "all", features: [], stage: null, low: 10, high: 20 },
+    { at: LOG_NOW, key: "A", basis: "similar", basisName: "size", features: ["size"], stage: null, basisProject: null, low: 100, high: 400 },
+    { at: LOG_NOW, key: "B", basis: "wide", basisName: "all", features: [], stage: null, basisProject: null, low: 10, high: 20 },
   ]);
 
   const same = [estimateOf("A", "size", 50, 900), estimateOf("B", "all", 10, 20)];
@@ -1262,7 +1262,7 @@ test("TP-23: a line is written only when the key, the basis or the feature names
   const renamed = newLogLines(items, [estimateOf("A", "type"), estimateOf("B", "all")], first, LOG_NOW + DAY_MS);
   assert.deepEqual(renamed.map((l) => [l.key, l.basis, l.basisName]), [["A", "wide", "type"]]);
   const lost = newLogLines(items, [estimateOf("A", "none"), estimateOf("B", "all")], first, LOG_NOW + DAY_MS);
-  assert.deepEqual(lost, [{ at: LOG_NOW + DAY_MS, key: "A", basis: "none", basisName: "none", features: ["size"], stage: null, low: null, high: null }]);
+  assert.deepEqual(lost, [{ at: LOG_NOW + DAY_MS, key: "A", basis: "none", basisName: "none", features: ["size"], stage: null, basisProject: null, low: null, high: null }]);
   const moreNames = newLogLines([item("A", null, { size: 5, churn: 3 }), item("B", null)], same, first, LOG_NOW + DAY_MS);
   assert.deepEqual(moreNames.map((l) => [l.key, l.features]), [["A", ["churn", "size"]]]);
   const newKey = newLogLines([...items, item("C", null)], [...same, estimateOf("C", "all")], first, LOG_NOW + DAY_MS);
@@ -1311,6 +1311,16 @@ test("a stage change with the same basis writes one new line, and a repeat in th
   assert.deepEqual(repeat, []);
   const dropped = newLogLines([{ key: "A", tags: {}, features: { size: 5 } }], estimates, [...first, ...moved], LOG_NOW + 2 * DAY_MS);
   assert.deepEqual(dropped.map((l) => l.stage), [null], "an item that loses its tag is a stage change to null");
+});
+
+test("TP-121: a project basis writes one new line after the same shared basis and no line on a repeat", () => {
+  const items = [{ ...item("A", null), tags: { project: "alpha" } }];
+  const shared = logged("A", LOG_NOW);
+  const estimates = [{ ...estimateOf("A", "all"), basisProject: "alpha" }];
+  const moved = newLogLines(items, estimates, [shared], LOG_NOW + DAY_MS);
+  assert.deepEqual(moved.map((line) => [line.basis, line.basisName, line.basisProject]), [["wide", "all", "alpha"]]);
+  assert.deepEqual(newLogLines(items, estimates, [shared, ...moved], LOG_NOW + 2 * DAY_MS), []);
+  assert.deepEqual(newLogLines(items, [estimateOf("A", "all")], [shared], LOG_NOW + 3 * DAY_MS), []);
 });
 
 test("an item with no stage tag keeps its line when the log holds a line with stage null", () => {
