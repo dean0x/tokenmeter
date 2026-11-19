@@ -524,6 +524,7 @@ This growth happens once.
   A range that is wider than that hits, but it does not help a week plan. So `useful_rate` is never more than `hit_rate`.
 - `stages`: the same eight values for each stage that a line of these 30 tasks names. A stage object has `n`, `hit_rate`, `error_factor`, `bias`, `band_low`, `band_high`, `width` and `useful_rate`.
   A stage uses the latest line of that stage that belongs to the task, over the same 30 most recent finished tasks.
+  A line that names a project different from the task's project can count only at the top level, not in `stages` or `projects`.
   A line with no stage does not count in `stages`. The top level uses the latest line, with or without a stage, but skips `spent` lines.
   A `spent` line has the stage `run`, so it counts in that stage only.
   An item with the stage tag `run` and an item on the `spent` basis count in the same `run` row. The row is one of the 8 places, like any stage.
@@ -534,7 +535,8 @@ This growth happens once.
   A name of only digits, such as `2`, comes before the other names, in number order.
   A stage past the eighth is not shown. Its lines stay in the log.
 - `projects`: the same eight fields for each project, from the top-level scores of the same 30 recent tasks.
-  A shared line can count for the project of its task. A line that names a different project can count at the top level but not in `projects`.
+  A shared line can count for the project of its task.
+  A task with no project can count at the top level but not in `projects`. Its shared lines can still count in `stages`.
   The rule still links lines by label. It does not look for a different line when the project does not match.
   The map keeps at most 8 projects with the most scored tasks, with ties by name.
   It is `{}` when no scored task has a project that meets these rules.
