@@ -1424,11 +1424,11 @@ export interface FinishedTask {
   readonly label: string;
   readonly start: number;
   readonly end: number;
+  readonly tags?: Readonly<Record<string, string>>;
   readonly totals: Readonly<Record<Subscription, TokenTotals>>;
 }
 
-// How the logged ranges did on a set of scored tasks: all of them, or those that
-// a stage tag links to a line.
+// How the logged ranges did on a set of scored tasks.
 export interface StageCheck {
   // The tasks among the most recent finished ones that had a range in the log
   // before they ended and a cost to compare with it.
@@ -1469,6 +1469,9 @@ export interface SelfCheck extends StageCheck {
   // tasks first (ties by text), then in text order. A task can count in several
   // stages. The map holds labels as keys only: a label is never a property name.
   readonly stages: ReadonlyMap<string, StageCheck>;
+  // The top-level scores by task project. A line with a different project scope
+  // counts only at the top level. At most MAX_PROJECTS projects in text order.
+  readonly projects: ReadonlyMap<string, StageCheck>;
 }
 
 // The stages that a self-check shows. A stage past this is left out.
@@ -1626,19 +1629,34 @@ export function checkOf(pairs: readonly ScoredPair[], subscription: Subscription
   };
 }
 
-// The MAX_STAGES stages with the most scored tasks, ties by text, in text order.
-function keptStages(checks: readonly (readonly [string, StageCheck])[]): Map<string, StageCheck> {
+// The groups with the most scored tasks, ties by text, in text order.
+function keptChecks(checks: readonly (readonly [string, StageCheck])[], cap: number): Map<string, StageCheck> {
   const ranked = [...checks]
     .sort(([nameA, checkA], [nameB, checkB]) => checkB.scored - checkA.scored || compareText(nameA, nameB))
-    .slice(0, MAX_STAGES)
+    .slice(0, cap)
     .sort(([nameA], [nameB]) => compareText(nameA, nameB));
   return new Map(ranked);
 }
 
+function projectChecks(top: readonly ScoredPair[], subscription: Subscription): ReadonlyMap<string, StageCheck> {
+  const groups = new Map<string, ScoredPair[]>();
+  for (const pair of top) {
+    const { task, line } = pair;
+    const project = task.tags === undefined ? null : projectOf(task.tags);
+    const scope = line.basisProject ?? null;
+    if (project === null || (scope !== null && scope !== project)) continue;
+    const group = groups.get(project);
+    if (group === undefined) groups.set(project, [pair]);
+    else group.push(pair);
+  }
+  const checks = [...groups].map(([project, pairs]) => [project, checkOf(pairs, subscription)] as const);
+  return keptChecks(checks.filter(([, check]) => check.scored > 0), MAX_PROJECTS);
+}
+
 // How the logged ranges did against the cost of the SELF_CHECK_TASKS most recent
-// finished tasks: the latest line that is not on the spent basis that links to
-// each task (a task with only spent lines is not scored here), and for each stage
-// the latest line of that stage. This function has no file and no clock.
+// finished tasks. The top level and the project checks use the latest line not
+// on the spent basis. Each stage uses its latest line. This function has no file
+// and no clock.
 export function selfCheck(
   lines: readonly EstimateLogLine[],
   finished: readonly FinishedTask[],
@@ -1653,9 +1671,9 @@ export function selfCheck(
       else pairs.push({ task, line });
     }
   }
-  const stages = keptStages([...pairsOfStage].map(([stage, pairs]) => [stage, checkOf(pairs, subscription)] as const));
+  const stages = keptChecks([...pairsOfStage].map(([stage, pairs]) => [stage, checkOf(pairs, subscription)] as const), MAX_STAGES);
   const top = recent.flatMap(({ task, latestUnspent }) => (latestUnspent === null ? [] : [{ task, line: latestUnspent }]));
-  return { ...checkOf(top, subscription), stages };
+  return { ...checkOf(top, subscription), stages, projects: projectChecks(top, subscription) };
 }
 
 // A window of the last sync, as the keep rule reads it.

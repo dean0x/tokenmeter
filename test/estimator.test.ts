@@ -1345,7 +1345,7 @@ test("the stage labels __proto__, constructor and toString are stored as the sta
 });
 
 // Labels K0.. each with one window of the given cost and one line before it ends.
-function checkedTasks(costs: readonly number[], range: readonly [number, number] = [100, 400]): { lines: EstimateLogLine[]; tasks: FinishedTask[] } {
+function checkedTasks(costs: readonly number[], range: readonly [number, number] = [100, 400]): { lines: RangedLogLine[]; tasks: FinishedTask[] } {
   const lines = costs.map((_, i) => logged(`K${i}`, day(1 + i), range));
   const tasks = costs.map((cost, i) => finishedTask(`K${i}`, day(2 + i), day(3 + i), cost));
   return { lines, tasks };
@@ -1412,6 +1412,68 @@ test("TP-28: only the thirty most recent finished tasks are scored", () => {
   assert.equal(result.scored, 30);
   const shuffled = selfCheck([...lines].reverse(), [...tasks].reverse());
   assert.deepEqual(shuffled, result, "the order of the input does not matter");
+});
+
+test("TP-124: project checks use the global thirty tasks and give null metrics under five scores", () => {
+  const { lines, tasks } = checkedTasks(Array.from({ length: 32 }, (_, i) => i === 11 ? 0 : 200));
+  const projects = [...Array<string>(7).fill("alpha"), ...Array<string>(4).fill("beta"), ...Array<string>(21).fill("gamma")];
+  const tagged = tasks.map((task, i) => ({ ...task, tags: { project: at(projects, i) } }));
+  const latestSpent = logged("K2", day(4), [1, 2], { basisName: BASIS_SPENT, stage: "run" });
+  const check = selfCheck([...lines, latestSpent], tagged);
+  const alpha = lines.slice(2, 7).map((line, i) => ({ line, task: at(tasks, i + 2) }));
+  assert.equal(check.scored, 29);
+  assert.deepEqual(check.projects.get("alpha"), checkOf(alpha, "claude"));
+  assert.deepEqual(check.projects.get("beta"), { ...EMPTY_CHECK, scored: 4 });
+  assert.equal(check.projects.get("gamma")?.scored, 20);
+});
+
+test("TP-125: project checks keep the eight most scored projects, with ties and output in text order", () => {
+  const projects = ["gamma9", "gamma8", "gamma7", "gamma6", "gamma5", "gamma4", "gamma3", "gamma2", "gamma1", "gamma0", "gamma9", "gamma8", null];
+  const { lines, tasks } = checkedTasks(projects.map(() => 200));
+  const tagged = tasks.map((task, i) => {
+    const project = at(projects, i);
+    return project === null ? task : { ...task, tags: { project } };
+  });
+  const check = selfCheck(lines, tagged);
+  assert.equal(check.scored, 13);
+  assert.deepEqual([...check.projects.keys()], [
+    "gamma0", "gamma1", "gamma2", "gamma3", "gamma4", "gamma5", "gamma8", "gamma9",
+  ]);
+});
+
+test("TP-126: no scored project gives an empty map and does not change the keep time", () => {
+  const { lines, tasks } = checkedTasks([0, ...Array.from({ length: 29 }, () => 200)]);
+  const finished = tasks.map((task, i) => i === 0 ? { ...task, tags: { project: "alpha" } } : task);
+  const scoped = lines.map((line, i) => i === 1 ? { ...line, basisProject: "beta" } : line);
+  const input = { lines: scoped, finished, damaged: false, openKeys: [], windows: [] };
+  assert.deepEqual(selfCheck(scoped, finished).projects, new Map());
+  assert.equal(keepTime(input), day(1));
+  assert.equal(keepTime({ ...input, damaged: true }), null);
+});
+
+test("TP-129: a reused label scores by each task's own tags, but mismatched scope scores only at the top level", () => {
+  const tasks = [
+    { ...finishedTask("K", day(2), day(3), 200), tags: { project: "alpha", repo: "beta" } },
+    { ...finishedTask("K", day(6), day(7), 200), tags: { repo: "beta" } },
+  ];
+  const lines = [logged("K", day(1)), logged("K", day(4), [100, 400], { basisProject: "beta" })];
+  const both = selfCheck(lines, tasks);
+  assert.deepEqual([both.projects.get("alpha")?.scored, both.projects.get("beta")?.scored], [1, 1]);
+
+  const mismatch = logged("K", day(5), [1, 2], { basisProject: "alpha", stage: "plan" });
+  const check = selfCheck([...lines, mismatch], tasks);
+  assert.equal(check.scored, 2);
+  assert.deepEqual([...check.projects.entries()], [["alpha", { ...EMPTY_CHECK, scored: 1 }]]);
+  assert.equal(check.stages.get("plan")?.scored, 1);
+});
+
+test("TP-134: a shuffle preserves the complete self-check with project keys", () => {
+  const projects = ["__proto__", "constructor", "toString"];
+  const { lines, tasks } = checkedTasks(Array.from({ length: 15 }, (_, i) => i % 2 === 0 ? 200 : 500));
+  const tagged = tasks.map((task, i) => ({ ...task, tags: { project: at(projects, i % projects.length) } }));
+  const check = selfCheck(lines, tagged);
+  assert.deepEqual([...check.projects.keys()], projects);
+  assert.deepEqual(selfCheck([...lines].reverse(), [...tagged].reverse()), check);
 });
 
 // The 2.5% and 97.5% quantiles of a Binomial(n, 4/5) count, from the probabilities as
@@ -1785,7 +1847,7 @@ test("TP-69: with no spent line in the log the top level is the check of the lat
     logged(task.label, before(task, 2), [10, 20], { stage: "plan" }),
     logged(task.label, before(task, 1), [100, 400]),
   ]);
-  const { stages, ...top } = selfCheck(lines, tasks);
+  const { stages, projects: _projects, ...top } = selfCheck(lines, tasks);
   assert.equal(stages.size, 1);
   assert.deepEqual(top, checkOf(tasks.map((task) => ({ task, line: logged(task.label, before(task, 1), [100, 400]) })), "claude"));
   assert.equal(top.hitRate, 1);
