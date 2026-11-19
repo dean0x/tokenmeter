@@ -53,6 +53,7 @@ import {
   type SelfCheck,
   type SignalEstimate,
   type StageCheck,
+  MAX_PROJECTS,
   MAX_STAGES,
   SELF_CHECK_MIN_SCORED,
   SELF_CHECK_TASKS,
@@ -231,6 +232,7 @@ export type EstimateJson =
       readonly count: number;
       readonly typical_pct: number | null;
       readonly budget_pct: number | null;
+      readonly basis_project: string | null;
     }
   | { readonly key: string; readonly subscription: Provider; readonly basis: "none"; readonly basis_name: string | null };
 
@@ -251,7 +253,9 @@ export type EstimateJson =
 // tasks names, at most 8 stages, in text order (an object puts a label of only
 // digits first, in number order): it is an empty object when no line of those
 // tasks has a stage, and null when the log could not be read or the snapshot is
-// from an older build. All nine are null when the log could not be read.
+// from an older build. `projects` has the same eight values for up to 8
+// projects of scored tasks. It is empty when none of those tasks has a project.
+// All fields are null when the log could not be read.
 export interface StageCheckJson {
   readonly n: number;
   readonly hit_rate: number | null;
@@ -273,6 +277,7 @@ export interface SelfCheckJson {
   readonly width: number | null;
   readonly useful_rate: number | null;
   readonly stages: Readonly<Record<string, StageCheckJson>> | null;
+  readonly projects: Readonly<Record<string, StageCheckJson>> | null;
 }
 
 // The sum of the costs of the open items, in percent of the week, as draws from the
@@ -439,6 +444,7 @@ export function estimateJson(item: SignalEstimate): EstimateJson {
     count: item.count,
     typical_pct: item.typicalPct,
     budget_pct: item.budgetPct,
+    basis_project: item.basisProject ?? null,
   };
 }
 
@@ -596,10 +602,9 @@ function typicalBudgetOf(
   return valid ? { typical_pct: typical, budget_pct: budget } : NO_COSTS;
 }
 
-// A snapshot from an older build has no raw range, no basis name and no typical
-// and budget cost in an estimate: they read as null, until the next collect. A
-// name that is not text reads as null too, and so do a typical and a budget cost
-// that are not valid, that lie outside the range, or that belong to an open range.
+// Fields from later builds read as null when absent. A name that is not text
+// or a project that is not a label reads as null. Typical and budget costs read
+// as null when invalid, outside the range, or part of an open range.
 function withLaterFields(item: EstimateJson): EstimateJson {
   const basisName: unknown = item.basis_name;
   const name = typeof basisName === "string" ? basisName : null;
@@ -617,6 +622,7 @@ function withLaterFields(item: EstimateJson): EstimateJson {
     count: item.count,
     typical_pct: costs.typical_pct,
     budget_pct: costs.budget_pct,
+    basis_project: isLabel(item.basis_project) ? item.basis_project : null,
   };
 }
 
@@ -691,15 +697,12 @@ function stageCheckOf(value: unknown): StageCheckJson | null {
   return numbers !== null && numbersMatchCount(n, numbers) ? { n, ...numbers } : null;
 }
 
-// The stages of a snapshot, or null for any bad value: a bad label, too many
-// stages, a bad stage or no object. The entries are read as data and the object
-// is built again from them, so no label is ever used as a property name of
-// another object.
-function stageChecksOf(value: unknown): Readonly<Record<string, StageCheckJson>> | null {
+// Rebuild the map from its entries so all labels remain own data keys.
+function checkMapOf(value: unknown, maxEntries: number): Readonly<Record<string, StageCheckJson>> | null {
   const row = asRow(value);
   if (row === null) return null;
   const entries = Object.entries(row);
-  if (entries.length > MAX_STAGES) return null;
+  if (entries.length > maxEntries) return null;
   const checked: (readonly [string, StageCheckJson])[] = [];
   for (const [label, entry] of entries) {
     const stage = stageCheckOf(entry);
@@ -711,11 +714,9 @@ function stageChecksOf(value: unknown): Readonly<Record<string, StageCheckJson>>
 
 // The self-check of a snapshot. A snapshot from an older build has none, and an
 // object with a wrong field reads as null: neither makes the snapshot corrupt.
-// The fields that a later build added (bias, the band, the width, the useful rate,
-// the stages) read as null when they are absent. A wrong field makes the whole
-// object null, except a bad `stages` value: it reads as null and keeps the rest.
-// With no task count (n null) every number and the stages are null, else the
-// whole object is null.
+// Fields from later builds read as null when absent. A bad map reads as null
+// and keeps the rest of the check. With no task count, projects reads as null.
+// In that case, a non-null number or stages value still invalidates the check.
 function selfCheckOf(value: unknown): SelfCheckJson | null {
   const row = asRow(value);
   if (row === null) return null;
@@ -731,8 +732,12 @@ function selfCheckOf(value: unknown): SelfCheckJson | null {
     row["useful_rate"] ?? null,
   );
   if (numbers === null || !numbersMatchCount(n, numbers)) return null;
-  if (n === null) return (row["stages"] ?? null) === null ? { n, ...numbers, stages: null } : null;
-  return { n, ...numbers, stages: stageChecksOf(row["stages"]) };
+  if (n === null && (row["stages"] ?? null) !== null) return null;
+  return {
+    n, ...numbers,
+    stages: checkMapOf(row["stages"], MAX_STAGES),
+    projects: n === null ? null : checkMapOf(row["projects"], MAX_PROJECTS),
+  };
 }
 
 const NO_QUEUE_SUMS = {
@@ -858,6 +863,7 @@ const UNREADABLE_SELF_CHECK: SelfCheckJson = {
   width: null,
   useful_rate: null,
   stages: null,
+  projects: null,
 };
 
 function stageCheckJson(check: StageCheck): StageCheckJson {
@@ -875,9 +881,12 @@ function stageCheckJson(check: StageCheck): StageCheckJson {
 
 // The stages are in text order in the map, and so in the object. A label is a
 // key of the new object only, never a property that is set by name.
+function checkMapJson(checks: ReadonlyMap<string, StageCheck>): Readonly<Record<string, StageCheckJson>> {
+  return Object.fromEntries([...checks].map(([label, check]) => [label, stageCheckJson(check)]));
+}
+
 function selfCheckJson(check: SelfCheck): SelfCheckJson {
-  const stages = [...check.stages].map(([label, stage]): readonly [string, StageCheckJson] => [label, stageCheckJson(stage)]);
-  return { ...stageCheckJson(check), stages: Object.fromEntries(stages) };
+  return { ...stageCheckJson(check), stages: checkMapJson(check.stages), projects: checkMapJson(check.projects) };
 }
 
 export function buildStatus(input: BuildInput): BuiltStatus {
