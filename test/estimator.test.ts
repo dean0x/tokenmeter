@@ -40,6 +40,7 @@ import {
   SELF_CHECK_TASKS,
   checkOf,
   estimateFromSignals,
+  fitAll,
   fitLine,
   fitPlane,
   hitRateBand,
@@ -47,12 +48,33 @@ import {
   newLogLines,
   nextQueueState,
   pctOfWeek,
+  projectFits,
+  projectFitsOf,
+  projectOf,
   queueSum,
   rangeShifts,
   scoreCandidates,
   scoreRatio,
   selfCheck,
 } from "../src/estimator.ts";
+
+test("TP-101: the own project tag takes precedence over the own repo tag", () => {
+  assert.equal(projectOf({ project: "alpha" }), "alpha");
+  assert.equal(projectOf({ repo: "beta" }), "beta");
+  assert.equal(projectOf({ project: "alpha", repo: "beta" }), "alpha");
+  assert.equal(projectOf({}), null);
+});
+
+test("TP-102: project tags use own entries and keep member names as values", () => {
+  const inherited: Record<string, string> = {};
+  Object.setPrototypeOf(inherited, { project: "alpha", repo: "beta" });
+  assert.equal(projectOf({ project: "__proto__" }), "__proto__");
+  assert.equal(projectOf({ project: "constructor" }), "constructor");
+  assert.equal(projectOf({ repo: "toString" }), "toString");
+  assert.equal(projectOf(inherited), null);
+  const ownRepo = Object.setPrototypeOf({ repo: "gamma" }, { project: "alpha" });
+  assert.equal(projectOf(ownRepo), "gamma");
+});
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1231,8 +1253,8 @@ test("TP-23: a line is written only when the key, the basis or the feature names
   const items = [item("A", null, { size: 5 }), item("B", null)];
   const first = newLogLines(items, [estimateOf("A", "size", 100, 400), estimateOf("B", "all", 10, 20)], [], LOG_NOW);
   assert.deepEqual(first, [
-    { at: LOG_NOW, key: "A", basis: "similar", basisName: "size", features: ["size"], stage: null, low: 100, high: 400 },
-    { at: LOG_NOW, key: "B", basis: "wide", basisName: "all", features: [], stage: null, low: 10, high: 20 },
+    { at: LOG_NOW, key: "A", basis: "similar", basisName: "size", features: ["size"], stage: null, basisProject: null, low: 100, high: 400 },
+    { at: LOG_NOW, key: "B", basis: "wide", basisName: "all", features: [], stage: null, basisProject: null, low: 10, high: 20 },
   ]);
 
   const same = [estimateOf("A", "size", 50, 900), estimateOf("B", "all", 10, 20)];
@@ -1242,7 +1264,7 @@ test("TP-23: a line is written only when the key, the basis or the feature names
   const renamed = newLogLines(items, [estimateOf("A", "type"), estimateOf("B", "all")], first, LOG_NOW + DAY_MS);
   assert.deepEqual(renamed.map((l) => [l.key, l.basis, l.basisName]), [["A", "wide", "type"]]);
   const lost = newLogLines(items, [estimateOf("A", "none"), estimateOf("B", "all")], first, LOG_NOW + DAY_MS);
-  assert.deepEqual(lost, [{ at: LOG_NOW + DAY_MS, key: "A", basis: "none", basisName: "none", features: ["size"], stage: null, low: null, high: null }]);
+  assert.deepEqual(lost, [{ at: LOG_NOW + DAY_MS, key: "A", basis: "none", basisName: "none", features: ["size"], stage: null, basisProject: null, low: null, high: null }]);
   const moreNames = newLogLines([item("A", null, { size: 5, churn: 3 }), item("B", null)], same, first, LOG_NOW + DAY_MS);
   assert.deepEqual(moreNames.map((l) => [l.key, l.features]), [["A", ["churn", "size"]]]);
   const newKey = newLogLines([...items, item("C", null)], [...same, estimateOf("C", "all")], first, LOG_NOW + DAY_MS);
@@ -1293,6 +1315,21 @@ test("a stage change with the same basis writes one new line, and a repeat in th
   assert.deepEqual(dropped.map((l) => l.stage), [null], "an item that loses its tag is a stage change to null");
 });
 
+test("TP-121: each change between shared and project scope writes one line, but a repeat writes none", () => {
+  const items = [{ ...item("A", null), tags: { project: "alpha" } }];
+  const shared = logged("A", LOG_NOW);
+  const estimate = estimateOf("A", "all");
+  const projectEstimate = { ...estimate, basisProject: "alpha" };
+  const moved = newLogLines(items, [projectEstimate], [shared], LOG_NOW + DAY_MS);
+  assert.deepEqual(moved, [{ ...shared, at: LOG_NOW + DAY_MS, basisProject: "alpha" }]);
+
+  const history = [shared, ...moved];
+  assert.deepEqual(newLogLines(items, [projectEstimate], history, LOG_NOW + 2 * DAY_MS), []);
+  const back = newLogLines(items, [estimate], history, LOG_NOW + 3 * DAY_MS);
+  assert.deepEqual(back, [{ ...shared, at: LOG_NOW + 3 * DAY_MS, basisProject: null }]);
+  assert.deepEqual(newLogLines(items, [estimate], [shared], LOG_NOW + 3 * DAY_MS), []);
+});
+
 test("an item with no stage tag keeps its line when the log holds a line with stage null", () => {
   const first = newLogLines([item("A", null, { size: 5 })], [estimateOf("A", "size")], [], LOG_NOW);
   assert.deepEqual(newLogLines([item("A", null, { size: 5 })], [estimateOf("A", "size")], first, LOG_NOW + DAY_MS), []);
@@ -1315,7 +1352,7 @@ test("the stage labels __proto__, constructor and toString are stored as the sta
 });
 
 // Labels K0.. each with one window of the given cost and one line before it ends.
-function checkedTasks(costs: readonly number[], range: readonly [number, number] = [100, 400]): { lines: EstimateLogLine[]; tasks: FinishedTask[] } {
+function checkedTasks(costs: readonly number[], range: readonly [number, number] = [100, 400]): { lines: RangedLogLine[]; tasks: FinishedTask[] } {
   const lines = costs.map((_, i) => logged(`K${i}`, day(1 + i), range));
   const tasks = costs.map((cost, i) => finishedTask(`K${i}`, day(2 + i), day(3 + i), cost));
   return { lines, tasks };
@@ -1382,6 +1419,69 @@ test("TP-28: only the thirty most recent finished tasks are scored", () => {
   assert.equal(result.scored, 30);
   const shuffled = selfCheck([...lines].reverse(), [...tasks].reverse());
   assert.deepEqual(shuffled, result, "the order of the input does not matter");
+});
+
+test("TP-124: project checks use the global thirty tasks and give null metrics under five scores", () => {
+  const { lines, tasks } = checkedTasks(Array.from({ length: 32 }, (_, i) => i === 11 ? 0 : 200));
+  const projects = [...Array<string>(7).fill("alpha"), ...Array<string>(4).fill("beta"), ...Array<string>(21).fill("gamma")];
+  const tagged = tasks.map((task, i) => ({ ...task, tags: { project: at(projects, i) } }));
+  const latestSpent = logged("K2", day(4), [1, 2], { basisName: BASIS_SPENT, stage: "run" });
+  const check = selfCheck([...lines, latestSpent], tagged);
+  const alpha = lines.slice(2, 7).map((line, i) => ({ line, task: at(tasks, i + 2) }));
+  assert.equal(check.scored, 29);
+  assert.deepEqual(check.projects.get("alpha"), checkOf(alpha, "claude"));
+  assert.deepEqual(check.projects.get("beta"), { ...EMPTY_CHECK, scored: 4 });
+  assert.equal(check.projects.get("gamma")?.scored, 20);
+});
+
+test("TP-125: project checks keep the eight most scored projects, with ties and output in text order", () => {
+  const projects = ["gamma9", "gamma8", "gamma7", "gamma6", "gamma5", "gamma4", "gamma3", "gamma2", "gamma1", "gamma0", "gamma9", "gamma8", null];
+  const { lines, tasks } = checkedTasks(projects.map(() => 200));
+  const tagged = tasks.map((task, i) => {
+    const project = at(projects, i);
+    return project === null ? task : { ...task, tags: { project } };
+  });
+  const check = selfCheck(lines, tagged);
+  assert.equal(check.scored, 13);
+  assert.deepEqual([...check.projects.keys()], [
+    "gamma0", "gamma1", "gamma2", "gamma3", "gamma4", "gamma5", "gamma8", "gamma9",
+  ]);
+});
+
+test("TP-126: no scored project gives an empty map and does not change the keep time", () => {
+  const { lines, tasks } = checkedTasks([0, ...Array.from({ length: 29 }, () => 200)]);
+  const finished = tasks.map((task, i) => i === 0 ? { ...task, tags: { project: "alpha" } } : task);
+  const scoped = lines.map((line, i) => i === 1 ? { ...line, basisProject: "beta" } : line);
+  const input = { lines: scoped, finished, damaged: false, openKeys: [], windows: [] };
+  assert.deepEqual(selfCheck(scoped, finished).projects, new Map());
+  assert.equal(keepTime(input), day(1));
+  assert.equal(keepTime({ ...input, damaged: true }), null);
+});
+
+test("TP-129: a reused label scores by each task's own tags, but mismatched scope scores only at the top level", () => {
+  const tasks = [
+    { ...finishedTask("K", day(2), day(3), 200), tags: { project: "alpha", repo: "beta" } },
+    { ...finishedTask("K", day(6), day(7), 200), tags: { repo: "beta" } },
+  ];
+  const lines = [logged("K", day(1), [100, 400], { stage: "plan" }), logged("K", day(4), [100, 400], { basisProject: "beta", stage: "plan" })];
+  const both = selfCheck(lines, tasks);
+  assert.deepEqual([both.projects.get("alpha")?.scored, both.projects.get("beta")?.scored], [1, 1]);
+  assert.equal(both.stages.get("plan")?.scored, 2);
+
+  const mismatch = logged("K", day(5), [1, 2], { basisProject: "alpha", stage: "plan" });
+  const check = selfCheck([...lines, mismatch], tasks);
+  assert.equal(check.scored, 2);
+  assert.deepEqual([...check.projects.entries()], [["alpha", { ...EMPTY_CHECK, scored: 1 }]]);
+  assert.equal(check.stages.get("plan")?.scored, 1);
+});
+
+test("TP-134: a shuffle preserves the complete self-check with project keys", () => {
+  const projects = ["__proto__", "constructor", "toString"];
+  const { lines, tasks } = checkedTasks(Array.from({ length: 15 }, (_, i) => i % 2 === 0 ? 200 : 500));
+  const tagged = tasks.map((task, i) => ({ ...task, tags: { project: at(projects, i % projects.length) } }));
+  const check = selfCheck(lines, tagged);
+  assert.deepEqual([...check.projects.keys()], projects);
+  assert.deepEqual(selfCheck([...lines].reverse(), [...tagged].reverse()), check);
 });
 
 // The 2.5% and 97.5% quantiles of a Binomial(n, 4/5) count, from the probabilities as
@@ -1755,7 +1855,7 @@ test("TP-69: with no spent line in the log the top level is the check of the lat
     logged(task.label, before(task, 2), [10, 20], { stage: "plan" }),
     logged(task.label, before(task, 1), [100, 400]),
   ]);
-  const { stages, ...top } = selfCheck(lines, tasks);
+  const { stages, projects: _projects, ...top } = selfCheck(lines, tasks);
   assert.equal(stages.size, 1);
   assert.deepEqual(top, checkOf(tasks.map((task) => ({ task, line: logged(task.label, before(task, 1), [100, 400]) })), "claude"));
   assert.equal(top.hitRate, 1);
@@ -2104,6 +2204,418 @@ test("TP-15: the range covers the cost of at least 78 percent of the thirty fixt
 });
 
 // ---------------------------------------------------------------------------
+// Project estimates
+// ---------------------------------------------------------------------------
+
+function tagged<T extends EstimateTask | EstimateItem>(entry: T, project: string): T {
+  return { ...entry, tags: { ...entry.tags, project } };
+}
+
+const ALPHA = tagged(item("alpha", null), "alpha");
+
+function costSeries(count: number, start: number, project?: string): EstimateTask[] {
+  return Array.from({ length: count }, (_, i) => {
+    const entry = task(start + i, null);
+    return project === undefined ? entry : tagged(entry, project);
+  });
+}
+
+function scoped(entry: EstimateItem, history: readonly EstimateTask[], perPct = PER_PCT) {
+  const calibration = ready(perPct);
+  return ranged(only(estimateFromSignals([entry], history, { claude: calibration, codex: calibration })));
+}
+
+function withoutProjects(history: readonly EstimateTask[]): EstimateTask[] {
+  return history.map(({ tags: { project: _project, ...tags }, ...entry }) => ({ ...entry, tags }));
+}
+
+function ownScope(row: SignalEstimate): string | undefined {
+  return row.basis === "none" ? undefined : row.basisProject;
+}
+
+function projectFixture(): EstimateTask[] {
+  return [...costSeries(30, 10), ...costSeries(20, 500, "alpha")];
+}
+
+test("TP-103: an item with no project keeps its shared estimate", () => {
+  const history = projectFixture();
+  const entry = item("alpha", null);
+  const row = scoped(entry, history);
+  const projectRow = scoped(ALPHA, history);
+  assert.equal(ownScope(projectRow), "alpha");
+  assert.deepEqual(scoped({ ...entry, tags: { repo: "alpha" } }, history), projectRow);
+  assert.deepEqual(row, scoped(entry, withoutProjects(history)));
+  assert.ok(!Object.hasOwn(row, "basisProject"));
+});
+
+test("TP-107: a project uses its own range only when the blend improves on shared fits", () => {
+  const history = projectFixture();
+  assert.equal(ownScope(scoped(ALPHA, history)), "alpha");
+  const sameMix = [...costSeries(20, 500), ...costSeries(20, 500, "alpha")];
+  assert.deepEqual(scoped(ALPHA, sameMix), scoped(ALPHA, withoutProjects(sameMix)));
+});
+
+function projectFitPass() {
+  const history = projectFixture().map((entry) => ({ ...entry, tags: { ...entry.tags, type: "work" } }));
+  return fitAll(history, "claude", 0);
+}
+
+for (const fault of ["short", "non-finite"] as const) {
+  test(`the project cannot win against a shared fit with a ${fault} error array`, () => {
+    const pass = projectFitPass();
+    const [all, type] = [at(pass.fitted, 0), at(pass.fitted, 1)];
+    const prefix = type.errors.slice(0, -1);
+    const errors = fault === "short" ? prefix : [...prefix, Number.NaN];
+    const fitted = [all, { ...type, errors }];
+    assert.equal(projectFitsOf({ ...pass, fitted: [all] }).get("alpha")?.wins, true);
+    assert.equal(projectFitsOf({ ...pass, fitted }).get("alpha")?.wins ?? false, false);
+  });
+}
+
+test("the project cannot win when the project count excludes a fit sample", () => {
+  const pass = projectFitPass();
+  const group = pass.projectGroups.fit.get("alpha");
+  assert.ok(group !== undefined);
+  const projectGroups = { ...pass.projectGroups, fit: new Map([["alpha", group.slice(1)]]) };
+  assert.equal(projectFitsOf(pass).get("alpha")?.wins, true);
+  assert.equal(projectFitsOf({ ...pass, projectGroups }).get("alpha")?.wins ?? false, false);
+});
+
+test("TP-111: a project row uses exact rank ends and clips its center to them", () => {
+  const row = scoped(ALPHA, projectFixture());
+  assert.deepEqual([row.basis, row.basisName, ownScope(row), row.count], ["wide", "all", "alpha", 20]);
+  assert.deepEqual([row.weightedLow, row.weightedHigh], [501, 518]);
+  const nine = scoped(ALPHA, [...costSeries(30, 2000), ...costSeries(9, 500, "alpha")]);
+  assert.equal(ownScope(nine), "alpha");
+  assert.equal(nine.budgetPct, 508 / PER_PCT);
+  assert.equal(nine.highPct, nine.budgetPct);
+  assert.ok(nine.typicalPct !== null && nine.typicalPct >= nine.lowPct && nine.typicalPct <= nine.budgetPct);
+});
+
+test("TP-112: constant costs give the same rows as untagged history", () => {
+  const history = Array.from({ length: 20 }, () => tagged(task(500, null), "alpha"));
+  assert.equal(projectFits(history, "claude").size, 0);
+  const rows = estimateFromSignals([ALPHA], history, CAL);
+  assert.deepEqual(rows, estimateFromSignals([ALPHA], withoutProjects(history), CAL));
+  assert.ok(!Object.hasOwn(only(rows), "basisProject"));
+});
+
+test("TP-108: a project cannot win with no eligible shared fit", () => {
+  const shared = Array.from({ length: 30 }, () => task(50, null));
+  const history = [...shared, ...costSeries(9, 500, "alpha")];
+  assert.equal(scoreCandidates(history, "claude").length, 0);
+  assert.equal(projectFits(history, "claude").get("alpha")?.wins, false);
+  assert.equal(only(estimateFromSignals([ALPHA], history, CAL)).basis, "none");
+});
+
+test("TP-108: an eligible type can decide the gate when the whole project has a zero baseline", () => {
+  const common = Array.from({ length: 21 }, () => tagged(task(500, null), "alpha"));
+  const typed = Array.from({ length: 9 }, (_, i) => tagged(task(501 + i, "beta"), "alpha"));
+  const peers = Array.from({ length: 10 }, () => task(5000, "beta"));
+  const history = [...common, ...typed, ...peers];
+  const row = scoped({ ...ALPHA, tags: { project: "alpha", type: "beta" } }, history);
+  assert.deepEqual([ownScope(row), row.count, row.basisName], ["alpha", 30, "all"]);
+  assert.equal(projectFits(history, "claude").get("alpha")?.candidate.score, null);
+});
+
+test("TP-105: only project tasks at or above the floor count toward the minimum", () => {
+  const shared = costSeries(30, 30);
+  const small = costSeries(8, 500, "alpha");
+  const atFloor = tagged(task(10, null), "alpha");
+  const underFloor = tagged(task(9, null), "alpha");
+  assert.equal(projectFits([...shared, ...small, underFloor], "claude", 10).has("alpha"), false);
+  assert.equal(projectFits([...shared, ...small, atFloor], "claude", 10).get("alpha")?.candidate.count, 9);
+});
+
+test("TP-106: the eight largest projects qualify, with ties in text order", () => {
+  const names = Array.from({ length: 10 }, (_, i) => `alpha-${i}`);
+  const large = at(names, 9);
+  const history = [...names].reverse().flatMap((name) => costSeries(name === large ? 10 : 9, 100, name));
+  assert.deepEqual([...projectFits(history, "claude").keys()], [large, ...names.slice(0, 7)]);
+});
+
+function withoutIndex<T>(values: readonly T[], index: number): T[] {
+  return values.filter((_, i) => i !== index);
+}
+
+function expandedCenter(shared: readonly number[], project: readonly number[], percentile: number): number {
+  const expanded = [...shared, ...project].flatMap((cost, i) =>
+    Array<number>(i < shared.length ? 9 : shared.length + project.length + 9).fill(cost),
+  );
+  expanded.sort((a, b) => a - b);
+  return at(expanded, Math.ceil(percentile * expanded.length) - 1);
+}
+
+function blendError(shared: readonly number[], project: readonly number[], index: number, belowFloor: readonly number[] = []): number {
+  const remaining = withoutIndex(project, index);
+  const { low, high } = rankOracle([...remaining, ...belowFloor]);
+  const prediction = Math.min(high, Math.max(low, expandedCenter(shared, remaining, 0.5)));
+  return Math.abs(Math.log(at(project, index)) - Math.log(prediction));
+}
+
+test("TP-108: a partial type fit can stop a win at the nine-tenths margin", () => {
+  const project = costSeries(20, 500, "alpha").map((entry, i) =>
+    i < 9 ? { ...entry, tags: { ...entry.tags, type: "beta" } } : entry,
+  );
+  const costsOf = (entries: readonly EstimateTask[]) => entries.map((entry) => entry.totals.claude.weighted);
+  const costs = costsOf(project);
+  const typedItem = { ...ALPHA, tags: { ...ALPHA.tags, type: "beta" } };
+  const outside = costSeries(30, 10);
+  const ratios: number[] = [];
+  for (let start = 485; start <= 525; start += 1) {
+    const peers = costSeries(12, start).map((entry) => ({ ...entry, tags: { type: "beta" } }));
+    const history = [...outside, ...peers, ...project];
+    const otherCosts = costsOf([...outside, ...peers]);
+    const logs = (values: readonly number[]) => values.map(Math.log);
+    const typeCosts = [...costs.slice(0, 9), ...costsOf(peers)];
+    const errors = costs.map((_, i) => blendError(otherCosts, costs, i));
+    const allError = median(costs.map((cost, i) =>
+      Math.abs(Math.log(cost) - median(logs([...otherCosts, ...withoutIndex(costs, i)]))),
+    ));
+    assert.ok(median(errors) <= 0.9 * allError);
+    const typeError = median(costs.slice(0, 9).map((cost, i) =>
+      Math.abs(Math.log(cost) - median(logs(withoutIndex(typeCosts, i)))),
+    ));
+    const ratio = median(errors.slice(0, 9)) / typeError;
+    ratios.push(ratio);
+    const expected = ratio <= 0.9;
+    assert.equal(projectFits(history, "claude").get("alpha")?.wins, expected, `ratio=${ratio}`);
+    assert.equal(ownScope(scoped(typedItem, history)), expected ? "alpha" : undefined);
+  }
+  assert.ok(ratios.some((ratio) => ratio <= 0.9));
+  assert.ok(ratios.some((ratio) => ratio > 0.9 && ratio < 1));
+  assert.ok(ratios.some((ratio) => ratio >= 1));
+});
+
+function candidateRange(shared: readonly number[], project: readonly number[]) {
+  const history = [...shared.map((cost) => task(cost, null)), ...project.map((cost) => tagged(task(cost, null), "alpha"))];
+  const range = projectFits(history, "claude").get("alpha")?.candidate.rangeFor(ALPHA);
+  assert.ok(range !== undefined && range !== null);
+  return range;
+}
+
+test("TP-109: the project center agrees with whole-number weight expansion", () => {
+  const shared = Array.from({ length: 9 }, (_, i) => 41 + i);
+  const project = [10, 20, 30, 40, 60, 70, 80, 90, 100];
+  const range = candidateRange(shared, project);
+  assert.deepEqual([range.typical, range.budget], [expandedCenter(shared, project, 0.5), expandedCenter(shared, project, 0.8)]);
+});
+
+test("TP-110: the project weight is one half at 9 tasks and nine tenths at 81", () => {
+  const shared = Array.from({ length: 30 }, () => 20);
+  for (const [count, projectWeight] of [[9, 0.5], [81, 0.9]] as const) {
+    const project = Array.from({ length: count }, (_, i) => i === 0 ? 10 : 100 + i);
+    const range = candidateRange(shared, project);
+    const all = [...shared, ...project].sort((a, b) => a - b);
+    const expected = (percentile: number) => all.find((cost) => {
+      const projectCdf = project.filter((value) => value <= cost).length / project.length;
+      const sharedCdf = all.filter((value) => value <= cost).length / all.length;
+      return projectWeight * projectCdf + (1 - projectWeight) * sharedCdf >= percentile;
+    });
+    assert.deepEqual([range.typical, range.budget], [expected(0.5), expected(0.8)]);
+  }
+});
+
+test("TP-146: the rank counts under-floor costs and a nine-task fit clamps to the remaining ends", () => {
+  const shared = costSeries(30, 50);
+  const cachedTask = (cost: number) => tagged(taskFrom([0, 0, 0, cost * 10, 0], null), "alpha");
+  const project = costSeries(9, 500, "alpha").map((entry, i) => i < 4 ? cachedTask(500 + i) : entry);
+  const belowFloor = [2, 3, 4].map(cachedTask);
+  const floor = 10;
+  const fit = projectFits([...shared, ...project, ...belowFloor], "claude", floor).get("alpha");
+  assert.ok(fit !== undefined);
+  const range = fit.candidate.rangeFor(ALPHA);
+  assert.ok(range !== null);
+  assert.deepEqual([fit.candidate.count, fit.candidate.rawRatio, range.low, range.high], [9, 10, 2, 508]);
+  assert.equal(projectFits([...shared, ...project.slice(1), ...belowFloor], "claude", floor).has("alpha"), false);
+  const costs = (entries: readonly EstimateTask[]) => entries.map((entry) => entry.totals.claude.weighted);
+  const own = costs(project);
+  const outside = costs(shared);
+  const baseline = median(own.map((cost, i) => Math.abs(Math.log(cost) - median([...outside, ...withoutIndex(own, i)].map(Math.log)))));
+  const score = projectFits([...shared, ...project], "claude", floor).get("alpha")?.candidate.score;
+  assert.ok(typeof score === "number");
+  close(score, median(own.map((_, i) => blendError(outside, own, i))) / baseline);
+});
+
+test("TP-148: standalone candidates agree with the ranges and scores of both item paths", () => {
+  const history = projectFixture();
+  const clean = withoutProjects(history);
+  const scored = (entries: readonly EstimateTask[]) => scoreCandidates(entries, "claude", 1)
+    .map(({ model, score, count }) => ({ model, score, count }));
+  assert.deepEqual(scored(history), scored(clean));
+  const sharedItem = item("beta", null);
+  const projectFit = projectFits(history, "claude", 1).get("alpha");
+  assert.ok(projectFit?.wins);
+  const sharedFit = at(scoreCandidates(history, "claude", 1), 0);
+  const inputs = [[ALPHA, projectFit.candidate], [sharedItem, sharedFit]] as const;
+  const rows = estimateFromSignals(inputs.map(([entry]) => entry), history, CAL);
+  inputs.forEach(([entry, candidate], i) => {
+    const expected = candidate.rangeFor(entry);
+    assert.ok(expected !== null);
+    const row = ranged(at(rows, i));
+    assert.deepEqual([row.weightedLow, row.weightedHigh, row.count], [expected.low, expected.high, candidate.count]);
+  });
+});
+
+// Project checks use an LCG and Box-Muller draws from the specified log laws.
+function projectRandom(seed: number): () => number {
+  let state = seed;
+  return () => {
+    state = nextQueueState(state);
+    return (state + 0.5) / 2 ** 32;
+  };
+}
+
+function drawCost(random: () => number, center: number, spread: number): number {
+  const z = Math.sqrt(-2 * Math.log(random())) * Math.cos(2 * Math.PI * random());
+  return Math.exp(center + spread * z);
+}
+
+function rankOracle(costs: readonly number[]): { low: number; high: number } {
+  const ordered = [...costs].sort((a, b) => a - b);
+  const count = ordered.length;
+  return {
+    low: at(ordered, Math.max(1, Math.floor((count + 1) / 10)) - 1),
+    high: at(ordered, Math.min(count, Math.ceil(9 * (count + 1) / 10)) - 1),
+  };
+}
+
+test("TP-113: each of two projects keeps its basis and covers at least 78 percent in leave-one-out", (t) => {
+  const random = projectRandom(101);
+  const groups = [["alpha", 7], ["beta", 10]] as const;
+  const history = groups.flatMap(([project, center]) =>
+    Array.from({ length: 20 }, () => tagged(task(drawCost(random, center, 0.4), null), project)),
+  );
+  const stats = groups.map(([project]) => {
+    let hits = 0;
+    let wins = 0;
+    history.forEach((holdout, i) => {
+      if (holdout.tags.project !== project) return;
+      const row = scoped(tagged(item(project, null), project), history.filter((_, j) => i !== j));
+      const cost = holdout.totals.claude.weighted;
+      if (row.weightedLow <= cost && cost <= row.weightedHigh) hits += 1;
+      if (ownScope(row) === project) wins += 1;
+    });
+    t.diagnostic(`${project}: coverage=${hits}/20 wins=${wins}/20`);
+    return { project, hits, wins };
+  });
+  for (const { project, hits, wins } of stats) {
+    assert.equal(wins, 20, project);
+    assert.ok(hits / 20 >= 0.78, project);
+  }
+});
+
+interface TrialRange {
+  readonly low: number;
+  readonly high: number;
+  readonly center: number;
+}
+
+function projectTrial(random: () => number, count: number, arm: "offset" | "zero") {
+  const sharedCenter = 8;
+  const offset = (0.75 + 1.25 * random()) * (random() < 0.5 ? -1 : 1);
+  const projectCenter = sharedCenter + (arm === "offset" ? offset : 0);
+  const projectSpread = arm === "offset" ? 0.4 : 0.8;
+  const floor = Math.exp(Math.min(sharedCenter - 1.6448536269514722 * 0.8, projectCenter - 1.6448536269514722 * projectSpread));
+  const shared = Array.from({ length: 200 }, () => task(drawCost(random, sharedCenter, 0.8), null));
+  const costs: number[] = [];
+  let fitCount = 0;
+  for (let draw = 0; draw < 10 * count && fitCount < count; draw += 1) {
+    if (draw === 10 * count - 1) assert.fail(`draw cap: ${arm} at n_fit=${count}`);
+    const cost = drawCost(random, projectCenter, projectSpread);
+    costs.push(cost);
+    if (cost >= floor) fitCount += 1;
+  }
+  const newCosts = Array.from({ length: 20 }, () => drawCost(random, projectCenter, projectSpread));
+  const perPct = floor / 0.1;
+  const row = scoped(ALPHA, [...shared, ...costs.map((cost) => tagged(task(cost, null), "alpha"))], perPct);
+  assert.ok(row.typicalPct !== null);
+  const rank = { ...rankOracle(costs), center: median(costs) };
+  const shown = { low: row.weightedLow, high: row.weightedHigh, center: row.typicalPct * perPct };
+  const measures = ({ low, high, center }: TrialRange) => ({
+    coverage: newCosts.filter((cost) => low <= cost && cost <= high).length / newCosts.length,
+    width: high / low,
+    centerError: Math.abs(Math.log(center) - projectCenter),
+  });
+  return { shown: measures(shown), rank: measures(rank), won: ownScope(row) === "alpha" };
+}
+
+for (const [arm, title] of [
+  ["offset", "TP-114: the seed-101 offset fixture meets the aggregate and per-count coverage thresholds"],
+  ["zero", "TP-147: the seed-101 zero-offset fixture has an aggregate project win fraction of at most 0.2"],
+] as const) {
+  test(title, (t) => {
+    const random = projectRandom(101);
+    const counts = Array.from({ length: 8 }, (_, i) => i + 9);
+    const stats = counts.map((count) => {
+      const trials = Array.from({ length: 100 }, () => projectTrial(random, count, arm));
+      const mean = (values: readonly number[]) => values.reduce((sum, value) => sum + value, 0) / values.length;
+      const coverage = mean(trials.map(({ shown }) => shown.coverage));
+      const wins = mean(trials.map(({ won }) => Number(won)));
+      const width = median(trials.map(({ shown }) => shown.width));
+      const error = median(trials.map(({ shown }) => shown.centerError));
+      const rankCoverage = mean(trials.map(({ rank }) => rank.coverage));
+      const rankWidth = median(trials.map(({ rank }) => rank.width));
+      const rankError = median(trials.map(({ rank }) => rank.centerError));
+      t.diagnostic(`${arm} n_fit=${count}: coverage=${coverage.toFixed(3)} wins=${wins.toFixed(3)} width=${width.toFixed(3)} center_error=${error.toFixed(3)}; rank coverage=${rankCoverage.toFixed(3)} width=${rankWidth.toFixed(3)} center_error=${rankError.toFixed(3)}`);
+      return { count, coverage, wins };
+    });
+    if (arm === "offset") {
+      const meanCoverage = stats.reduce((sum, { coverage }) => sum + coverage, 0) / stats.length;
+      assert.ok(meanCoverage >= 0.8, `seed-101 offset fixture aggregate coverage: ${meanCoverage}`);
+      for (const { count, coverage } of stats) assert.ok(coverage >= 0.75, `seed-101 offset fixture coverage at n_fit=${count}: ${coverage}`);
+    } else {
+      const meanWins = stats.reduce((sum, { wins }) => sum + wins, 0) / stats.length;
+      assert.ok(meanWins <= 0.2, `seed-101 zero-offset fixture aggregate project win fraction: ${meanWins}`);
+    }
+  });
+}
+
+test("TP-134: a shuffle preserves project scopes and estimate ends", () => {
+  const history = projectFixture();
+  const random = projectRandom(101);
+  const shuffled = history.map((entry) => ({ entry, order: random() })).sort((a, b) => a.order - b.order).map(({ entry }) => entry);
+  const entries = [ALPHA, tagged(item("beta", null), "beta"), item("gamma", null)];
+  const rows = estimateFromSignals(entries, history, CAL);
+  const reordered = estimateFromSignals(entries, shuffled, CAL);
+  assert.equal(ownScope(only(rows.slice(0, 1))), "alpha");
+  rows.forEach((estimate, index) => {
+    const row = ranged(estimate);
+    const other = ranged(at(reordered, index));
+    assert.deepEqual([row.basis, row.basisName, ownScope(row)], [other.basis, other.basisName, ownScope(other)]);
+    close(row.weightedLow, other.weightedLow);
+    close(row.weightedHigh, other.weightedHigh);
+  });
+});
+
+test("TP-135: a spent row stays shared even when its project wins", () => {
+  const history = projectFixture();
+  assert.equal(ownScope(scoped(ALPHA, history)), "alpha");
+  const running = { ...ALPHA, spent: 500 };
+  const row = scoped(running, history);
+  assert.equal(row.basisName, BASIS_SPENT);
+  assert.equal(ownScope(row) ?? null, null);
+  assert.deepEqual(row, scoped(running, withoutProjects(history)));
+  assert.deepEqual(queueSum([ALPHA, running], history, CAL), queueSum([ALPHA, running], withoutProjects(history), CAL));
+});
+
+test("TP-145: a project win keeps a shared feature only when it is better on its covered tasks", () => {
+  const project = costSeries(20, 500, "alpha").map((entry, i) => ({
+    ...entry,
+    features: i < 8 ? { files: 499 + i } : i === 8 ? { commits: 10 } : {},
+  }));
+  const shared = costSeries(30, 10).map((entry, i) => ({ ...entry, features: { commits: 9 + i } }));
+  const history = [...shared, ...project];
+  const good = { ...ALPHA, features: { files: 502 } };
+  const worse = { ...ALPHA, features: { commits: 10 } };
+  assert.equal(ownScope(scoped(ALPHA, history)), "alpha");
+  assert.deepEqual(scoped(good, history), scoped(good, withoutProjects(history)));
+  assert.equal(scoped(good, history).basisName, "files");
+  assert.equal(scoped(worse, withoutProjects(history)).basisName, "commits");
+  assert.equal(ownScope(scoped(worse, history)), "alpha");
+});
+
+// ---------------------------------------------------------------------------
 // TP-16: time
 // ---------------------------------------------------------------------------
 
@@ -2127,6 +2639,33 @@ test("TP-16: five thousand rows and five hundred items finish in about two secon
   t.diagnostic(`${elapsed.toFixed(0)} ms for ${history.length} rows and ${items.length} items`);
   assert.equal(estimates.length, 500);
   assert.ok(elapsed < 2000, `${elapsed} ms`);
+});
+
+test("TP-131: tagged histories of five thousand rows and five hundred items finish in under two seconds", (t) => {
+  const random = lcg(101);
+  const names = ["issue_bytes", "plan_bytes", "brief_bytes", "churn", "files", "commits"];
+  const features = () => Object.fromEntries(names.flatMap((name) =>
+    random() < 0.7 ? [[name, Math.floor(10 ** (1 + 4 * random()))]] : [],
+  ));
+  const times = [2, 555].map((projects) => {
+    const history = Array.from({ length: 5000 }, (_, i) => {
+      const own = features();
+      const size = Object.values(own).reduce((sum, value) => sum + Math.log1p(value), 0);
+      const cost = Math.exp(4 + 0.3 * size + random() + (projects === 2 ? 3 * (i % 2) : 0));
+      const entry = task(cost, `type${i % 5}`, own);
+      return i < projects * Math.floor(5000 / projects) ? tagged(entry, `alpha-${i % projects}`) : entry;
+    });
+    const entries = Array.from({ length: 500 }, (_, i) => tagged(item(`K${i}`, `type${i % 6}`, features()), `alpha-${i % projects}`));
+    const start = performance.now();
+    const rows = estimateFromSignals(entries, history, CAL);
+    const elapsed = performance.now() - start;
+    assert.equal(rows.length, 500);
+    t.diagnostic(`${projects} projects: ${elapsed.toFixed(1)} ms`);
+    return elapsed;
+  });
+  const maximum = Math.max(...times);
+  t.diagnostic(`TP-131 maximum: ${maximum.toFixed(1)} ms`);
+  assert.ok(maximum < 2000, `${maximum} ms`);
 });
 
 // ---------------------------------------------------------------------------

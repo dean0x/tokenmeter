@@ -31,6 +31,12 @@ export type Subscription = "claude" | "codex";
 
 // The tag that names the type of a task.
 const TYPE_TAG = "type";
+const PROJECT_TAG = "project";
+const REPO_TAG = "repo";
+const MIN_PROJECT_TASKS = 9;
+export const MAX_PROJECTS = 8;
+const PROJECT_BLEND_TASKS = 9;
+const PROJECT_GAIN = 0.9;
 // The tag that names the work stage of an open item.
 const STAGE_TAG = "stage";
 
@@ -89,6 +95,11 @@ export function pctOfWeek(calibration: Calibration, weightedTokens: number): num
 
 function typeOf(tags: Readonly<Record<string, string>>): string | null {
   return Object.hasOwn(tags, TYPE_TAG) ? (tags[TYPE_TAG] ?? null) : null;
+}
+
+export function projectOf(tags: Readonly<Record<string, string>>): string | null {
+  if (Object.hasOwn(tags, PROJECT_TAG)) return tags[PROJECT_TAG] ?? null;
+  return Object.hasOwn(tags, REPO_TAG) ? (tags[REPO_TAG] ?? null) : null;
 }
 
 // The stage tag of an item, read as an own entry only: a stage label such as
@@ -228,15 +239,6 @@ function compareScored(a: Scored, b: Scored): number {
   return (
     a.score - b.score || rankOf(a.model) - rankOf(b.model) || compareText(basisNameOf(a.model), basisNameOf(b.model))
   );
-}
-
-// The item with the lowest score, or null for no item.
-function lowest<T>(items: readonly T[], scoredOf: (item: T) => Scored): T | null {
-  let best: T | null = null;
-  for (const item of items) {
-    if (best === null || compareScored(scoredOf(item), scoredOf(best)) < 0) best = item;
-  }
-  return best;
 }
 
 // A score is an error over the error of "all". It is null when that divisor is
@@ -396,6 +398,7 @@ interface Observed {
   // Raw tokens for each weighted token.
   readonly ratio: number;
   readonly type: string | null;
+  readonly project: string | null;
   // log(1 + value) of each feature that the task carries.
   readonly z: ReadonlyMap<string, number>;
 }
@@ -405,6 +408,13 @@ interface Observed {
 // these errors on its own tasks.
 interface Sample extends Observed {
   readonly baseline: number;
+}
+
+// The leave-one-out errors have the same order as the samples in the group.
+interface Fitted {
+  readonly candidate: Candidate;
+  readonly group: readonly Sample[];
+  readonly errors: readonly number[];
 }
 
 function isFeatureValue(value: unknown): value is number {
@@ -428,6 +438,7 @@ function observedOf(history: readonly EstimateTask[], subscription: Subscription
       weighted: weightedTokens,
       ratio: rawTokens(totals) / weightedTokens,
       type: typeOf(entry.tags),
+      project: projectOf(entry.tags),
       z,
     });
   }
@@ -563,9 +574,10 @@ function rangeAt(prediction: number, shifts: Shifts, clamped: boolean): ItemRang
 }
 
 // Type and all: the 10th, 50th, 80th and 90th percentile of the weighted tokens of the group.
-function groupCandidate(model: RankedModel, group: readonly Sample[]): Candidate | null {
+function groupCandidate(model: RankedModel, group: readonly Sample[]): Fitted | null {
   if (group.length < MIN_GROUP_TASKS) return null;
-  const standing = standingOf(group, leaveOneOut(group).map(({ error }) => error));
+  const errors = leaveOneOut(group).map(({ error }) => error);
+  const standing = standingOf(group, errors);
   if (standing === null) return null;
   const costs = sortedAscending(group.map((sample) => sample.weighted));
   const range: ItemRange = {
@@ -576,14 +588,15 @@ function groupCandidate(model: RankedModel, group: readonly Sample[]): Candidate
     clamped: false,
   };
   const type = model.kind === "type" ? model.type : null;
-  return {
+  const candidate: Candidate = {
     ...standing,
     model,
     rangeFor: (item) => (type === null || typeOf(item.tags) === type ? range : null),
   };
+  return { candidate, group, errors };
 }
 
-function singleCandidate(feature: string, samples: readonly Sample[]): Candidate | null {
+function singleCandidate(feature: string, samples: readonly Sample[]): Fitted | null {
   const { group, zs } = carrying(samples, feature);
   const fit = fitLine(zs, ysOf(group));
   if (fit === null) return null;
@@ -591,7 +604,7 @@ function singleCandidate(feature: string, samples: readonly Sample[]): Candidate
   if (standing === null) return null;
   const shifts = shiftsOf(fit.errors);
   const bounds = boundsOf(zs);
-  return {
+  const candidate: Candidate = {
     ...standing,
     model: { kind: "single", feature },
     rangeFor: (item) => {
@@ -602,6 +615,7 @@ function singleCandidate(feature: string, samples: readonly Sample[]): Candidate
       return rangeAt(fit.intercept + fit.slope * inside, shifts, inside !== z);
     },
   };
+  return { candidate, group, errors: fit.errors };
 }
 
 // The score of one line fitted to a group, or null.
@@ -610,7 +624,7 @@ function lineScore(group: readonly Sample[], zs: readonly number[]): number | nu
   return fit === null ? null : scoreOf(group, fit.errors);
 }
 
-function pairCandidate(names: readonly [string, string], samples: readonly Sample[]): Candidate | null {
+function pairCandidate(names: readonly [string, string], samples: readonly Sample[]): Fitted | null {
   const [first, second] = names;
   const { group, z1s, z2s } = carryingBoth(samples, first, second);
   if (group.length < MIN_PAIR_TASKS) return null;
@@ -624,7 +638,7 @@ function pairCandidate(names: readonly [string, string], samples: readonly Sampl
   const shifts = shiftsOf(fit.errors);
   const bounds1 = boundsOf(z1s);
   const bounds2 = boundsOf(z2s);
-  return {
+  const candidate: Candidate = {
     ...standing,
     model: { kind: "pair", features: names },
     rangeFor: (item) => {
@@ -636,6 +650,7 @@ function pairCandidate(names: readonly [string, string], samples: readonly Sampl
       return rangeAt(fit.intercept + fit.slopes[0] * inside1 + fit.slopes[1] * inside2, shifts, inside1 !== z1 || inside2 !== z2);
     },
   };
+  return { candidate, group, errors: fit.errors };
 }
 
 // The names of the features that tasks carry, with their task counts: at most
@@ -653,12 +668,12 @@ function scoredFeatureNames(samples: readonly Sample[]): string[] {
 }
 
 // The candidate on the whole history.
-function allCandidates(samples: readonly Sample[]): Candidate[] {
+function allCandidates(samples: readonly Sample[]): Fitted[] {
   return kept([groupCandidate({ kind: "all" }, samples)]);
 }
 
 // One candidate for each type with enough tasks, by type name.
-function typeCandidates(samples: readonly Sample[]): Candidate[] {
+function typeCandidates(samples: readonly Sample[]): Fitted[] {
   const byType = new Map<string, Sample[]>();
   for (const sample of samples) {
     if (sample.type === null) continue;
@@ -671,16 +686,193 @@ function typeCandidates(samples: readonly Sample[]): Candidate[] {
 }
 
 // One candidate for each scored feature name, by name.
-function singleCandidates(samples: readonly Sample[]): Candidate[] {
+function singleCandidates(samples: readonly Sample[]): Fitted[] {
   return kept(scoredFeatureNames(samples).sort(compareText).map((name) => singleCandidate(name, samples)));
 }
 
 // One candidate for each pair of the MAX_PAIR_NAMES features with the best single
 // scores, by name.
-function pairCandidates(samples: readonly Sample[], singles: readonly Candidate[]): Candidate[] {
-  const best = [...singles].sort(compareScored).slice(0, MAX_PAIR_NAMES);
+function pairCandidates(samples: readonly Sample[], singles: readonly Fitted[]): Fitted[] {
+  const best = singles.map(({ candidate }) => candidate).sort(compareScored).slice(0, MAX_PAIR_NAMES);
   const names = best.flatMap((candidate) => (candidate.model.kind === "single" ? [candidate.model.feature] : [])).sort(compareText);
   return kept(names.flatMap((first, at) => names.slice(at + 1).map((second) => pairCandidate([first, second], samples))));
+}
+
+function groupByProject<T extends Observed>(tasks: readonly T[]): ReadonlyMap<string, readonly T[]> {
+  const groups = new Map<string, T[]>();
+  for (const task of tasks) {
+    if (task.project === null) continue;
+    const group = groups.get(task.project);
+    if (group === undefined) groups.set(task.project, [task]);
+    else group.push(task);
+  }
+  return groups;
+}
+
+interface FitPass {
+  readonly samples: readonly Sample[];
+  readonly fitted: readonly Fitted[];
+  readonly observed: readonly Observed[];
+  readonly projectGroups: {
+    readonly fit: ReadonlyMap<string, readonly Sample[]>;
+    readonly rank: ReadonlyMap<string, readonly Observed[]>;
+  };
+}
+
+export function fitAll(history: readonly EstimateTask[], subscription: Subscription, floor: number): FitPass {
+  const observed = observedOf(history, subscription);
+  const forFit = floor === 0 ? observed : observedOf(history, subscription, floor);
+  const samples = forFit.length < MIN_GROUP_TASKS ? [] : withBaseline(forFit);
+  const singles = singleCandidates(samples);
+  const fitted = [...allCandidates(samples), ...typeCandidates(samples), ...singles, ...pairCandidates(samples, singles)];
+  return { samples, fitted, observed, projectGroups: { fit: groupByProject(samples), rank: groupByProject(observed) } };
+}
+
+// A project task gets the shared weight k plus the project weight N. When one
+// task is left out, both N and the project count exclude it.
+function weightedPoint(
+  sorted: readonly Sample[], project: string, count: number, tenths: 5 | 8, omit?: Sample,
+): number | null {
+  const size = sorted.length - (omit === undefined ? 0 : 1);
+  const target = tenths * size * (count + PROJECT_BLEND_TASKS);
+  let weight = 0;
+  for (const sample of sorted) {
+    if (sample === omit) continue;
+    weight += sample.project === project ? size + PROJECT_BLEND_TASKS : PROJECT_BLEND_TASKS;
+    if (10 * weight >= target) return sample.weighted;
+  }
+  return null;
+}
+
+// Exact order statistics in weighted tokens. With a task left out, an index
+// outside the remaining list takes the nearest end.
+function rankRange(sorted: readonly number[], omit = sorted.length): Span | null {
+  const leftOut = omit < sorted.length;
+  const count = sorted.length - (leftOut ? 1 : 0);
+  const lowRank = Math.floor((count + 1) / 10);
+  const highRank = Math.ceil(9 * (count + 1) / 10);
+  const pick = (rank: number) => sorted[rank <= omit ? rank - 1 : rank] ?? Number.NaN;
+  const low = pick(leftOut ? Math.max(1, lowRank) : lowRank);
+  const high = pick(leftOut ? Math.min(count, highRank) : highRank);
+  return low > 0 && Number.isFinite(low) && Number.isFinite(high) && low <= high ? { low, high } : null;
+}
+
+// Check the count and the samples once, before the leave-one-out pass.
+function projectGroupMatches(sorted: readonly Sample[], project: string, group: readonly Sample[]): boolean {
+  const unmatched = new Set(group);
+  if (unmatched.size !== group.length) return false;
+  for (const sample of sorted) {
+    if (sample.project === project && !unmatched.delete(sample)) return false;
+  }
+  return unmatched.size === 0;
+}
+
+function projectErrors(
+  sorted: readonly Sample[], costs: readonly number[], project: string, group: readonly Sample[],
+): ReadonlyMap<Sample, number> | null {
+  if (!projectGroupMatches(sorted, project, group)) return null;
+  const errors = new Map<Sample, number>();
+  for (const sample of group) {
+    // Equal costs are interchangeable for the rank ends, not for the fit sample.
+    const span = rankRange(costs, firstAtOrAbove(costs, sample.weighted));
+    const center = weightedPoint(sorted, project, group.length - 1, 5, sample);
+    if (span === null || center === null) return null;
+    errors.set(sample, Math.abs(sample.y - Math.log(clampTo(center, span))));
+  }
+  return errors;
+}
+
+interface ProjectFit {
+  readonly candidate: Omit<Candidate, "score"> & { readonly score: number | null };
+  readonly wins: boolean;
+  readonly kept: readonly Candidate[];
+}
+
+// A malformed shared fit prevents a project win. Do not skip that competitor.
+function projectGate(fitted: readonly Fitted[], errors: ReadonlyMap<Sample, number>): Omit<ProjectFit, "candidate"> | null {
+  let eligible = false;
+  const kept: Candidate[] = [];
+  for (const fit of fitted) {
+    if (fit.group.length !== fit.errors.length) return null;
+    const group: Sample[] = [];
+    const blendErrors: number[] = [];
+    const sharedErrors: number[] = [];
+    for (let i = 0; i < fit.group.length; i += 1) {
+      const sample = fit.group[i];
+      const sharedError = fit.errors[i];
+      if (sample === undefined || sharedError === undefined || !Number.isFinite(sharedError)) return null;
+      const error = errors.get(sample);
+      if (error === undefined) continue;
+      group.push(sample);
+      blendErrors.push(error);
+      sharedErrors.push(sharedError);
+    }
+    const { candidate } = fit;
+    const feature = candidate.model.kind === "single" || candidate.model.kind === "pair";
+    if (group.length === 0 || (!feature && group.length < MIN_PROJECT_TASKS)) continue;
+    const blendScore = scoreOf(group, blendErrors);
+    const sharedScore = scoreOf(group, sharedErrors);
+    if (blendScore === null || sharedScore === null) continue;
+    if (group.length >= MIN_PROJECT_TASKS) {
+      eligible = true;
+      if (blendScore > PROJECT_GAIN * sharedScore) return { wins: false, kept: [] };
+    }
+    if (feature && sharedScore < blendScore) kept.push(candidate);
+  }
+  return { wins: eligible, kept: eligible ? kept : [] };
+}
+
+function blendFit(
+  project: string, group: readonly Sample[], observed: readonly Observed[], sorted: readonly Sample[], fitted: readonly Fitted[],
+): ProjectFit | null {
+  const costs = sortedCostsOf(observed);
+  const span = rankRange(costs);
+  if (span === null) return null;
+  const errors = projectErrors(sorted, costs, project, group);
+  if (errors === null) return null;
+  const gate = projectGate(fitted, errors);
+  if (gate === null) return null;
+  const score = scoreOf(group, [...errors.values()]);
+  // An eligible subset can decide the gate even when the whole project has a zero baseline.
+  if (score === null && !gate.wins) return null;
+  const middle = weightedPoint(sorted, project, group.length, 5);
+  const upper = weightedPoint(sorted, project, group.length, 8);
+  if (middle === null || upper === null) return null;
+  const typical = clampTo(middle, span);
+  const budget = Math.max(typical, clampTo(upper, span));
+  const range = { ...span, typical, budget, clamped: false };
+  return {
+    candidate: {
+      model: { kind: "all" },
+      score,
+      count: group.length,
+      rawRatio: medianOf(observed.map((sample) => sample.ratio)),
+      rangeFor: (item) => projectOf(item.tags) === project ? range : null,
+    },
+    ...gate,
+  };
+}
+
+export function projectFitsOf({ samples, fitted, projectGroups }: FitPass): ReadonlyMap<string, ProjectFit> {
+  const qualified = [...projectGroups.fit]
+    .filter(([, group]) => group.length >= MIN_PROJECT_TASKS)
+    .sort(([a, groupA], [b, groupB]) => groupB.length - groupA.length || compareText(a, b))
+    .slice(0, MAX_PROJECTS);
+  const blends = new Map<string, ProjectFit>();
+  if (qualified.length === 0) return blends;
+  const sorted = [...samples].sort((a, b) => a.weighted - b.weighted);
+  for (const [project, group] of qualified) {
+    const observed = projectGroups.rank.get(project);
+    if (observed === undefined) continue;
+    const blend = blendFit(project, group, observed, sorted, fitted);
+    if (blend !== null) blends.set(project, blend);
+  }
+  return blends;
+}
+
+// The bounded project candidates and their verdicts on the shared score scale.
+export function projectFits(history: readonly EstimateTask[], subscription: Subscription, floor = 0): ReadonlyMap<string, ProjectFit> {
+  return projectFitsOf(fitAll(history, subscription, floor));
 }
 
 // Every candidate that qualifies, scored on its own tasks. The score table
@@ -689,11 +881,7 @@ function pairCandidates(samples: readonly Sample[], singles: readonly Candidate[
 // under `floor` weighted tokens is left out of every candidate; with no floor
 // every task with a cost counts.
 export function scoreCandidates(history: readonly EstimateTask[], subscription: Subscription, floor = 0): readonly Candidate[] {
-  const observed = observedOf(history, subscription, floor);
-  if (observed.length < MIN_GROUP_TASKS) return [];
-  const samples = withBaseline(observed);
-  const singles = singleCandidates(samples);
-  return [...allCandidates(samples), ...typeCandidates(samples), ...singles, ...pairCandidates(samples, singles)];
+  return fitAll(history, subscription, floor).fitted.map(({ candidate }) => candidate);
 }
 
 // ---------------------------------------------------------------------------
@@ -731,6 +919,7 @@ export type SignalEstimate =
       // finite number above 0. Low end <= typical <= budget <= high end.
       readonly typicalPct: number | null;
       readonly budgetPct: number | null;
+      readonly basisProject?: string;
     }
   | {
       readonly key: string;
@@ -741,7 +930,7 @@ export type SignalEstimate =
     };
 
 interface Applied {
-  readonly candidate: Candidate;
+  readonly candidate: Pick<Candidate, "model" | "count" | "rawRatio">;
   readonly range: ItemRange;
 }
 
@@ -764,6 +953,7 @@ interface Shown {
   readonly high: number;
   readonly open: boolean;
   readonly rough: boolean;
+  readonly basisProject?: string;
 }
 
 function rangedEstimate(key: string, subscription: Subscription, perPct: number, shown: Shown): SignalEstimate {
@@ -784,7 +974,17 @@ function rangedEstimate(key: string, subscription: Subscription, perPct: number,
     open,
     rough,
     ...costsOf(shown.range, low, open, perPct),
+    ...(shown.basisProject === undefined ? {} : { basisProject: shown.basisProject }),
   };
+}
+
+function bestApplied(item: EstimateItem, candidates: readonly Candidate[]): Applied | null {
+  let best: { candidate: Candidate; range: ItemRange } | null = null;
+  for (const candidate of candidates) {
+    const range = candidate.rangeFor(item);
+    if (range !== null && (best === null || compareScored(candidate, best.candidate) < 0)) best = { candidate, range };
+  }
+  return best;
 }
 
 function estimateOne(
@@ -792,16 +992,27 @@ function estimateOne(
   subscription: Subscription,
   perPct: number,
   candidates: readonly Candidate[],
+  projects: ReadonlyMap<string, ProjectFit>,
   spentBase: SpentBase,
 ): SignalEstimate {
-  const started = spentEstimate(item, subscription, perPct, spentBase);
-  if (started !== null) return started;
-  const applied: Applied[] = [];
-  for (const candidate of candidates) {
-    const range = candidate.rangeFor(item);
-    if (range !== null) applied.push({ candidate, range });
+  const started = spentRange(item, perPct, spentBase);
+  if (started !== null) return rangedEstimate(item.key, subscription, perPct, { ...started, rough: true });
+  const project = projectOf(item.tags);
+  const blend = project === null ? undefined : projects.get(project);
+  let basisProject: string | undefined;
+  let best: Applied | null;
+  if (blend?.wins && project !== null) {
+    best = bestApplied(item, blend.kept);
+    if (best === null) {
+      const range = blend.candidate.rangeFor(item);
+      if (range !== null) {
+        best = { candidate: blend.candidate, range };
+        basisProject = project;
+      }
+    }
+  } else {
+    best = bestApplied(item, candidates);
   }
-  const best = lowest(applied, ({ candidate }) => candidate);
   if (best === null) return noBasis(item.key, subscription);
   // A running item has used some tokens already, so its low end cannot be less.
   const spent = item.spent ?? 0;
@@ -818,6 +1029,7 @@ function estimateOne(
     high: Math.max(best.range.high, low),
     open,
     rough: open || best.range.clamped,
+    ...(basisProject === undefined ? {} : { basisProject }),
   });
 }
 
@@ -858,8 +1070,7 @@ interface SpentBase {
   readonly rawRatio: number;
 }
 
-function spentBaseOf(history: readonly EstimateTask[], subscription: Subscription): SpentBase {
-  const observed = observedOf(history, subscription);
+function spentBaseOf(observed: readonly Observed[]): SpentBase {
   return { costs: sortedCostsOf(observed), rawRatio: medianOf(observed.map((entry) => entry.ratio)) };
 }
 
@@ -869,7 +1080,7 @@ function spentBaseOf(history: readonly EstimateTask[], subscription: Subscriptio
 // cost as much as the item has used, with their median and 80th percentile as the
 // typical and budget costs. With fewer than SPENT_MIN_TASKS such tasks the range is
 // open from the cost so far. The rule has no memory: it reads the cost so far only.
-function spentEstimate(item: EstimateItem, subscription: Subscription, perPct: number, base: SpentBase): SignalEstimate | null {
+function spentRange(item: EstimateItem, perPct: number, base: SpentBase): Omit<Shown, "rough" | "basisProject"> | null {
   const { spent } = item;
   if (spent === undefined || !Number.isFinite(spent) || !(spent >= SPENT_START_PCT * perPct) || base.costs.length === 0) return null;
   const costs = base.costs.slice(firstAtOrAbove(base.costs, spent));
@@ -883,7 +1094,7 @@ function spentEstimate(item: EstimateItem, subscription: Subscription, perPct: n
         budget: percentile(costs, BUDGET_FRACTION),
         clamped: false,
       };
-  return rangedEstimate(item.key, subscription, perPct, {
+  return {
     basis: "wide",
     basisName: BASIS_SPENT,
     count: costs.length,
@@ -892,8 +1103,7 @@ function spentEstimate(item: EstimateItem, subscription: Subscription, perPct: n
     low: range.low,
     high: range.high,
     open,
-    rough: true,
-  });
+  };
 }
 
 // One estimate for each open item, in the order given. Each item takes the
@@ -903,9 +1113,9 @@ function spentEstimate(item: EstimateItem, subscription: Subscription, perPct: n
 // type and all is the 10th to 90th percentile of their costs. Each range has a
 // typical cost (the median) and a budget cost (the 80th percentile). The percent range and the raw
 // range have the same factors. With no ready calibration there is no basis. A
-// finished task under FIT_FLOOR_PCT of the week is left out of every fit. A running
-// item that has used SPENT_START_PCT of the week or more takes the spent basis
-// instead of any other (see spentEstimate).
+// finished task under FIT_FLOOR_PCT of the week is left out of every fit. A project
+// that wins the gate uses its rank range or a better shared feature fit. A running
+// item that has used SPENT_START_PCT of the week or more takes the spent basis.
 export function estimateFromSignals(
   items: readonly EstimateItem[],
   history: readonly EstimateTask[],
@@ -914,9 +1124,11 @@ export function estimateFromSignals(
 ): readonly SignalEstimate[] {
   const perPct = perPctOf(calibrations[subscription]);
   if (perPct === null || items.length === 0) return items.map((item) => noBasis(item.key, subscription));
-  const candidates = scoreCandidates(history, subscription, perPct * FIT_FLOOR_PCT);
-  const spentBase = spentBaseOf(history, subscription);
-  return items.map((item) => estimateOne(item, subscription, perPct, candidates, spentBase));
+  const pass = fitAll(history, subscription, perPct * FIT_FLOOR_PCT);
+  const candidates = pass.fitted.map(({ candidate }) => candidate);
+  const projects = projectFitsOf(pass);
+  const spentBase = spentBaseOf(pass.observed);
+  return items.map((item) => estimateOne(item, subscription, perPct, candidates, projects, spentBase));
 }
 
 
@@ -1114,6 +1326,8 @@ interface EstimateLogLineBase {
   readonly features: readonly string[];
   // The stage tag of the item, or null when it had none.
   readonly stage: string | null;
+  // The project of the basis, if any. An absent scope has the same meaning as null.
+  readonly basisProject?: string | null;
 }
 
 // A line of an estimate with a basis, and the range that it showed in weighted tokens.
@@ -1126,6 +1340,7 @@ export interface RangedLogLine extends EstimateLogLineBase {
 // A line of an estimate with no basis: it showed no range.
 export interface NoBasisLogLine extends EstimateLogLineBase {
   readonly basis: "none";
+  readonly basisProject?: null;
   readonly low: null;
   readonly high: null;
 }
@@ -1138,7 +1353,7 @@ function logLineOf(item: EstimateItem, estimate: SignalEstimate, at: number): Es
   const features = Object.keys(item.features).sort(compareText);
   const stage = stageOf(item.tags);
   if (estimate.basis === "none") {
-    return { at, key: item.key, basis: "none", basisName: BASIS_NONE, features, stage, low: null, high: null };
+    return { at, key: item.key, basis: "none", basisName: BASIS_NONE, features, stage, basisProject: null, low: null, high: null };
   }
   return {
     at,
@@ -1148,6 +1363,7 @@ function logLineOf(item: EstimateItem, estimate: SignalEstimate, at: number): Es
     features,
     // A spent line has a fixed stage, so the stage tag of the item cannot start a new line.
     stage: estimate.basisName === BASIS_SPENT ? SPENT_STAGE : stage,
+    basisProject: estimate.basisProject ?? null,
     low: estimate.weightedLow,
     // An open range logs its low end as its high end. The item has already used
     // more than the range of its basis, so the self-check scores the line a miss
@@ -1156,12 +1372,13 @@ function logLineOf(item: EstimateItem, estimate: SignalEstimate, at: number): Es
   };
 }
 
-// The same basis, the same name, the same feature names and the same stage. The
+// The same basis, basis name, project scope, feature names and stage. The
 // range is not part of it: a range moves with every new finished task.
 function sameBasis(a: EstimateLogLine, b: EstimateLogLine): boolean {
   return (
     a.basis === b.basis &&
     a.basisName === b.basisName &&
+    (a.basisProject ?? null) === (b.basisProject ?? null) &&
     a.stage === b.stage &&
     a.features.length === b.features.length &&
     a.features.every((name, index) => name === b.features[index])
@@ -1193,8 +1410,8 @@ function latestByKey(lines: readonly EstimateLogLine[]): Map<string, EstimateLog
 }
 
 // The lines to write for the estimates of a pass: one for each key that has no
-// line yet, and one for each key whose basis, basis name, feature names or stage
-// differ from its latest line in the log. `estimates` is in the order of `items`.
+// line yet, and one for each key whose basis, basis name, project scope, feature
+// names or stage differ from its latest line. `estimates` is in the order of `items`.
 export function newLogLines(
   items: readonly EstimateItem[],
   estimates: readonly SignalEstimate[],
@@ -1220,11 +1437,11 @@ export interface FinishedTask {
   readonly label: string;
   readonly start: number;
   readonly end: number;
+  readonly tags?: Readonly<Record<string, string>>;
   readonly totals: Readonly<Record<Subscription, TokenTotals>>;
 }
 
-// How the logged ranges did on a set of scored tasks: all of them, or those that
-// a stage tag links to a line.
+// How the logged ranges did on a set of scored tasks.
 export interface StageCheck {
   // The tasks among the most recent finished ones that had a range in the log
   // before they ended and a cost to compare with it.
@@ -1257,14 +1474,17 @@ export interface StageCheck {
 }
 
 export interface SelfCheck extends StageCheck {
-  // The same check for each stage tag that links to a task: the latest line of
-  // the stage that links to the task. A line with no stage counts only above. The
+  // Each stage uses its latest linked line unless its project scope differs from
+  // the task's project. A line with no stage does not count in the stages. The
   // lines on the spent basis have the stage run, so they count here and not above:
   // the top level reads the latest line that is not on the spent basis, and skips
   // a task that has none. At most MAX_STAGES stages, the ones with the most scored
   // tasks first (ties by text), then in text order. A task can count in several
   // stages. The map holds labels as keys only: a label is never a property name.
   readonly stages: ReadonlyMap<string, StageCheck>;
+  // The top-level scores by task project. A line with a different project scope
+  // counts only at the top level. At most MAX_PROJECTS projects in text order.
+  readonly projects: ReadonlyMap<string, StageCheck>;
 }
 
 // The stages that a self-check shows. A stage past this is left out.
@@ -1422,19 +1642,38 @@ export function checkOf(pairs: readonly ScoredPair[], subscription: Subscription
   };
 }
 
-// The MAX_STAGES stages with the most scored tasks, ties by text, in text order.
-function keptStages(checks: readonly (readonly [string, StageCheck])[]): Map<string, StageCheck> {
+// The groups with the most scored tasks, ties by text, in text order.
+function keptChecks(checks: readonly (readonly [string, StageCheck])[], cap: number): Map<string, StageCheck> {
   const ranked = [...checks]
     .sort(([nameA, checkA], [nameB, checkB]) => checkB.scored - checkA.scored || compareText(nameA, nameB))
-    .slice(0, MAX_STAGES)
+    .slice(0, cap)
     .sort(([nameA], [nameB]) => compareText(nameA, nameB));
   return new Map(ranked);
 }
 
+function matchesProject(line: EstimateLogLine, project: string | null): boolean {
+  const scope = line.basisProject ?? null;
+  return scope === null || scope === project;
+}
+
+function projectChecks(top: readonly ScoredPair[], subscription: Subscription): ReadonlyMap<string, StageCheck> {
+  const groups = new Map<string, ScoredPair[]>();
+  for (const pair of top) {
+    const { task, line } = pair;
+    const project = task.tags === undefined ? null : projectOf(task.tags);
+    if (project === null || !matchesProject(line, project)) continue;
+    const group = groups.get(project);
+    if (group === undefined) groups.set(project, [pair]);
+    else group.push(pair);
+  }
+  const checks = [...groups].map(([project, pairs]) => [project, checkOf(pairs, subscription)] as const);
+  return keptChecks(checks.filter(([, check]) => check.scored > 0), MAX_PROJECTS);
+}
+
 // How the logged ranges did against the cost of the SELF_CHECK_TASKS most recent
-// finished tasks: the latest line that is not on the spent basis that links to
-// each task (a task with only spent lines is not scored here), and for each stage
-// the latest line of that stage. This function has no file and no clock.
+// finished tasks. The top level and the project checks use the latest line not
+// on the spent basis. Each stage uses its latest line. This function has no file
+// and no clock.
 export function selfCheck(
   lines: readonly EstimateLogLine[],
   finished: readonly FinishedTask[],
@@ -1443,15 +1682,17 @@ export function selfCheck(
   const recent = recentLinked(lines, finished);
   const pairsOfStage = new Map<string, ScoredPair[]>();
   for (const { task, byStage } of recent) {
+    const project = task.tags === undefined ? null : projectOf(task.tags);
     for (const [stage, line] of byStage) {
+      if (!matchesProject(line, project)) continue;
       const pairs = pairsOfStage.get(stage);
       if (pairs === undefined) pairsOfStage.set(stage, [{ task, line }]);
       else pairs.push({ task, line });
     }
   }
-  const stages = keptStages([...pairsOfStage].map(([stage, pairs]) => [stage, checkOf(pairs, subscription)] as const));
+  const stages = keptChecks([...pairsOfStage].map(([stage, pairs]) => [stage, checkOf(pairs, subscription)] as const), MAX_STAGES);
   const top = recent.flatMap(({ task, latestUnspent }) => (latestUnspent === null ? [] : [{ task, line: latestUnspent }]));
-  return { ...checkOf(top, subscription), stages };
+  return { ...checkOf(top, subscription), stages, projects: projectChecks(top, subscription) };
 }
 
 // A window of the last sync, as the keep rule reads it.

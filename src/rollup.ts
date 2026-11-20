@@ -94,6 +94,8 @@ export interface PeriodsJson {
   readonly days: readonly PeriodRowJson[];
   readonly weeks: readonly PeriodRowJson[];
   readonly months: readonly PeriodRowJson[];
+  // Rows within the count caps that did not fit the byte budget.
+  readonly cut: { readonly days: number; readonly weeks: number; readonly months: number };
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +217,7 @@ interface Fitted {
   readonly rows: readonly PeriodRowJson[];
   // The JSON text of the rows, with one byte for each separator.
   readonly bytes: number;
+  readonly cut: number;
 }
 
 // The newest rows, as many as fit in `maxBytes` of JSON text.
@@ -228,17 +231,21 @@ function newestWithin(rows: readonly PeriodRowJson[], maxBytes: number): Fitted 
     bytes += size;
     keep = index;
   }
-  return { rows: rows.slice(keep), bytes };
+  return { rows: rows.slice(keep), bytes, cut: keep };
 }
 
 const EMPTY_LISTS = { days: [], weeks: [], months: [] } as const;
+const ZERO_CUT = { days: 0, weeks: 0, months: 0 } as const;
 
 // Day rows older than the day horizon, and rows dated more than two days after
 // today (a clock or zone that moved), are left out.
 const FUTURE_SLACK_DAYS = 2;
 
-// The JSON text around the lists: the week start and the names of the lists.
-const FRAME_BYTES = 64;
+// Reserve the JSON frame with the largest possible cut count in each list.
+const FRAME_BYTES = Buffer.byteLength(JSON.stringify({
+  week_start: "sun", ...EMPTY_LISTS,
+  cut: { days: PERIODS_MAX_DAYS, weeks: PERIODS_MAX_WEEKS, months: PERIODS_MAX_MONTHS },
+}));
 
 export interface PeriodsInput {
   readonly rows: DayRows;
@@ -258,7 +265,7 @@ export function periodsOf({ rows, zone, nowMs, weekStart, collect, maxBytes }: P
   const dates = rows.dates().filter((date) => date >= cutoff && date <= newest);
   const first = dates[0];
   const last = dates[dates.length - 1];
-  if (first === undefined || last === undefined) return { week_start: weekStart, ...EMPTY_LISTS };
+  if (first === undefined || last === undefined) return { week_start: weekStart, ...EMPTY_LISTS, cut: ZERO_CUT };
 
   const clock: Clock = {
     zone,
@@ -299,5 +306,8 @@ export function periodsOf({ rows, zone, nowMs, weekStart, collect, maxBytes }: P
   const fitMonths = newestWithin(monthRows.slice(-PERIODS_MAX_MONTHS), room);
   const fitWeeks = newestWithin(weekRows.slice(-PERIODS_MAX_WEEKS), room - fitMonths.bytes);
   const fitDays = newestWithin(dayRows.slice(-PERIODS_MAX_DAYS), room - fitMonths.bytes - fitWeeks.bytes);
-  return { week_start: weekStart, days: fitDays.rows, weeks: fitWeeks.rows, months: fitMonths.rows };
+  return {
+    week_start: weekStart, days: fitDays.rows, weeks: fitWeeks.rows, months: fitMonths.rows,
+    cut: { days: fitDays.cut, weeks: fitWeeks.cut, months: fitMonths.cut },
+  };
 }

@@ -3,12 +3,11 @@
 //   estimates-YYYY-MM.jsonl   one line for each change of the basis of an
 //                             estimate, in the UTC month of the line time
 //
-// A line is {"at","key","basis","basis_name","features","stage","low","high"}:
+// A line is {"at","key","basis","basis_name","features","stage","basis_project","low","high"}:
 // the time in epoch milliseconds, the item key, the basis word, the basis name,
-// the feature names that the item carried, the stage label of the item (null
-// with no stage tag), and the range in weighted tokens that the estimate showed
-// (null with no basis). The key and the stage label are the only text of the
-// item that is stored. A line with no stage key reads as stage null.
+// the feature names, the stage label, the project of the basis, and the range
+// in weighted tokens. The range is null with no basis. A missing stage or
+// project scope reads as null. A shared basis or no basis has null scope.
 //
 // A month file takes no line once it holds the cap. The reader looks at the
 // newest 24 month files. A damaged file (a link, a foreign owner, open to the
@@ -35,7 +34,7 @@ import {
   utcMonthOf,
 } from "./core.ts";
 import { type EstimateLogLine, settledLines } from "./estimator.ts";
-import { type FsDeps, appendLine, defaultDeps, isOwnPrivateFile, listDir, lstatEntry, readOwnFile, removeFile } from "./fsafe.ts";
+import { type FsDeps, appendLine, defaultDeps, listDir, lstatEntry, readOwnFile, removeFile } from "./fsafe.ts";
 
 const KIB = 1024;
 export const ESTIMATE_LOG_CAP_BYTES = KIB * KIB;
@@ -57,7 +56,9 @@ function fileOfMonth(month: string): string {
 // The file of a line time: its UTC month. Null for a time that is not valid.
 export function estimateLogFile(atMs: number): string | null {
   const month = utcMonthOf(atMs);
-  return month === null ? null : fileOfMonth(month);
+  if (month === null) return null;
+  const file = fileOfMonth(month);
+  return isEstimateLogFile(file) ? file : null;
 }
 
 // Exactly estimates-YYYY-MM.jsonl, with a month from 01 to 12.
@@ -78,6 +79,7 @@ export function logLineText(line: EstimateLogLine): string {
     basis_name: line.basisName,
     features: line.features,
     stage: line.stage,
+    basis_project: line.basisProject ?? null,
     low: line.low,
     high: line.high,
   });
@@ -112,22 +114,19 @@ function rangeOf(low: unknown, high: unknown): { readonly low: number; readonly 
     : null;
 }
 
-// The stage of a line: an absent key or null reads null, a label reads as itself,
-// and any other value is not valid (null for the whole answer). The key is read as
-// an own entry only.
-function stageOfRow(row: Readonly<Record<string, unknown>>): { readonly stage: string | null } | null {
-  const stage = Object.hasOwn(row, "stage") ? row["stage"] : null;
-  if (stage === null) return { stage };
-  return isLabel(stage) ? { stage } : null;
+// A missing own label or null reads as null. An invalid value reads as undefined.
+function labelOfRow(row: Readonly<Record<string, unknown>>, key: "stage" | "basis_project"): string | null | undefined {
+  const value = Object.hasOwn(row, key) ? row[key] : null;
+  return value === null || isLabel(value) ? value : undefined;
 }
 
-type LineHead = Pick<EstimateLogLine, "at" | "key" | "basisName" | "features" | "stage">;
+type LineHead = Required<Pick<EstimateLogLine, "at" | "key" | "basisName" | "features" | "stage" | "basisProject">>;
 
-// A line with no basis has the basis name none and no range. A line with a basis
-// has a range and a basis name that is not none.
+// A line with no basis has the name none, no range and no project scope.
 function lineWithBasis(head: LineHead, basis: unknown, low: unknown, high: unknown): EstimateLogLine | null {
   if (basis === "none") {
-    return head.basisName === BASIS_NONE && low === null && high === null ? { ...head, basis, low: null, high: null } : null;
+    if (head.basisName !== BASIS_NONE || head.basisProject !== null || low !== null || high !== null) return null;
+    return { ...head, basis, basisProject: null, low, high };
   }
   const range = rangeOf(low, high);
   return (basis === "similar" || basis === "wide") && range !== null && head.basisName !== BASIS_NONE
@@ -145,8 +144,10 @@ export function parseLogLine(text: string, nowMs: number): EstimateLogLine | nul
   if (typeof at !== "number" || !(at >= EARLIEST_TIME_MS && at <= nowMs + FUTURE_SLACK_MS)) return null;
   if (!isLabel(key) || !isBasisName(basisName)) return null;
   const features = featureNamesOf(rawFeatures);
-  const stage = stageOfRow(row);
-  return features === null || stage === null ? null : lineWithBasis({ at, key, basisName, features, ...stage }, basis, low, high);
+  const stage = labelOfRow(row, "stage");
+  const basisProject = labelOfRow(row, "basis_project");
+  if (features === null || stage === undefined || basisProject === undefined) return null;
+  return lineWithBasis({ at, key, basisName, features, stage, basisProject }, basis, low, high);
 }
 
 // ---------------------------------------------------------------------------
@@ -215,28 +216,20 @@ export interface AppendReport {
   readonly appended: number;
   // Lines refused because their month file holds the cap.
   readonly full: number;
-  // Lines not written: a time that names no month, a month that the pass did not
-  // read, a month file that the read would refuse, or a write that failed.
+  // Lines not written: an invalid or noncanonical line, an unread month, a file
+  // that the read would refuse, or a write that failed.
   readonly failed: number;
-}
-
-// The size of a month file that the read would accept, 0 for a missing file, null
-// for any other file (a link, a folder, a foreign owner, group or world bits) and
-// for anything that cannot be looked at.
-function sizeBeforeAppend(path: string, uid: number): number | null {
-  const stat = lstatEntry(path);
-  if (!stat.ok) return stat.error.code === "not_found" ? 0 : null;
-  return isOwnPrivateFile(stat.value, uid) ? stat.value.size : null;
 }
 
 function appendOne(dataDir: string, line: EstimateLogLine, access: MonthAccess, deps: FsDeps): keyof AppendReport {
   const file = estimateLogFile(line.at);
   if (file === null || !access.listingComplete || access.unreadMonths.some((month) => fileOfMonth(month) === file)) return "failed";
-  const path = join(dataDir, file);
-  const size = sizeBeforeAppend(path, deps.uid);
-  if (size === null) return "failed";
-  if (size >= ESTIMATE_LOG_CAP_BYTES) return "full";
-  return appendLine(path, logLineText(line), deps).ok ? "appended" : "failed";
+  const text = logLineText(line);
+  const back = parseLogLine(text, line.at);
+  if (back === null || logLineText(back) !== text) return "failed";
+  const result = appendLine(join(dataDir, file), text, deps, ESTIMATE_LOG_CAP_BYTES);
+  if (result.ok) return "appended";
+  return result.error.code === "too_large" ? "full" : "failed";
 }
 
 // Appends each line to the file of its month, only where the pass read the month

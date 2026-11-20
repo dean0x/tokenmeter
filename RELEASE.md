@@ -55,6 +55,7 @@ For the first version, check the provenance once (see "Verify"). If it is not th
 ## Prepare the version
 
 1. Change the version in `package.json` and `package-lock.json` through a pull request to `main`.
+   Add the version entry to `CHANGELOG.md` in the same pull request.
 2. Make a fresh clone of the repository. Use Node 22.18 or newer.
 3. Install from the lockfile. Build the command. Run the canary test.
 

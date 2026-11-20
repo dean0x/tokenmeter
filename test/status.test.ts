@@ -339,7 +339,7 @@ test("only the subscription whose week has ended loses its week percents", () =>
   assert.equal(result.tasks[0]?.shares[1]?.week_pct, null);
 });
 
-// --- the estimates: the basis name (TP-18) ---
+// --- the estimates: the basis name and project ---
 
 const RANGED: SignalEstimate = {
   key: "A",
@@ -374,6 +374,7 @@ test("TP-18: an estimate carries the basis name next to the basis word", () => {
     count: 9,
     typical_pct: 2,
     budget_pct: 3,
+    basis_project: null,
   });
   assert.deepEqual(Object.keys(json), [
     "key",
@@ -387,6 +388,7 @@ test("TP-18: an estimate carries the basis name next to the basis word", () => {
     "count",
     "typical_pct",
     "budget_pct",
+    "basis_project",
   ]);
 });
 
@@ -414,6 +416,7 @@ test("TP-14: an open range shows its low end and no high end, and reads rough wi
     count: 9,
     typical_pct: null,
     budget_pct: null,
+    basis_project: null,
   });
 });
 
@@ -431,6 +434,7 @@ test("a clamped range reads rough: basis wide, the basis name and both ends kept
     count: 9,
     typical_pct: 2,
     budget_pct: 3,
+    basis_project: null,
   });
   assert.equal(estimateJson(RANGED).basis, "similar", "the control: a range that is not rough keeps its word");
 });
@@ -469,12 +473,13 @@ test("TP-18: an estimate from an older snapshot reads its basis name as null and
     count: 3,
     typical_pct: null,
     budget_pct: null,
+    basis_project: null,
   });
 });
 
 test("TP-29: a ranged row has typical_pct and budget_pct after count, a no basis row has neither key, an open row has both null", () => {
   const json = estimateJson(RANGED);
-  assert.deepEqual(Object.keys(json).slice(-3), ["count", "typical_pct", "budget_pct"]);
+  assert.deepEqual(Object.keys(json).slice(-4), ["count", "typical_pct", "budget_pct", "basis_project"]);
   assert.deepEqual([json.basis !== "none" && json.typical_pct, json.basis !== "none" && json.budget_pct], [2, 3]);
 
   const none = estimateJson({ key: "N", subscription: "claude", basis: "none", basisName: "none", label: "no basis yet" });
@@ -513,6 +518,7 @@ test("TP-45: an item on the spent basis with fewer than 5 tasks at or over its c
     count: 1,
     typical_pct: null,
     budget_pct: null,
+    basis_project: null,
   });
 });
 
@@ -529,6 +535,17 @@ const TYPICAL_BUDGET_ROW = { key: "A", subscription: "claude", basis: "similar",
 function readRows(rows: readonly object[]): readonly EstimateJson[] {
   return refreshShares({ ...data([], []), estimates: rows as unknown as readonly EstimateJson[] }, SEPARATE, NOW).estimates;
 }
+
+test("TP-116: a project estimate ends with its project and keeps the wide basis and all name", () => {
+  const row = estimateJson({ ...RANGED, basis: "wide", basisName: "all", basisProject: "alpha" });
+  assert.deepEqual([row.basis, row.basis_name, Object.entries(row).at(-1)], ["wide", "all", ["basis_project", "alpha"]]);
+});
+
+test("TP-117: the snapshot reader keeps a valid project and replaces an absent or invalid project with null", () => {
+  const row = { ...TYPICAL_BUDGET_ROW, typical_pct: 2, budget_pct: 3 };
+  const input = [row, { ...row, basis_project: "alpha" }, { ...row, basis_project: "has space" }, { ...row, basis_project: 7 }];
+  assert.deepEqual(readRows(input), [null, "alpha", null, null].map((basis_project) => ({ ...row, basis_project })));
+});
 
 function pairOf(row: EstimateJson | undefined): readonly unknown[] {
   assert.ok(row !== undefined && row.basis !== "none", "the row is a ranged row");
@@ -566,7 +583,7 @@ test("a typical cost under low_pct, or a budget cost over high_pct, reads both c
   ];
   const read = readRows(rows);
   assert.deepEqual(read.map(pairOf), rows.map(() => [null, null]));
-  assert.deepEqual(read, rows.map((row) => ({ ...row, typical_pct: null, budget_pct: null })));
+  assert.deepEqual(read, rows.map((row) => ({ ...row, typical_pct: null, budget_pct: null, basis_project: null })));
 });
 
 test("a typical and a budget cost in full order with the range keep both, also when they equal an end of the range", () => {
@@ -578,7 +595,7 @@ test("a typical and a budget cost in full order with the range keep both, also w
   ];
   const rows = pairs.map(([typical, budget]) => ({ ...TYPICAL_BUDGET_ROW, typical_pct: typical, budget_pct: budget }));
   assert.deepEqual(readRows(rows).map(pairOf), pairs);
-  assert.deepEqual(readRows(rows), rows);
+  assert.deepEqual(readRows(rows), rows.map((row) => ({ ...row, basis_project: null })));
 });
 
 test("TP-30: an open row, with high_pct null, reads both typical_pct and budget_pct as null whatever they hold", () => {
@@ -588,7 +605,7 @@ test("TP-30: an open row, with high_pct null, reads both typical_pct and budget_
 
 test("TP-31: a row from an older build, with neither field, reads both as null and keeps its other values", () => {
   const read = readRows([TYPICAL_BUDGET_ROW]);
-  assert.deepEqual(read[0], { ...TYPICAL_BUDGET_ROW, typical_pct: null, budget_pct: null });
+  assert.deepEqual(read[0], { ...TYPICAL_BUDGET_ROW, typical_pct: null, budget_pct: null, basis_project: null });
 });
 
 test("TP-30: a no basis row stays without the two keys after a refresh", () => {
@@ -630,7 +647,7 @@ test("TP-48: a snapshot without self_check, as an older build wrote it, reads it
   assert.equal(read.version, 1, "the rest of the snapshot is as it was");
 });
 
-const SELF_CHECK_KEYS = ["n", "hit_rate", "error_factor", "bias", "band_low", "band_high", "width", "useful_rate", "stages"];
+const SELF_CHECK_KEYS = ["n", "hit_rate", "error_factor", "bias", "band_low", "band_high", "width", "useful_rate", "stages", "projects"];
 const STAGE_KEYS = ["n", "hit_rate", "error_factor", "bias", "band_low", "band_high", "width", "useful_rate"];
 const NO_NUMBERS = { hit_rate: null, error_factor: null, bias: null, band_low: null, band_high: null, width: null, useful_rate: null };
 
@@ -645,7 +662,7 @@ function stageJson(over: Partial<StageCheckJson> = {}): StageCheckJson {
 }
 
 function checkJson(over: Partial<SelfCheckJson> = {}): SelfCheckJson {
-  return { n: 12, hit_rate: 0.75, error_factor: 1.8, bias: 1.2, ...bandOf(over.n ?? 12), width: 2.5, useful_rate: 0.5, stages: { plan: stageJson() }, ...over };
+  return { n: 12, hit_rate: 0.75, error_factor: 1.8, bias: 1.2, ...bandOf(over.n ?? 12), width: 2.5, useful_rate: 0.5, stages: { plan: stageJson() }, projects: null, ...over };
 }
 
 // A copy of `value` without the named keys: a field that is absent, not null.
@@ -671,9 +688,9 @@ test("TP-28: a self_check object keeps its numbers, and nulls for a task count t
     checkJson(),
     checkJson({ stages: {} }),
     checkJson({ n: 30, hit_rate: 0, error_factor: 1, bias: 0.25, band_low: 19 / 30, band_high: 28 / 30, useful_rate: 0, stages: null }),
-    { n: 3, ...NO_NUMBERS, stages: {} },
-    { n: 0, ...NO_NUMBERS, stages: {} },
-    { n: null, ...NO_NUMBERS, stages: null },
+    { n: 3, ...NO_NUMBERS, stages: {}, projects: {} },
+    { n: 0, ...NO_NUMBERS, stages: {}, projects: {} },
+    { n: null, ...NO_NUMBERS, stages: null, projects: null },
   ];
   for (const value of good) {
     const read: SelfCheckJson | null = readSelfCheck(value);
@@ -686,10 +703,10 @@ test("a snapshot from before bias, bands and stages keeps its three numbers and 
   const older: readonly [Record<string, unknown>, SelfCheckJson][] = [
     [
       { n: 12, hit_rate: 0.75, error_factor: 1.8 },
-      { n: 12, hit_rate: 0.75, error_factor: 1.8, bias: null, band_low: null, band_high: null, width: null, useful_rate: null, stages: null },
+      { n: 12, hit_rate: 0.75, error_factor: 1.8, bias: null, band_low: null, band_high: null, width: null, useful_rate: null, stages: null, projects: null },
     ],
-    [{ n: 3, hit_rate: null, error_factor: null }, { n: 3, ...NO_NUMBERS, stages: null }],
-    [{ n: null, hit_rate: null, error_factor: null }, { n: null, ...NO_NUMBERS, stages: null }],
+    [{ n: 3, hit_rate: null, error_factor: null }, { n: 3, ...NO_NUMBERS, stages: null, projects: null }],
+    [{ n: null, hit_rate: null, error_factor: null }, { n: null, ...NO_NUMBERS, stages: null, projects: null }],
   ];
   for (const [value, expected] of older) {
     const read = readSelfCheck(value);
@@ -757,7 +774,7 @@ test("a stage band that is not the band of the stage task count gives stages nul
 });
 
 test("a self_check with n null has every number null and stages null or absent, else the whole self_check is null", () => {
-  const unread = { n: null, ...NO_NUMBERS, stages: null };
+  const unread = { n: null, ...NO_NUMBERS, stages: null, projects: null };
   const bad: readonly unknown[] = [
     { ...unread, hit_rate: 0.5 },
     { ...unread, error_factor: 2 },
@@ -889,6 +906,16 @@ test("the stage labels __proto__, constructor and toString read as own entries o
   assert.deepEqual(Object.getOwnPropertyNames(Object.prototype).sort(), before);
 });
 
+test("TP-127: an invalid projects map reads as null and keeps the rest of the self-check", () => {
+  const expected = { ...checkJson(), projects: null };
+  const tooMany = Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`alpha${i}`, stageJson()]));
+  for (const projects of [{ "has space": stageJson() }, { alpha: stageJson({ n: -1 }) }, tooMany, []]) {
+    assert.deepEqual(readSelfCheck({ ...expected, projects }), expected);
+  }
+  const noCount = { n: null, ...NO_NUMBERS, stages: null, projects: null };
+  assert.deepEqual(readSelfCheck({ ...noCount, projects: { alpha: stageJson() } }), noCount);
+});
+
 // --- the self_check that a built status carries ---
 
 const SEP_1 = Date.parse("2026-09-01T00:00:00Z");
@@ -934,7 +961,7 @@ function builtSelfCheck(lines: readonly EstimateLogLine[], entries: readonly Tas
   return check;
 }
 
-test("a built self_check has the keys n, hit_rate, error_factor, bias, band_low, band_high, width, useful_rate and stages, and each stage the first eight", () => {
+test("a built self_check keeps check fields in order and gives each stage the eight metrics", () => {
   // The range is 100 to 400, so its log middle is 200. The costs 400, 400, 400, 200 and 50 give four hits and
   // one miss. The offsets are ln 1/2 (three times), 0 and ln 4: the bias is exp of their median, 1/2, and the
   // error factor is the median of exp of their size, 2. So the bias and the error factor differ. The width is
@@ -942,7 +969,7 @@ test("a built self_check has the keys n, hit_rate, error_factor, bias, band_low,
   const entries = history([400, 400, 400, 200, 50]);
   const lines = entries.flatMap((_, i) => [lineBefore(i, "plan"), lineBefore(i, "issue", 2)]);
   const check = builtSelfCheck(lines, entries);
-  const expectFive = (value: Omit<SelfCheckJson, "stages">): void => {
+  const expectFive = (value: Omit<SelfCheckJson, "stages" | "projects">): void => {
     assert.deepEqual([value.n, value.hit_rate, value.band_low, value.band_high], [5, 0.8, 0.4, 1]);
     near(value.bias, 0.5);
     near(value.error_factor, 2);
@@ -996,6 +1023,15 @@ test("a built self_check of four scored tasks has width and useful_rate null at 
   for (const stage of Object.values(stages)) assert.deepEqual([stage.n, stage.width, stage.useful_rate], [4, null, null]);
 });
 
+test("TP-128: project map keys stay own data through the status writer and reader", () => {
+  const projects = ["__proto__", "constructor", "toString"];
+  const entries = history([200, 200, 200]).map((entry, i) => ({ ...entry, tags: { project: projects[i] ?? "" } }));
+  const check = builtSelfCheck(entries.map((_, i) => lineBefore(i, null)), entries);
+  const expected = Object.fromEntries(projects.map((project) => [project, { n: 1, ...NO_NUMBERS }]));
+  assert.deepEqual(Object.getOwnPropertyDescriptor(check, "projects")?.value, expected);
+  assert.deepEqual(readSelfCheck(JSON.parse(JSON.stringify(check))), check);
+});
+
 test("a built self_check whose width is not finite keeps the other numbers, and the reader keeps the self_check", () => {
   // Two ranges of 100 to 200 and three of 1e-300 to 1e10, every cost 150: all five are hits, the median of the
   // five ratios is infinite, and the two narrow ranges are the only useful ones.
@@ -1023,18 +1059,18 @@ test("a built self_check whose width is not finite keeps the other numbers, and 
   assert.deepEqual(refreshShares(onDisk, SEPARATE, NOW).self_check, check);
 });
 
-test("a built self_check with no line of any stage has an empty stages object, and with no log lines at all n 0", () => {
+test("TP-126: a readable log without stage or project data has empty maps", () => {
   const entries = history([200, 200, 200, 200, 200]);
   const unstaged = builtSelfCheck(entries.map((_, i) => lineBefore(i, null)), entries);
-  assert.deepEqual(unstaged.stages, {});
+  assert.deepEqual([unstaged.stages, unstaged.projects], [{}, {}]);
   assert.equal(unstaged.n, 5);
-  assert.deepEqual(builtSelfCheck([], entries), { n: 0, ...NO_NUMBERS, stages: {} });
+  assert.deepEqual(builtSelfCheck([], entries), { n: 0, ...NO_NUMBERS, stages: {}, projects: {} });
 });
 
-test("a built self_check of a damaged log has all seven values null, stages included", () => {
+test("TP-126: a damaged log has null metrics and maps", () => {
   const entries = history([200, 200, 200, 200, 200]);
   const check = builtSelfCheck(entries.map((_, i) => lineBefore(i, "plan")), entries, true);
-  assert.deepEqual(check, { n: null, ...NO_NUMBERS, stages: null });
+  assert.deepEqual(check, { n: null, ...NO_NUMBERS, stages: null, projects: null });
   assert.deepEqual(Object.keys(check), SELF_CHECK_KEYS);
 });
 
@@ -1176,9 +1212,9 @@ test("TP-63: a snapshot from before the change keeps its old fields through refr
 
   assert.deepEqual(Object.keys(read), ["version", "written_at", "collect", "subscriptions", "models", "tasks", "estimates", "self_check", "pool", "queue"]);
   assert.equal(read.queue, null);
-  assert.deepEqual(read.estimates, [{ ...ranged, typical_pct: null, budget_pct: null }, none]);
-  assert.deepEqual(Object.keys(read.estimates[0] ?? {}), [...Object.keys(ranged), "typical_pct", "budget_pct"]);
-  assert.deepEqual(read.self_check, { ...stage, width: null, useful_rate: null, stages: { plan: { ...stage, width: null, useful_rate: null } } });
-  assert.deepEqual(Object.keys(read.self_check ?? {}), ["n", "hit_rate", "error_factor", "bias", "band_low", "band_high", "width", "useful_rate", "stages"]);
+  assert.deepEqual(read.estimates, [{ ...ranged, typical_pct: null, budget_pct: null, basis_project: null }, none]);
+  assert.deepEqual(Object.keys(read.estimates[0] ?? {}), [...Object.keys(ranged), "typical_pct", "budget_pct", "basis_project"]);
+  assert.deepEqual(read.self_check, { ...stage, width: null, useful_rate: null, stages: { plan: { ...stage, width: null, useful_rate: null } }, projects: null });
+  assert.deepEqual(Object.keys(read.self_check ?? {}), ["n", "hit_rate", "error_factor", "bias", "band_low", "band_high", "width", "useful_rate", "stages", "projects"]);
   assert.deepEqual([read.version, read.written_at, read.pool], [1, START + HOUR, { mode: "separate" }]);
 });

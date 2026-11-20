@@ -220,7 +220,7 @@ async function dataOf(w: World, command: string): Promise<Envelope["data"]> {
 // The self_check of a log that was read, with `n` scored tasks and no number to show,
 // and no line of any stage. The keys are in the order of the output.
 function unscored(n: number | null, stages: object | null = {}): object {
-  return { n, hit_rate: null, error_factor: null, bias: null, band_low: null, band_high: null, width: null, useful_rate: null, stages };
+  return { n, hit_rate: null, error_factor: null, bias: null, band_low: null, band_high: null, width: null, useful_rate: null, stages, projects: n === null ? null : {} };
 }
 
 // The queue of a status with no open item. The keys are in the order of the output.
@@ -764,8 +764,9 @@ test("periods: the day, the week and the month of the collected rows agree with 
   const run = await cli(w, ["status"], { io: { locale: "en-US" } });
   assert.equal(run.code, 0, run.text);
   const { periods, subscriptions } = run.env.data;
-  assert.deepEqual(Object.keys(periods), ["week_start", "days", "weeks", "months"]);
+  assert.deepEqual(Object.keys(periods), ["week_start", "days", "weeks", "months", "cut"]);
   assert.equal(periods.week_start, "sun");
+  assert.deepEqual(periods.cut, { days: 0, weeks: 0, months: 0 });
   const [day] = periods.days;
   const [week] = periods.weeks;
   const [month] = periods.months;
@@ -851,7 +852,7 @@ test("periods: a folder with no days file gives empty lists", async (t) => {
   fs.unlinkSync(join(dataDir(w), "days.json"));
   const missing = await cli(w, ["status"], { io: { locale: "en-US" } });
   assert.equal(missing.code, 0, missing.text);
-  assert.deepEqual(missing.env.data.periods, { week_start: "sun", days: [], weeks: [], months: [] });
+  assert.deepEqual(missing.env.data.periods, { week_start: "sun", days: [], weeks: [], months: [], cut: { days: 0, weeks: 0, months: 0 } });
   assert.equal(missing.env.data.periods_error, null);
 });
 
@@ -943,25 +944,57 @@ function longKey(index: number): string {
   return String(index).padStart(4, "0").padEnd(64, "k");
 }
 
-test("TP-64: collect with 500 open items of 64 character keys keeps status.json under 1 MiB, and status and usage within the output budget", async (t) => {
+// A raise to this ceiling needs a reason in its PR.
+const FIXED_OUTPUT_CEILING_BYTES = 13 * 16 * 1024;
+const MIN_PERIOD_ROOM_BYTES = 60 * 1024;
+const LONG_PROJECTS = Array.from({ length: 8 }, (_, i) => `alpha${i}`.padEnd(64, "a"));
+
+function plantProjectChecks(path: string): object {
+  const snapshot = JSON.parse(readFileSync(path, "utf8"));
+  const check = {
+    n: 5, hit_rate: 0.8123456789123456, error_factor: 2.123456789123456, bias: 1.123456789123456,
+    band_low: 0.4, band_high: 1, width: 2.123456789123456, useful_rate: 0.6123456789123456,
+  };
+  const projects = Object.fromEntries(LONG_PROJECTS.map((project) => [project, check]));
+  snapshot.data.self_check = { ...snapshot.data.self_check, n: 30, projects };
+  writeFileSync(path, JSON.stringify(snapshot), { mode: 0o600 });
+  return projects;
+}
+
+test("TP-64/132: 500 long project estimates keep the snapshot and output within their byte budgets", async (t) => {
   const w = makeWorld(t);
-  const open = Array.from({ length: SYNC_MAX_OPEN_ITEMS }, (_, index) => ({ key: longKey(index), tags: {} }));
-  assert.ok(open.every((item) => item.key.length === 64));
-  await syncCostTasks(w, THREE_COSTS, open);
+  const alpha = "alpha".padEnd(64, "a");
+  const beta = "beta".padEnd(64, "b");
+  const tags = Object.fromEntries(LONG_PROJECTS.slice(1).map((value, i) => [`alpha${i}`, value]));
+  const open = Array.from({ length: SYNC_MAX_OPEN_ITEMS }, (_, index) => ({
+    key: longKey(index), tags: { ...tags, project: index % 2 === 0 ? alpha : beta },
+  }));
+  await syncCostTasks(w, projectCosts(alpha, beta), open, 100);
   await collectOk(w);
-  // The worst store of days beside it: the periods take the bytes that the other fields leave.
+  const path = join(dataDir(w), "status.json");
+  const collected = statSync(path).size;
+  const projects = plantProjectChecks(path);
+  const stored = statSync(path).size;
+  t.diagnostic(`status.json: ${collected} bytes collected, ${stored} bytes with project checks`);
+  assert.ok(collected <= MIB && stored <= MIB, `status.json is ${stored} bytes`);
   writeFileSync(join(dataDir(w), "days.json"), JSON.stringify(worstDays().toJson()), { mode: 0o600 });
 
-  const stored = statSync(join(dataDir(w), "status.json")).size;
-  assert.ok(stored <= MIB, `status.json is ${stored} bytes`);
   for (const command of ["status", "usage"] as const) {
     const run = await cli(w, [command]);
     assert.equal(run.code, 0, run.text.slice(0, 200));
-    assert.ok(Buffer.byteLength(run.text) <= STATUS_OUTPUT_MAX_BYTES, `${command}: ${Buffer.byteLength(run.text)} bytes`);
+    const { periods, estimates, queue, self_check } = run.env.data;
+    const fixed = Buffer.byteLength(JSON.stringify({ ...run.env, data: { ...run.env.data, periods: null, periods_error: null } })) + 1;
+    const output = Buffer.byteLength(run.text);
+    t.diagnostic(`${command}: fixed=${fixed}, output=${output}, rows=${[periods.days.length, periods.weeks.length, periods.months.length]}, cut=${JSON.stringify(periods.cut)}`);
+    assert.ok(output <= STATUS_OUTPUT_MAX_BYTES, `${command}: ${output} bytes`);
+    assert.ok(periods.days.length > 0 && periods.days.length < DAYS_HORIZON_DAYS);
+    assert.deepEqual(periods.cut, { days: DAYS_HORIZON_DAYS - periods.days.length, weeks: 0, months: 0 });
+    assert.ok(fixed <= FIXED_OUTPUT_CEILING_BYTES, `${command} fixed part: ${fixed} bytes`);
+    assert.ok(STATUS_OUTPUT_MAX_BYTES - fixed >= MIN_PERIOD_ROOM_BYTES, `${command} period room: ${STATUS_OUTPUT_MAX_BYTES - fixed} bytes`);
+    assert.deepEqual(self_check.projects, projects);
+    assert.deepEqual(estimates.map((row: Record<string, unknown>) => [row.key, row.basis_project]), open.map((item) => [item.key, item.tags.project]));
+    assert.equal(queue.count, SYNC_MAX_OPEN_ITEMS, "the queue counts every item");
   }
-  const { estimates, queue } = await dataOf(w, "status");
-  assert.equal(estimates.length, SYNC_MAX_OPEN_ITEMS, "every item has its estimate");
-  assert.equal(queue.count, SYNC_MAX_OPEN_ITEMS, "the queue counts every item");
 });
 
 // Days 2026-11-01 and 2026-11-02 beside the collected 2026-11-03.
@@ -1379,15 +1412,43 @@ function seedCostTasks(w: World, tasks: readonly CostTask[]): object[] {
 }
 
 // Seeds the rows and the quota, then syncs the windows and the open items.
-async function syncCostTasks(w: World, tasks: readonly CostTask[], open: readonly object[]): Promise<void> {
+async function syncCostTasks(w: World, tasks: readonly CostTask[], open: readonly object[], weekPct = 10): Promise<void> {
   const windows = seedCostTasks(w, tasks);
-  recordPoints(w, 5, 10);
-  const synced = await cli(w, ["tasks", "sync"], { stdin: JSON.stringify({ windows, open }) });
+  recordPoints(w, 5, weekPct);
+  const stdin = JSON.stringify({ windows, open });
+  assert.ok(Buffer.byteLength(stdin) <= SYNC_MAX_BYTES);
+  const synced = await cli(w, ["tasks", "sync"], { stdin });
   assert.equal(synced.code, 0, synced.text);
   assert.equal(synced.env.data.windows, tasks.length);
 }
 
 const THREE_COSTS: readonly CostTask[] = [1000, 2000, 4000].map((cost, index): CostTask => ({ label: `T${index + 1}`, cost }));
+
+function projectCosts(alpha: string, beta: string): readonly CostTask[] {
+  return [alpha, beta].flatMap((project, group) => Array.from({ length: 9 }, (_, index) => ({
+    label: `T${group}-${index}`, cost: (1_000 + 10 * index) * (group === 0 ? 1 : 100), tags: { project },
+  })));
+}
+
+test("TP-116/118/123: status and estimate show the project basis, and an unchanged collect does not log it again", async (t) => {
+  const w = makeWorld(t);
+  const items = [{ key: "A", tags: { project: "alpha" } }, { key: "B", tags: { repo: "beta" } }, { key: "C", tags: {} }];
+  await syncCostTasks(w, projectCosts("alpha", "beta"), items, 100);
+  await collectOk(w);
+
+  const status = await dataOf(w, "status");
+  const estimate = await cli(w, ["estimate"], { stdin: JSON.stringify({ items }) });
+  assert.equal(estimate.code, 0, estimate.text);
+  assert.deepEqual(estimate.env.data.estimates, status.estimates);
+  assert.deepEqual(
+    status.estimates.map((row: Record<string, unknown>) => [row.key, row.basis, row.basis_name, Object.entries(row).at(-1)]),
+    items.map(({ key }, i) => [key, "wide", "all", ["basis_project", ["alpha", "beta", null][i]]]),
+  );
+  const lines = storedLines(w);
+  assert.deepEqual(lines.map((line) => line["basis_project"]), ["alpha", "beta", null]);
+  await collectOk(w);
+  assert.deepEqual(storedLines(w), lines);
+});
 
 function near(actual: number, expected: number, message: string): void {
   assert.ok(Math.abs(actual - expected) < 1e-6, `${message}: ${actual} is not near ${expected}`);
@@ -1403,6 +1464,7 @@ test("tasks: an estimate from an older snapshot has no raw range and no basis na
   await collectOk(w);
   const current = (await dataOf(w, "status")).estimates;
   assert.deepEqual(current.map((e: { basis: string; basis_name: string }) => [e.basis, e.basis_name]), [["wide", "all"], ["wide", "all"]]);
+  assert.ok(current.every((row: Record<string, unknown>) => row.basis_project === null && !Object.hasOwn(row, "folder")));
   assert.ok(current[0].raw_low > 0 && current[0].raw_high >= current[0].raw_low);
 
   const path = join(dataDir(w), "status.json");
@@ -1429,7 +1491,7 @@ test("tasks: an estimate from an older snapshot has no raw range and no basis na
 const OLD_TOP_KEYS = ["version", "written_at", "collect", "subscriptions", "models", "tasks", "estimates", "self_check", "pool", "periods", "periods_error"];
 const OLD_ESTIMATE_KEYS = ["key", "subscription", "basis", "basis_name", "low_pct", "high_pct", "raw_low", "raw_high", "count"];
 const OLD_SELF_CHECK_KEYS = ["n", "hit_rate", "error_factor", "bias", "band_low", "band_high", "stages"];
-const NEW_SELF_CHECK_KEYS = ["width", "useful_rate"];
+const NEW_SELF_CHECK_KEYS = ["width", "useful_rate", "projects"];
 const QUEUE_KEYS = ["count", "expected_pct", "low_pct", "high_pct", "likely_low_pct", "likely_high_pct", "spent_pct"];
 
 test("TP-60: three finished tasks and two open items: each row keeps its old keys and values in order, then gets typical_pct and budget_pct", async (t) => {
@@ -1444,7 +1506,7 @@ test("TP-60: three finished tasks and two open items: each row keeps its old key
   // = 3605. P50 is at 1: 2005. P80 is at 1.6: 2005 + 0.6 * 2000 = 3205.
   assert.deepEqual(estimates.map((row: { key: string }) => row.key), ["A", "B"]);
   for (const row of estimates) {
-    assert.deepEqual(Object.keys(row), [...OLD_ESTIMATE_KEYS, "typical_pct", "budget_pct"], row.key);
+    assert.deepEqual(Object.keys(row), [...OLD_ESTIMATE_KEYS, "typical_pct", "budget_pct", "basis_project"], row.key);
     assert.deepEqual([row.subscription, row.basis, row.basis_name, row.count], ["claude", "wide", "all", 3], row.key);
     near(row.low_pct, 1205 / perPct, `${row.key} low`);
     near(row.high_pct, 3605 / perPct, `${row.key} high`);
@@ -1468,7 +1530,7 @@ test("TP-61: the top level and the self_check keep the keys of the earlier statu
 
   const checkKeys = Object.keys(data.self_check);
   assert.deepEqual(checkKeys.filter((key) => !NEW_SELF_CHECK_KEYS.includes(key)), OLD_SELF_CHECK_KEYS);
-  assert.deepEqual(checkKeys, ["n", "hit_rate", "error_factor", "bias", "band_low", "band_high", "width", "useful_rate", "stages"]);
+  assert.deepEqual(checkKeys, ["n", "hit_rate", "error_factor", "bias", "band_low", "band_high", "width", "useful_rate", "stages", "projects"]);
   assert.deepEqual(data.self_check, unscored(0), "no task was scored yet: the old numbers and the two new ones are null, the stages are empty");
 
   // Two items with no cost so far, each one drawn from the three costs: the mean of the pool is 7015 / 3, and the
@@ -1513,8 +1575,8 @@ test("TP-62: an older snapshot with every new key deleted reads queue null and n
     assert.deepEqual([row.typical_pct, row.budget_pct], [null, null], row.key);
     for (const key of OLD_ESTIMATE_KEYS) assert.deepEqual(row[key], saved.data.estimates[index]?.[key], `${row.key} ${key}`);
   }
-  assert.deepEqual(read.self_check, { ...stage, width: null, useful_rate: null, stages: { plan: { ...stage, width: null, useful_rate: null } } });
-  assert.deepEqual(Object.keys(read.self_check), ["n", "hit_rate", "error_factor", "bias", "band_low", "band_high", "width", "useful_rate", "stages"]);
+  assert.deepEqual(read.self_check, { ...stage, width: null, useful_rate: null, stages: { plan: { ...stage, width: null, useful_rate: null } }, projects: null });
+  assert.deepEqual(Object.keys(read.self_check), ["n", "hit_rate", "error_factor", "bias", "band_low", "band_high", "width", "useful_rate", "stages", "projects"]);
 });
 
 test("TP-19: a snapshot with the new estimate fields and one without them both read, with no store corrupt flag", async (t) => {
@@ -1626,7 +1688,7 @@ test("estimate: three finished tasks of different costs give a wide range over a
     near(estimate.budget_pct, 3205 / perPct, `${estimate.key} budget`);
     assert.deepEqual(
       Object.keys(estimate),
-      ["key", "subscription", "basis", "basis_name", "low_pct", "high_pct", "raw_low", "raw_high", "count", "typical_pct", "budget_pct"],
+      ["key", "subscription", "basis", "basis_name", "low_pct", "high_pct", "raw_low", "raw_high", "count", "typical_pct", "budget_pct", "basis_project"],
       estimate.key,
     );
   }
@@ -2245,7 +2307,7 @@ test("a snapshot on disk with a bad stage entry reads with stages null and the r
     for (const command of ["status", "usage"]) {
       const run = await cli(w, [command]);
       assert.equal(run.code, 0, `${command} ${JSON.stringify(bad)}: ${run.text}`);
-      assert.deepEqual(run.env.data.self_check, { ...top, stages: null }, `${command} ${JSON.stringify(bad)}`);
+      assert.deepEqual(run.env.data.self_check, { ...top, stages: null, projects: null }, `${command} ${JSON.stringify(bad)}`);
     }
     assert.equal((await cli(w, ["doctor"])).code, 0, JSON.stringify(bad));
   }

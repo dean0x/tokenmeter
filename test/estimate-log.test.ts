@@ -58,11 +58,11 @@ function put(dir: string, name: string, text: string): void {
 }
 
 function logged(key: string, at: number, over: Partial<RangedLogLine> = {}): RangedLogLine {
-  return { at, key, basis: "wide", basisName: "all", features: [], stage: null, low: 100, high: 400, ...over };
+  return { at, key, basis: "wide", basisName: "all", features: [], stage: null, basisProject: null, low: 100, high: 400, ...over };
 }
 
 function loggedNone(key: string, at: number, stage: string | null = null): NoBasisLogLine {
-  return { at, key, basis: "none", basisName: "none", features: [], stage, low: null, high: null };
+  return { at, key, basis: "none", basisName: "none", features: [], stage, basisProject: null, low: null, high: null };
 }
 
 // The month file of a valid time.
@@ -165,20 +165,53 @@ test("a line with sixteen feature names reads back as it was written", () => {
   assert.deepEqual(parseLogLine(logLineText(line), NOW), line);
 });
 
-test("a line always writes its stage after the feature names, null included, and a line with a stage reads back as it was written", () => {
+test("TP-119: a line writes stage and project scope in order, with null scope for a shared basis or no basis", () => {
   const lines = [
     logged("A", NOW),
-    logged("B", NOW, { basis: "similar", basisName: "size", features: ["size"], stage: "issue" }),
+    logged("B", NOW, { stage: "issue", basisProject: "alpha" }),
     loggedNone("C", NOW),
     loggedNone("D", NOW, "plan"),
   ];
   for (const line of lines) {
     const text = logLineText(line);
     const written = JSON.parse(text) as Record<string, unknown>;
-    assert.deepEqual(Object.keys(written), ["at", "key", "basis", "basis_name", "features", "stage", "low", "high"]);
+    assert.deepEqual(Object.keys(written), ["at", "key", "basis", "basis_name", "features", "stage", "basis_project", "low", "high"]);
     assert.equal(written["stage"], line.stage);
+    assert.equal(written["basis_project"], line.basisProject);
     assert.deepEqual(parseLogLine(text, NOW), line);
   }
+});
+
+test("TP-119: a line with no project scope reads with null scope", () => {
+  const old = '{"at":' + NOW + ',"key":"A","basis":"wide","basis_name":"all","features":[],"stage":null,"low":100,"high":400}';
+  assert.equal(parseLogLine(old, NOW)?.basisProject, null);
+});
+
+test("TP-119: the log keeps a change from shared to project scope but not a repeat", (t) => {
+  const { dir } = folder(t);
+  const shared = logged("A", NOW - DAY_MS);
+  const scoped = logged("A", NOW - 2, { basisProject: "alpha" });
+  const repeat = { ...scoped, at: NOW - 1 };
+  put(dir, fileOf(NOW), linesText(shared, scoped, repeat));
+  assert.deepEqual(readEstimateLog(dir, NOW, DEPS).lines, [shared, scoped]);
+});
+
+test("TP-119: the log keeps a change from project to shared scope but not a repeat", (t) => {
+  const { dir } = folder(t);
+  const scoped = logged("A", NOW - 2, { stage: "plan", basisProject: "alpha" });
+  const shared = { ...scoped, at: NOW - 1, basisProject: null };
+  const repeat = { ...shared, at: NOW };
+  put(dir, fileOf(NOW), linesText(scoped, shared, repeat));
+  assert.deepEqual(readEstimateLog(dir, NOW, DEPS).lines, [scoped, shared]);
+});
+
+test("TP-120: invalid project scopes and project scopes with no basis make a line invalid", () => {
+  const ranged = JSON.parse(logLineText(logged("A", NOW))) as Record<string, unknown>;
+  for (const scope of ["", "has space", "a".repeat(65), 7, true, {}, []]) {
+    assert.equal(parseLogLine(JSON.stringify({ ...ranged, basis_project: scope }), NOW), null);
+  }
+  const none = JSON.parse(logLineText(loggedNone("A", NOW))) as Record<string, unknown>;
+  assert.equal(parseLogLine(JSON.stringify({ ...none, basis_project: "alpha" }), NOW), null);
 });
 
 test("a line with no stage key, or with stage null, reads with stage null", () => {
@@ -306,12 +339,43 @@ test("TP-25: an append to a month file at or above the cap is refused, and the f
   assert.equal(appendEstimateLines(dir, [logged("A", NOW)], ALL_READ, DEPS).full, 1, "over the cap");
 });
 
-test("TP-25: the cap is checked before each append, so a file below it takes one line and then stops", (t) => {
+test("TP-25 and TP-133: a file below the cap takes one maximum-size scoped line and still reads it", (t) => {
   const { dir } = folder(t);
   const file = join(dir, fileOf(NOW));
-  put(dir, fileOf(NOW), "x".repeat(ESTIMATE_LOG_CAP_BYTES - 1));
-  assert.deepEqual(appendEstimateLines(dir, [logged("A", NOW), logged("B", NOW)], ALL_READ, DEPS), { appended: 1, full: 1, failed: 0 });
-  assert.ok(statSync(file).size >= ESTIMATE_LOG_CAP_BYTES);
+  const features = featureNames(16).map((name) => name.padEnd(16, "a"));
+  const line = logged("a".repeat(64), NOW, {
+    basis: "similar", basisName: features.slice(0, 2).join("+"), features,
+    stage: "b".repeat(64), basisProject: "c".repeat(64), low: 1.0000000000000002e-307, high: Number.MAX_VALUE,
+  });
+  const before = ESTIMATE_LOG_CAP_BYTES - 1;
+  put(dir, fileOf(NOW), `${"x".repeat(before - 1)}\n`);
+  assert.deepEqual(appendEstimateLines(dir, [line, logged("B", NOW)], ALL_READ, DEPS), { appended: 1, full: 1, failed: 0 });
+  assert.equal(statSync(file).size, before + Buffer.byteLength(linesText(line)));
+  assert.deepEqual(readEstimateLog(dir, NOW, DEPS).lines, [line]);
+});
+
+test("a project line stays separate when the last record has no newline", (t) => {
+  const { dir } = folder(t);
+  const previous = logged("A", NOW - 1);
+  const next = logged("B", NOW, { basisProject: "alpha" });
+  for (const tail of [logLineText(previous), "{"]) {
+    put(dir, fileOf(NOW), tail);
+    assert.deepEqual(appendEstimateLines(dir, [next], ALL_READ, DEPS), { appended: 1, full: 0, failed: 0 });
+    assert.equal(readFileSync(join(dir, fileOf(NOW)), "utf8"), `${tail}\n${linesText(next)}`);
+    assert.deepEqual(readEstimateLog(dir, NOW, DEPS).lines, tail === "{" ? [next] : [previous, next]);
+  }
+});
+
+test("TP-122: an invalid or noncanonical line counts as failed and leaves the file unchanged", (t) => {
+  const { dir } = folder(t);
+  const file = fileOf(NOW);
+  const before = linesText(logged("A", NOW));
+  put(dir, file, before);
+  const badScope = { ...logged("B", NOW), basisProject: "has space" };
+  const badRange = logged("C", NOW, { low: 500 });
+  const unordered = logged("D", NOW, { features: ["size", "files"] });
+  assert.deepEqual(appendEstimateLines(dir, [badScope, badRange, unordered], ALL_READ, DEPS), { appended: 0, full: 0, failed: 3 });
+  assert.equal(readFileSync(join(dir, file), "utf8"), before);
 });
 
 test("TP-25: a symlinked month file is refused and its target is not changed", (t) => {
@@ -361,6 +425,13 @@ test("a line with a time that is not valid is not written and is counted as fail
   const { dir } = folder(t);
   assert.deepEqual(appendEstimateLines(dir, [logged("A", Number.NaN), logged("B", NOW)], ALL_READ, DEPS), { appended: 1, full: 0, failed: 1 });
   assert.deepEqual(names(dir), ["estimates-2026-11.jsonl"]);
+});
+
+test("TP-122: an append refuses a time that names no readable month file", (t) => {
+  const { dir } = folder(t);
+  const at = Date.UTC(10_000, 0, 1);
+  assert.deepEqual(appendEstimateLines(dir, [logged("A", at)], ALL_READ, depsAt(at)), { appended: 0, full: 0, failed: 1 });
+  assert.deepEqual(names(dir), []);
 });
 
 test("a line goes to the month file of its own UTC time", (t) => {
