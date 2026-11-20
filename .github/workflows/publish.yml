@@ -30,16 +30,40 @@ jobs:
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
           version=$(jq -er .version package.json)
           test "$GITHUB_REF_NAME" = "v$version"
+      # Node 24.22.3 has npm 11.19.1. Staged publishing needs npm 11.15.0 or newer.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '24'
+          node-version: '24.22.3'
           registry-url: 'https://registry.npmjs.org'
-      # Trusted publishing needs npm 11.5.1 or newer.
-      - run: npm install --global npm@11.6.2
-      - run: npm ci
+      - name: Check the npm version
+        shell: bash
+        run: |
+          npm_version=$(npm --version)
+          if ! [[ "$npm_version" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
+            echo "::error::npm printed an unknown version: $npm_version"
+            exit 1
+          fi
+          major=${BASH_REMATCH[1]} minor=${BASH_REMATCH[2]}
+          if ((major < 11 || (major == 11 && minor < 15))); then
+            echo "::error::npm $npm_version can not stage a version. It needs npm 11.15.0 or newer."
+            exit 1
+          fi
+      # This job can sign in to npm, so no dependency runs an install script here.
+      - run: npm ci --ignore-scripts
       - run: npm test
-      - name: Publish with provenance
+      # RELEASE.md gives the steps for each mode.
+      # - NPM_TOKEN is set: the first version only. The token is stage-only. npm stages
+      #   the version, and the release owner approves it with 2FA.
+      # - NPM_TOKEN is empty: every later version. npm signs in with the workflow
+      #   identity (trusted publishing) and adds provenance on its own.
+      - name: Publish
+        shell: bash
         env:
-          # Empty when trusted publishing is set up. Then npm signs in with the workflow identity.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --provenance --access public
+        run: |
+          if [ -n "$NODE_AUTH_TOKEN" ]; then
+            npm stage publish --provenance --access public
+            echo "::warning::The version is staged, not live. Approve it with npm stage approve."
+          else
+            npm publish --access public
+          fi

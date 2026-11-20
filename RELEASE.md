@@ -1,16 +1,56 @@
 # Release tokenmeter
 
-The `Publish` workflow (`.github/workflows/publish.yml`) publishes to npm with provenance.
+The `Publish` workflow (`.github/workflows/publish.yml`) publishes or stages a version on npm with provenance.
 A version tag on `main` starts it.
+
+The workflow has two modes:
+
+- When the `NPM_TOKEN` secret is set, the workflow stages the version with `npm stage publish`.
+  The version is not live until the release owner approves it with 2FA.
+  Use this mode for the first version only.
+- When the `NPM_TOKEN` secret is empty, the workflow publishes with trusted publishing.
+  npm signs in with the workflow identity. There is no token.
 
 ## Set up once
 
 1. Make a GitHub environment with the name `npm`. Add the release owner as a required reviewer.
-2. On npmjs.com, add this repository and the `publish.yml` workflow as a trusted publisher of `@dean0x/tokenmeter`.
-3. If the package is not on npm yet, you can not add a trusted publisher.
-   For that first version, add a granular npm token as the `NPM_TOKEN` secret of the `npm` environment.
-   Give the token publish access to the `@dean0x` scope only, with a short expiry.
-   After the first publish, add the trusted publisher and delete the secret.
+   Let only tags that match `v*.*.*` deploy to it.
+
+## First version (staged)
+
+npm can not add a trusted publisher to a package that is not on npm yet.
+So the first version goes through a stage-only token.
+
+1. On npmjs.com, make a granular access token with stage-only publish access.
+   Give it access to the `@dean0x` scope only, with a short expiry.
+2. Add the token as the `NPM_TOKEN` secret of the `npm` environment.
+3. Publish the version (see "Publish").
+4. Approve the staged version with 2FA immediately after the run passes:
+
+   ```sh
+   npm stage list @dean0x/tokenmeter
+   npm stage approve '<stage-id>'
+   ```
+
+5. Delete the `NPM_TOKEN` secret. Revoke the token on npmjs.com.
+
+npm makes a public placeholder version `0.0.0-stage` when it stages a package that is not on npm yet.
+The npm docs do not say if a staged version keeps its provenance after approval.
+For the first version, check the provenance once (see "Verify"). If it is not there, record that in the release notes.
+
+## Later versions (trusted publishing)
+
+1. Merge the version change to `main` (see "Prepare the version").
+2. Sign in with `npm login`. Your npm account must have 2FA.
+   Add the trusted publisher with npm 11.15.0 or newer:
+
+   ```sh
+   npm trust github @dean0x/tokenmeter --repo dean0x/tokenmeter --file publish.yml --env npm --allow-publish
+   ```
+
+3. Push the version tag within 2 days (see "Publish"). A new trusted publisher expires when no publish uses it in 2 days.
+4. After that publish passes, open the package settings on npmjs.com.
+   Under "Publishing access", select "Require two-factor authentication and disallow tokens".
 
 ## Prepare the version
 
@@ -41,6 +81,7 @@ A version tag on `main` starts it.
 
 2. Open the `Publish` run of the tag in the Actions tab. Approve the `npm` environment.
 3. Confirm that the run passes. The run stops if the tag is not on `main` or does not agree with the version.
+4. If the run staged the version, approve it (see "First version (staged)", step 4).
 
 ## Verify
 
