@@ -735,6 +735,20 @@ test("appendLine refuses a line with a newline and writes nothing", (t) => {
   assert.throws(() => statSync(file));
 });
 
+for (const cap of [NaN, 0, -1, 0.5]) {
+  test(`appendLine rejects cap ${cap} without creating or modifying a file`, (t) => {
+    const sb = makeSandbox(t);
+    const missing = sb.path("missing.jsonl");
+    const existing = sb.path("existing.jsonl");
+    writeFileSync(existing, "keep\n", { mode: 0o600 });
+
+    assert.equal(failureOf(appendLine(missing, "line", undefined, cap)), "bad_input");
+    assert.throws(() => lstatSync(missing), { code: "ENOENT" });
+    assert.equal(failureOf(appendLine(existing, "line", undefined, cap)), "bad_input");
+    assert.equal(readFileSync(existing, "utf8"), "keep\n");
+  });
+}
+
 test("appendLine refuses a file owned by another user and a folder", (t) => {
   const sb = makeSandbox(t);
   const file = sb.path("log.jsonl");
