@@ -39,13 +39,17 @@ jobs:
         shell: bash
         run: |
           npm_version=$(npm --version)
-          [[ "$npm_version" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]]
+          if ! [[ "$npm_version" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
+            echo "::error::npm printed an unknown version: $npm_version"
+            exit 1
+          fi
           major=${BASH_REMATCH[1]} minor=${BASH_REMATCH[2]}
           if ((major < 11 || (major == 11 && minor < 15))); then
             echo "::error::npm $npm_version can not stage a version. It needs npm 11.15.0 or newer."
             exit 1
           fi
-      - run: npm ci
+      # This job can sign in to npm, so no dependency runs an install script here.
+      - run: npm ci --ignore-scripts
       - run: npm test
       # RELEASE.md gives the steps for each mode.
       # - NPM_TOKEN is set: the first version only. The token is stage-only. npm stages
@@ -59,6 +63,7 @@ jobs:
         run: |
           if [ -n "$NODE_AUTH_TOKEN" ]; then
             npm stage publish --provenance --access public
+            echo "::warning::The version is staged, not live. Approve it with npm stage approve."
           else
             npm publish --access public
           fi

@@ -1,6 +1,6 @@
 # Release tokenmeter
 
-The `Publish` workflow (`.github/workflows/publish.yml`) publishes to npm with provenance.
+The `Publish` workflow (`.github/workflows/publish.yml`) publishes or stages a version on npm with provenance.
 A version tag on `main` starts it.
 
 The workflow has two modes:
@@ -25,7 +25,7 @@ So the first version goes through a stage-only token.
    Give it access to the `@dean0x` scope only, with a short expiry.
 2. Add the token as the `NPM_TOKEN` secret of the `npm` environment.
 3. Publish the version (see "Publish").
-4. Approve the staged version with 2FA:
+4. Approve the staged version with 2FA immediately after the run passes:
 
    ```sh
    npm stage list @dean0x/tokenmeter
@@ -35,17 +35,21 @@ So the first version goes through a stage-only token.
 5. Delete the `NPM_TOKEN` secret. Revoke the token on npmjs.com.
 
 npm makes a public placeholder version `0.0.0-stage` when it stages a package that is not on npm yet.
+The npm docs do not say if a staged version keeps its provenance after approval.
+For the first version, check the provenance once (see "Verify"). If it is not there, record that in the release notes.
 
 ## Later versions (trusted publishing)
 
-1. Add the trusted publisher with npm 11.15.0 or newer:
+1. Merge the version change to `main` (see "Prepare the version").
+2. Sign in with `npm login`. Your npm account must have 2FA.
+   Add the trusted publisher with npm 11.15.0 or newer:
 
    ```sh
    npm trust github @dean0x/tokenmeter --repo dean0x/tokenmeter --file publish.yml --env npm --allow-publish
    ```
 
-2. Publish the next version within 2 days. A new trusted publisher expires when no publish uses it in 2 days.
-3. After that publish passes, open the package settings on npmjs.com.
+3. Push the version tag within 2 days (see "Publish"). A new trusted publisher expires when no publish uses it in 2 days.
+4. After that publish passes, open the package settings on npmjs.com.
    Under "Publishing access", select "Require two-factor authentication and disallow tokens".
 
 ## Prepare the version
