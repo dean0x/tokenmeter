@@ -40,6 +40,7 @@ import {
   SELF_CHECK_TASKS,
   checkOf,
   estimateFromSignals,
+  fitAll,
   fitLine,
   fitPlane,
   hitRateBand,
@@ -48,6 +49,7 @@ import {
   nextQueueState,
   pctOfWeek,
   projectFits,
+  projectFitsOf,
   projectOf,
   queueSum,
   rangeShifts,
@@ -2251,6 +2253,32 @@ test("TP-107: a project uses its own range only when the blend improves on share
   assert.equal(ownScope(scoped(ALPHA, history)), "alpha");
   const sameMix = [...costSeries(20, 500), ...costSeries(20, 500, "alpha")];
   assert.deepEqual(scoped(ALPHA, sameMix), scoped(ALPHA, withoutProjects(sameMix)));
+});
+
+function projectFitPass() {
+  const history = projectFixture().map((entry) => ({ ...entry, tags: { ...entry.tags, type: "work" } }));
+  return fitAll(history, "claude", 0);
+}
+
+for (const fault of ["short", "non-finite"] as const) {
+  test(`the project cannot win against a shared fit with a ${fault} error array`, () => {
+    const pass = projectFitPass();
+    const [all, type] = [at(pass.fitted, 0), at(pass.fitted, 1)];
+    const prefix = type.errors.slice(0, -1);
+    const errors = fault === "short" ? prefix : [...prefix, Number.NaN];
+    const fitted = [all, { ...type, errors }];
+    assert.equal(projectFitsOf({ ...pass, fitted: [all] }).get("alpha")?.wins, true);
+    assert.equal(projectFitsOf({ ...pass, fitted }).get("alpha")?.wins ?? false, false);
+  });
+}
+
+test("the project cannot win when the project count excludes a fit sample", () => {
+  const pass = projectFitPass();
+  const group = pass.projectGroups.fit.get("alpha");
+  assert.ok(group !== undefined);
+  const projectGroups = { ...pass.projectGroups, fit: new Map([["alpha", group.slice(1)]]) };
+  assert.equal(projectFitsOf(pass).get("alpha")?.wins, true);
+  assert.equal(projectFitsOf({ ...pass, projectGroups }).get("alpha")?.wins ?? false, false);
 });
 
 test("TP-111: a project row uses exact rank ends and clips its center to them", () => {

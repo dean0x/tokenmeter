@@ -719,7 +719,7 @@ interface FitPass {
   };
 }
 
-function fitAll(history: readonly EstimateTask[], subscription: Subscription, floor: number): FitPass {
+export function fitAll(history: readonly EstimateTask[], subscription: Subscription, floor: number): FitPass {
   const observed = observedOf(history, subscription);
   const forFit = floor === 0 ? observed : observedOf(history, subscription, floor);
   const samples = forFit.length < MIN_GROUP_TASKS ? [] : withBaseline(forFit);
@@ -757,9 +757,20 @@ function rankRange(sorted: readonly number[], omit = sorted.length): Span | null
   return low > 0 && Number.isFinite(low) && Number.isFinite(high) && low <= high ? { low, high } : null;
 }
 
+// Check the count and the samples once, before the leave-one-out pass.
+function projectGroupMatches(sorted: readonly Sample[], project: string, group: readonly Sample[]): boolean {
+  const unmatched = new Set(group);
+  if (unmatched.size !== group.length) return false;
+  for (const sample of sorted) {
+    if (sample.project === project && !unmatched.delete(sample)) return false;
+  }
+  return unmatched.size === 0;
+}
+
 function projectErrors(
   sorted: readonly Sample[], costs: readonly number[], project: string, group: readonly Sample[],
 ): ReadonlyMap<Sample, number> | null {
+  if (!projectGroupMatches(sorted, project, group)) return null;
   const errors = new Map<Sample, number>();
   for (const sample of group) {
     // Equal costs are interchangeable for the rank ends, not for the fit sample.
@@ -777,20 +788,25 @@ interface ProjectFit {
   readonly kept: readonly Candidate[];
 }
 
-function projectGate(fitted: readonly Fitted[], errors: ReadonlyMap<Sample, number>): Omit<ProjectFit, "candidate"> {
+// A malformed shared fit prevents a project win. Do not skip that competitor.
+function projectGate(fitted: readonly Fitted[], errors: ReadonlyMap<Sample, number>): Omit<ProjectFit, "candidate"> | null {
   let eligible = false;
   const kept: Candidate[] = [];
   for (const fit of fitted) {
+    if (fit.group.length !== fit.errors.length) return null;
     const group: Sample[] = [];
     const blendErrors: number[] = [];
     const sharedErrors: number[] = [];
-    fit.group.forEach((sample, i) => {
+    for (let i = 0; i < fit.group.length; i += 1) {
+      const sample = fit.group[i];
+      const sharedError = fit.errors[i];
+      if (sample === undefined || sharedError === undefined || !Number.isFinite(sharedError)) return null;
       const error = errors.get(sample);
-      if (error === undefined) return;
+      if (error === undefined) continue;
       group.push(sample);
       blendErrors.push(error);
-      sharedErrors.push(fit.errors[i] ?? Number.NaN);
-    });
+      sharedErrors.push(sharedError);
+    }
     const { candidate } = fit;
     const feature = candidate.model.kind === "single" || candidate.model.kind === "pair";
     if (group.length === 0 || (!feature && group.length < MIN_PROJECT_TASKS)) continue;
@@ -815,6 +831,7 @@ function blendFit(
   const errors = projectErrors(sorted, costs, project, group);
   if (errors === null) return null;
   const gate = projectGate(fitted, errors);
+  if (gate === null) return null;
   const score = scoreOf(group, [...errors.values()]);
   // An eligible subset can decide the gate even when the whole project has a zero baseline.
   if (score === null && !gate.wins) return null;
@@ -836,7 +853,7 @@ function blendFit(
   };
 }
 
-function projectFitsOf({ samples, fitted, projectGroups }: FitPass): ReadonlyMap<string, ProjectFit> {
+export function projectFitsOf({ samples, fitted, projectGroups }: FitPass): ReadonlyMap<string, ProjectFit> {
   const qualified = [...projectGroups.fit]
     .filter(([, group]) => group.length >= MIN_PROJECT_TASKS)
     .sort(([a, groupA], [b, groupB]) => groupB.length - groupA.length || compareText(a, b))
