@@ -1313,14 +1313,19 @@ test("a stage change with the same basis writes one new line, and a repeat in th
   assert.deepEqual(dropped.map((l) => l.stage), [null], "an item that loses its tag is a stage change to null");
 });
 
-test("TP-121: a project basis writes one new line after the same shared basis and no line on a repeat", () => {
+test("TP-121: each change between shared and project scope writes one line, but a repeat writes none", () => {
   const items = [{ ...item("A", null), tags: { project: "alpha" } }];
   const shared = logged("A", LOG_NOW);
-  const estimates = [{ ...estimateOf("A", "all"), basisProject: "alpha" }];
-  const moved = newLogLines(items, estimates, [shared], LOG_NOW + DAY_MS);
-  assert.deepEqual(moved.map((line) => [line.basis, line.basisName, line.basisProject]), [["wide", "all", "alpha"]]);
-  assert.deepEqual(newLogLines(items, estimates, [shared, ...moved], LOG_NOW + 2 * DAY_MS), []);
-  assert.deepEqual(newLogLines(items, [estimateOf("A", "all")], [shared], LOG_NOW + 3 * DAY_MS), []);
+  const estimate = estimateOf("A", "all");
+  const projectEstimate = { ...estimate, basisProject: "alpha" };
+  const moved = newLogLines(items, [projectEstimate], [shared], LOG_NOW + DAY_MS);
+  assert.deepEqual(moved, [{ ...shared, at: LOG_NOW + DAY_MS, basisProject: "alpha" }]);
+
+  const history = [shared, ...moved];
+  assert.deepEqual(newLogLines(items, [projectEstimate], history, LOG_NOW + 2 * DAY_MS), []);
+  const back = newLogLines(items, [estimate], history, LOG_NOW + 3 * DAY_MS);
+  assert.deepEqual(back, [{ ...shared, at: LOG_NOW + 3 * DAY_MS, basisProject: null }]);
+  assert.deepEqual(newLogLines(items, [estimate], [shared], LOG_NOW + 3 * DAY_MS), []);
 });
 
 test("an item with no stage tag keeps its line when the log holds a line with stage null", () => {
@@ -2507,9 +2512,11 @@ function projectTrial(random: () => number, count: number, arm: "offset" | "zero
   return { shown: measures(shown), rank: measures(rank), won: ownScope(row) === "alpha" };
 }
 
-for (const arm of ["offset", "zero"] as const) {
-  const id = arm === "offset" ? "TP-114" : "TP-147";
-  test(`${id}: the project gate gives the expected coverage and win rate for ${arm}`, (t) => {
+for (const [arm, title] of [
+  ["offset", "TP-114: the seed-101 offset fixture meets the aggregate and per-count coverage thresholds"],
+  ["zero", "TP-147: the seed-101 zero-offset fixture has an aggregate project win fraction of at most 0.2"],
+] as const) {
+  test(title, (t) => {
     const random = projectRandom(101);
     const counts = Array.from({ length: 8 }, (_, i) => i + 9);
     const stats = counts.map((count) => {
@@ -2527,11 +2534,11 @@ for (const arm of ["offset", "zero"] as const) {
     });
     if (arm === "offset") {
       const meanCoverage = stats.reduce((sum, { coverage }) => sum + coverage, 0) / stats.length;
-      assert.ok(meanCoverage >= 0.8, `mean coverage: ${meanCoverage}`);
-      for (const { count, coverage } of stats) assert.ok(coverage >= 0.75, `n_fit=${count}: ${coverage}`);
+      assert.ok(meanCoverage >= 0.8, `seed-101 offset fixture aggregate coverage: ${meanCoverage}`);
+      for (const { count, coverage } of stats) assert.ok(coverage >= 0.75, `seed-101 offset fixture coverage at n_fit=${count}: ${coverage}`);
     } else {
       const meanWins = stats.reduce((sum, { wins }) => sum + wins, 0) / stats.length;
-      assert.ok(meanWins <= 0.2, `mean wins: ${meanWins}`);
+      assert.ok(meanWins <= 0.2, `seed-101 zero-offset fixture aggregate project win fraction: ${meanWins}`);
     }
   });
 }

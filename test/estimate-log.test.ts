@@ -196,6 +196,15 @@ test("TP-119: the log keeps a change from shared to project scope but not a repe
   assert.deepEqual(readEstimateLog(dir, NOW, DEPS).lines, [shared, scoped]);
 });
 
+test("TP-119: the log keeps a change from project to shared scope but not a repeat", (t) => {
+  const { dir } = folder(t);
+  const scoped = logged("A", NOW - 2, { stage: "plan", basisProject: "alpha" });
+  const shared = { ...scoped, at: NOW - 1, basisProject: null };
+  const repeat = { ...shared, at: NOW };
+  put(dir, fileOf(NOW), linesText(scoped, shared, repeat));
+  assert.deepEqual(readEstimateLog(dir, NOW, DEPS).lines, [scoped, shared]);
+});
+
 test("TP-120: invalid project scopes and project scopes with no basis make a line invalid", () => {
   const ranged = JSON.parse(logLineText(logged("A", NOW))) as Record<string, unknown>;
   for (const scope of ["", "has space", "a".repeat(65), 7, true, {}, []]) {
