@@ -665,6 +665,22 @@ test("the Claude forecast is worked out again from the latest reading, with no n
   assert.equal(forecast.runs_out_at, NOW + 64 * HOUR_MS);
 });
 
+test("status reports a Claude week drop and updates the forecast without a new collect", async (t) => {
+  const w = makeWorld(t);
+  const quota = (pct: number): StatuslineQuota => ({ five_hour: { reason: "absent" }, week: point(pct, WEEK_RESET) });
+  for (const [minutesAgo, pct] of [[180, 98], [120, 99], [20, 100]] as const) {
+    recordQuota(w, quota(pct), NOW - minutesAgo * MINUTE_MS);
+  }
+  await collectOk(w);
+  recordQuota(w, quota(36));
+
+  const claude = (await dataOf(w, "status")).subscriptions[0];
+  assert.deepEqual(claude.quota.seven_day, { pct: 36, resets_at: WEEK_RESET, at: NOW });
+  assert.equal(claude.forecast.at, NOW);
+  assert.equal(claude.forecast.at_reset_pct, 63);
+  assert.equal(claude.forecast.runs_out_at, null);
+});
+
 test("the forecast of each subscription says the time of the reading that it used", async (t) => {
   const w = makeWorld(t);
   seedFixtures(w);

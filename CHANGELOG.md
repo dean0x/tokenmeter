@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- The Claude week and 5 h percentages can now drop within one reset period after about 10 minutes without confirmation of the higher value.
+
 ## 0.2.0
 
 - Estimate task costs by project when the project range beats the shared candidates. Shared feature fits can still apply.
