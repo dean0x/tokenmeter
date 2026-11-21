@@ -562,18 +562,50 @@ test("writer: a lower percent with the same reset time keeps the stored value an
   assert.equal(linesOf(month).filter((line) => line.includes('"five_hour"')).length, 1);
 });
 
-test("writer: a lower percent at 60 s age refreshes the time but keeps the higher percent", (t) => {
+test("writer: a lower week percent just before 10 minutes leaves the latest file and samples alone", (t) => {
   const w = makeWorld(t);
-  must(recordStatuslineQuota(w.dir, quotaOf(rawPoint(6, FIVE_RESET_MS), null), NOW, BASE_DEPS));
-  const later = NOW + QUOTA_LATEST_REFRESH_MS;
-  const report = must(recordStatuslineQuota(w.dir, quotaOf(rawPoint(4, FIVE_RESET_MS), null), later, BASE_DEPS));
-  assert.deepEqual(report, { appended: 0, skipped: 0, full: 0, latestWritten: true });
-  assert.deepEqual(readLatestQuota(w.dir, later, BASE_DEPS).five_hour, {
-    known: true,
-    usedPercent: 6,
-    resetsAt: FIVE_RESET_MS,
-    at: later,
+  const later = NOW + 10 * MINUTE_MS - 1;
+  must(recordStatuslineQuota(w.dir, quotaOf(null, rawPoint(100, WEEK_RESET_MS)), NOW, BASE_DEPS));
+
+  const report = must(recordStatuslineQuota(w.dir, quotaOf(null, rawPoint(36, WEEK_RESET_MS)), later, BASE_DEPS));
+
+  assert.deepEqual(report, { appended: 0, skipped: 0, full: 0, latestWritten: false });
+  assert.deepEqual(readLatestQuota(w.dir, later, BASE_DEPS).week, {
+    known: true, usedPercent: 100, resetsAt: WEEK_RESET_MS, at: NOW,
   });
+  assert.equal(linesOf(join(w.dir, "quota-2026-11.jsonl")).length, 1);
+});
+
+test("writer: a change in the 5 hour window does not confirm a held week percent", (t) => {
+  const w = makeWorld(t);
+  const later = NOW + 5 * MINUTE_MS;
+  must(recordStatuslineQuota(w.dir, quotaOf(rawPoint(10, FIVE_RESET_MS), rawPoint(100, WEEK_RESET_MS)), NOW, BASE_DEPS));
+
+  const report = must(recordStatuslineQuota(w.dir, quotaOf(rawPoint(11, FIVE_RESET_MS), rawPoint(36, WEEK_RESET_MS)), later, BASE_DEPS));
+
+  assert.deepEqual(report, { appended: 1, skipped: 0, full: 0, latestWritten: true });
+  assert.deepEqual(readLatestQuota(w.dir, later, BASE_DEPS).week, {
+    known: true, usedPercent: 100, resetsAt: WEEK_RESET_MS, at: NOW,
+  });
+});
+
+test("writer: a lower week percent at 10 minutes replaces the stored point and adds a sample", (t) => {
+  const w = makeWorld(t);
+  const lower = quotaOf(null, rawPoint(36, WEEK_RESET_MS));
+  const later = NOW + 10 * MINUTE_MS;
+  must(recordStatuslineQuota(w.dir, quotaOf(null, rawPoint(100, WEEK_RESET_MS)), NOW, BASE_DEPS));
+  must(recordStatuslineQuota(w.dir, lower, later - 1, BASE_DEPS));
+
+  const report = must(recordStatuslineQuota(w.dir, lower, later, BASE_DEPS));
+
+  assert.deepEqual(report, { appended: 1, skipped: 0, full: 0, latestWritten: true });
+  assert.deepEqual(readLatestQuota(w.dir, later, BASE_DEPS).week, {
+    known: true, usedPercent: 36, resetsAt: WEEK_RESET_MS, at: later,
+  });
+  assert.deepEqual(linesOf(join(w.dir, "quota-2026-11.jsonl")).map((line) => JSON.parse(line) as unknown), [
+    { p: "claude", w: "week", at: NOW, pct: 100, reset: WEEK_RESET_MS },
+    { p: "claude", w: "week", at: later, pct: 36, reset: WEEK_RESET_MS },
+  ]);
 });
 
 test("writer: a higher percent with the same reset time replaces the stored value", (t) => {
@@ -599,14 +631,17 @@ test("writer: a new reset time replaces the stored value, also at a lower percen
   });
 });
 
-test("writer: the sequence 6, 6, 4, 6 from two sessions ends at 6 with one sample", (t) => {
+test("writer: regular confirmations hold the week percent against lower inputs from an idle session", (t) => {
   const w = makeWorld(t);
-  for (const [index, pct] of [6, 6, 4, 6].entries()) {
-    must(recordStatuslineQuota(w.dir, quotaOf(rawPoint(pct, FIVE_RESET_MS), null), NOW + index * 2000, BASE_DEPS));
+  for (const [index, pct] of [100, 36, 100, 36, 100, 36].entries()) {
+    const at = NOW + index * 3 * MINUTE_MS;
+    must(recordStatuslineQuota(w.dir, quotaOf(null, rawPoint(pct, WEEK_RESET_MS)), at, BASE_DEPS));
   }
-  assert.equal(linesOf(join(w.dir, "quota-2026-11.jsonl")).filter((line) => line.includes('"five_hour"')).length, 1);
-  const view = readLatestQuota(w.dir, NOW + 8000, BASE_DEPS).five_hour;
-  assert.ok(view.known && view.usedPercent === 6);
+
+  assert.equal(linesOf(join(w.dir, "quota-2026-11.jsonl")).length, 1);
+  assert.deepEqual(readLatestQuota(w.dir, NOW + 15 * MINUTE_MS, BASE_DEPS).week, {
+    known: true, usedPercent: 100, resetsAt: WEEK_RESET_MS, at: NOW + 12 * MINUTE_MS,
+  });
 });
 
 test("writer: a stored value that is out of range does not hold back the new one", (t) => {
@@ -783,14 +818,29 @@ test("reader: a file over 4 KiB, a loose mode, a link or a foreign owner reads a
 });
 
 // ---------------------------------------------------------------------------
-// Latest sample for the reader (Codex restamp)
+// Latest sample for the reader
 // ---------------------------------------------------------------------------
 
 function mk(provider: "claude" | "codex", window: "five_hour" | "week", at: number, pct: number, reset: number): QuotaSample {
   return { provider, window, at, usedPercent: pct, resetsAt: reset };
 }
 
-test("latest sample: the highest percent of the current reset period wins, not the latest time", () => {
+test("latest sample: Claude takes the later lower percent of the newest reset period", () => {
+  const reset = NOW + 4 * DAY_MS;
+  const lower = mk("claude", "week", NOW - HOUR_MS, 36, reset);
+  const samples = [
+    mk("claude", "week", NOW - 17 * HOUR_MS, 99, reset),
+    mk("claude", "week", NOW - 2 * HOUR_MS, 100, reset),
+    lower,
+    mk("claude", "week", NOW - HOUR_MS, 35, reset),
+    mk("claude", "week", NOW, 100, reset - HOUR_MS),
+  ];
+
+  assert.deepEqual(pickLatestSample(samples, "claude", "week", NOW), lower);
+  assert.deepEqual(pickLatestSample([...samples].reverse(), "claude", "week", NOW), lower);
+});
+
+test("latest sample: Codex takes the highest percent of the current reset period", () => {
   const reset = NOW + 2 * DAY_MS;
   const samples = [
     mk("codex", "week", NOW - 3 * HOUR_MS, 35, reset),

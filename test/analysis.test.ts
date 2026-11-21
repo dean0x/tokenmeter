@@ -459,14 +459,30 @@ test("the forecast says not before reset when the burn stays under the limit", (
   assert.equal(forecast.runsOutAt, null);
 });
 
-test("the forecast uses the latest sample of the open week and ignores a restamped older percent", () => {
+test("the Claude forecast uses the later lower sample of the open week", () => {
+  const lower = sample("claude", START + 84 * HOUR_MS, 36, RESET - 1000);
   const samples = [
     sample("claude", START - HOUR_MS, 90, START),
-    sample("claude", START + 24 * HOUR_MS, 10),
-    sample("claude", START + 48 * HOUR_MS, 30),
-    sample("claude", START + 60 * HOUR_MS, 20),
+    sample("claude", START + 72 * HOUR_MS, 98),
+    sample("claude", START + 76 * HOUR_MS, 99),
+    sample("claude", START + 80 * HOUR_MS, 100),
+    lower,
   ];
   const forecast = sub(run({ samples }), "claude").forecast;
+  assert.ok(forecast !== null);
+  assert.equal(forecast.at, lower.at);
+  near(forecast.burnPctPerHour, 36 / (84 + 1000 / HOUR_MS));
+  assert.equal(forecast.runsOutAt, null);
+});
+
+test("the Codex forecast ignores a restamped older percent", () => {
+  const samples = [
+    sample("codex", START - HOUR_MS, 90, START),
+    sample("codex", START + 24 * HOUR_MS, 10),
+    sample("codex", START + 48 * HOUR_MS, 30),
+    sample("codex", START + 60 * HOUR_MS, 20),
+  ];
+  const forecast = sub(run({ samples }), "codex").forecast;
   assert.ok(forecast !== null);
   near(forecast.burnPctPerHour, 0.625);
 });
@@ -608,16 +624,36 @@ test("an interval needs 1 hour and 5 points, so one interval alone falls back to
   assert.equal(smallCalibration.intervals, 1);
 });
 
-test("intervals ignore a restamped older percent and repeats of a percent", () => {
-  const base = chain("claude", START + 6 * HOUR_MS, 5, [[10, 10], [15, 10]]);
+test("Codex intervals ignore a restamped older percent and repeats of a percent", () => {
+  const base = chain("codex", START + 6 * HOUR_MS, 5, [[10, 10], [15, 10]]);
   const noise = [
-    sample("claude", START + 50 * HOUR_MS, 5),
-    sample("claude", START + 60 * HOUR_MS, 15),
-    sample("claude", START + 70 * HOUR_MS, 25),
+    sample("codex", START + 50 * HOUR_MS, 5),
+    sample("codex", START + 60 * HOUR_MS, 15),
+    sample("codex", START + 70 * HOUR_MS, 25),
   ];
-  const calibration = readyOf(claudeCalibration({ samples: [...base, ...noise] }));
+  const analysis = run({ rows: STEADY("codex"), samples: [...base, ...noise] });
+  const calibration = readyOf(sub(analysis, "codex").calibration);
   near(calibration.perPctWeighted, 5000);
   assert.equal(calibration.intervals, 2);
+});
+
+test("Claude calibration counts rises on both sides of a drop but not across it", () => {
+  const samples = chain("claude", START + 72 * HOUR_MS, 90, [[2, 10], [1, -64], [1, 5]]);
+  const tieAt = START + 73 * HOUR_MS;
+  const ties = [sample("claude", tieAt, 89), sample("claude", tieAt, 91)];
+  const calibration = readyOf(claudeCalibration({ samples: [...ties, ...samples.reverse()] }));
+  near(calibration.perPctWeighted, 800);
+  assert.equal(calibration.intervals, 2);
+  assert.equal(calibration.confidence, "low");
+});
+
+test("Claude calibration does not divide the tokens of the whole week by the percent after a drop", () => {
+  const samples = chain("claude", START + 72 * HOUR_MS, 98, [[4, 1], [4, 1], [4, -64]]);
+  const claude = sub(run({ rows: STEADY(), samples }), "claude");
+
+  assert.equal(claude.calibration.ready, false);
+  assert.equal(claude.latest.week?.usedPercent, 36);
+  assert.equal(claude.week.end, RESET);
 });
 
 test("a reset time that moves by a second stays in the same reset period", () => {

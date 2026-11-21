@@ -297,17 +297,18 @@ function lastSeenOrNull(sample: QuotaSample | null, observations: readonly Quota
   return sample === null ? null : lastSeen(sample, observations);
 }
 
-// A percent only grows inside one reset period, so the latest sample is the
-// highest percent, and of those the later one. A restamped copy with an older
-// percent does not win.
-function latestOf(samples: readonly QuotaSample[]): QuotaSample | null {
+// These samples already belong to one period, including reset times within
+// the tolerance. Claude takes the latest; Codex takes the highest percent.
+function latestOf(samples: readonly QuotaSample[], provider: Provider): QuotaSample | null {
   let best: QuotaSample | null = null;
   for (const sample of samples) {
-    const wins =
-      best === null ||
-      sample.usedPercent > best.usedPercent ||
-      (sample.usedPercent === best.usedPercent && sample.at > best.at);
-    if (wins) best = sample;
+    if (best === null) {
+      best = sample;
+      continue;
+    }
+    const time = sample.at - best.at;
+    const percent = sample.usedPercent - best.usedPercent;
+    if ((provider === "claude" ? time || percent : percent || time) > 0) best = sample;
   }
   return best;
 }
@@ -346,10 +347,8 @@ interface Level {
   readonly at: number;
 }
 
-// Each percent level with the time of its first sample. The record pass writes
-// a sample when the percent changes, so the first sample of a level is the
-// change. A later copy of a sample, restamped, does not move the level.
-function levelsOf(samples: readonly QuotaSample[]): Level[] {
+// Codex uses the first sample of each percent. A restamped copy does not move it.
+function codexLevels(samples: readonly QuotaSample[]): Level[] {
   const firstAt = new Map<number, number>();
   for (const sample of samples) {
     const seen = firstAt.get(sample.usedPercent);
@@ -358,16 +357,30 @@ function levelsOf(samples: readonly QuotaSample[]): Level[] {
   return [...firstAt].map(([percent, at]) => ({ percent, at })).sort((a, b) => a.percent - b.percent);
 }
 
-// Weighted tokens for 1 percent, one value for each interval. An interval goes
-// from one level to the first later level that is at least 1 hour later and
-// 5 points higher. The next interval starts there, so intervals do not overlap.
-// An interval with no tokens gives no value.
-function intervalValues(samples: readonly QuotaSample[], sums: SlotSums): number[] {
+// Claude uses time order and keeps the higher percent when two times match.
+function claudeLevels(samples: readonly QuotaSample[]): Level[] {
+  return samples.map(({ usedPercent, at }) => ({ percent: usedPercent, at }))
+    .sort((a, b) => a.at - b.at || b.percent - a.percent)
+    .filter((level, index, levels) => level.at !== levels[index - 1]?.at);
+}
+
+// Weighted tokens for 1 percent, one value for each interval. An interval needs
+// at least 1 hour and a rise of 5 points. Drops start new intervals for Claude.
+// Intervals do not overlap. An interval with no tokens gives no value.
+function intervalValues(
+  samples: readonly QuotaSample[], sums: SlotSums, provider: Provider,
+): { readonly values: number[]; readonly hadDrop: boolean } {
   const values: number[] = [];
+  const levels = provider === "claude" ? claudeLevels(samples) : codexLevels(samples);
   let anchor: Level | null = null;
-  for (const level of levelsOf(samples)) {
-    if (anchor === null) {
+  let previous: Level | null = null;
+  let hadDrop = false;
+  for (const level of levels) {
+    const drop = provider === "claude" && previous !== null && level.percent < previous.percent;
+    previous = level;
+    if (anchor === null || drop) {
       anchor = level;
+      if (drop) hadDrop = true;
       continue;
     }
     const elapsedMs = level.at - anchor.at;
@@ -377,7 +390,7 @@ function intervalValues(samples: readonly QuotaSample[], sums: SlotSums): number
     if (tokens > 0) values.push(tokens / points);
     anchor = level;
   }
-  return values;
+  return { values, hadDrop };
 }
 
 function confidenceOf(count: number, spread: number): Confidence {
@@ -393,6 +406,7 @@ function ready(perPctWeighted: number, confidence: Confidence, intervals: number
 }
 
 interface CalibrationInput {
+  readonly provider: Provider;
   readonly week: WeekPeriod;
   readonly inPeriod: readonly QuotaSample[];
   readonly latest: QuotaSample | null;
@@ -403,9 +417,9 @@ interface CalibrationInput {
 // The interval method from two intervals on: the median, with a confidence from
 // the count and the spread. Else the day-one rough value: the weighted tokens
 // from the week start to the latest sample, divided by its percent. It needs
-// 5 percent and a finished scan (no backlog).
+// 5 percent, a finished scan (no backlog), and no drop within the week.
 function calibrate(input: CalibrationInput): Calibration {
-  const values = intervalValues(input.inPeriod, input.sums);
+  const { values, hadDrop } = intervalValues(input.inPeriod, input.sums, input.provider);
   if (values.length >= MIN_INTERVALS) {
     const sorted = [...values].sort((a, b) => a - b);
     const median = percentile(sorted, MEDIAN);
@@ -413,7 +427,7 @@ function calibrate(input: CalibrationInput): Calibration {
     return ready(median, confidenceOf(sorted.length, spread), sorted.length);
   }
   const { latest, week, sums, collectState } = input;
-  if (latest === null || collectState !== "ok" || latest.usedPercent < MIN_ROUGH_PERCENT) return NOT_READY;
+  if (hadDrop || latest === null || collectState !== "ok" || latest.usedPercent < MIN_ROUGH_PERCENT) return NOT_READY;
   const tokens = weightedBetween(sums, slotOf(week.start), slotOf(latest.at));
   return tokens > 0 ? ready(tokens / latest.usedPercent, "rough", values.length) : NOT_READY;
 }
@@ -455,11 +469,11 @@ export function analyze(input: AnalysisInput): Analysis {
   const subscriptions = PROVIDERS.map((provider): SubscriptionUsage => {
     const week = weeks[provider];
     const inPeriod = samplesOfPeriod(samples, provider, week);
-    const latest = latestOf(inPeriod);
+    const latest = latestOf(inPeriod, provider);
     const calibration =
       inPeriod.length === 0
         ? NOT_READY
-        : calibrate({ week, inPeriod, latest, sums: slotSums(rows, provider, week), collectState });
+        : calibrate({ provider, week, inPeriod, latest, sums: slotSums(rows, provider, week), collectState });
     return {
       provider,
       week,

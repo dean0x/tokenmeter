@@ -7,29 +7,27 @@
 // used percent and reset time, the times in epoch milliseconds. Nothing else
 // from the statusline JSON or from a rollout is stored: only these numbers.
 //
-// The Claude writer (record) appends a line only when the percent or the reset
-// time changed, and rewrites the latest file on a change or when its time is 60 s
-// old. Both Codex sources use the same append path and skip a sample whose
-// percent and reset time are already in the file, whatever its sample time.
+// The Claude writer (record) appends a line on each accepted change. It rewrites
+// the latest file on a change or when a repeat is at least 60 s newer. Both Codex
+// sources skip a sample whose percent and reset time are already in the file.
 // A month file stops growing at 1 MiB.
 //
-// The latest file holds the time each window was last seen. Codex windows also
-// hold their source and reached flag. A repeat adds no line to the month file.
-// Each writer keeps the other provider's section. The forecast uses the time
-// of the last repeat (see readObservations).
+// The latest file holds the time each window was last confirmed. Codex windows
+// also hold their source and reached flag. A repeat adds no line to the month file.
+// Each writer keeps the other provider's section. The forecast uses the last
+// confirmed time (see readObservations).
 //
-// A window that the statusline did not carry, or carried with a bad percent or a
-// bad reset time, is stored as a reason code: absent, bad_percent or bad_reset.
-// A stored value whose period is still open is kept instead. A percent only
-// grows inside one reset period: a lower percent with the same reset time (a
-// second session that is a step behind) does not replace the stored one.
+// The Claude writer accepts a drop with the same reset time after 10 minutes
+// without confirmation of the stored percent. This holds off stale readings
+// from idle sessions. A held drop does not confirm the stored percent.
+// A missing or invalid window keeps its stored value while its period is open.
+// Otherwise it gets a reason code: absent, bad_percent or bad_reset.
 //
 // The readers check owner, mode, a byte cap and the ranges. Anything else reads
 // as unknown, with a reason code; the display shows "?".
 //
-// Latest sample of a Codex or Claude window: a restamped copy in a Codex child
-// rollout can give a later sample with an older percent. So the readers do not
-// take the sample with the latest time. See pickLatestSample.
+// Within the newest reset period, Claude takes the latest sample. Codex takes
+// the highest percent to ignore restamped copies. See pickLatestSample.
 
 import { join } from "node:path";
 import {
@@ -67,6 +65,7 @@ const KIB = 1024;
 export const QUOTA_LATEST_FILE = "quota-latest.json";
 const QUOTA_LATEST_LOCK = "quota-latest.lock";
 export const QUOTA_LATEST_REFRESH_MS = 60_000;
+const QUOTA_LOWER_HOLD_MS = 10 * 60_000;
 export const QUOTA_LATEST_CAP_BYTES = 4 * KIB;
 export const QUOTA_MONTH_CAP_BYTES = KIB * KIB;
 // The writers check the size before they append, with no lock, so appenders that run at
@@ -381,10 +380,9 @@ function beats(a: StoredPoint, b: StoredPoint): boolean {
 // `nowMs` of pickLatestSample to take the samples of ended periods too.
 export const ANY_RESET = 0;
 
-// The latest sample of a window whose period is still open (reset after `nowMs`).
-// A percent only grows inside one reset period. A restamped copy in a Codex child
-// rollout has a later time but an older percent. So: the newest reset period
-// wins, then the highest percent in it, then the later time.
+// The newest open reset period wins. Within it, Claude takes the later time,
+// then the higher percent. Codex takes the higher percent, then the later time,
+// so a restamped child rollout does not replace a higher reading.
 export function pickLatestSample(
   samples: readonly QuotaSample[],
   provider: QuotaProvider,
@@ -394,7 +392,11 @@ export function pickLatestSample(
   let best: QuotaSample | null = null;
   for (const sample of samples) {
     if (sample.provider !== provider || sample.window !== window || sample.resetsAt <= nowMs) continue;
-    if (best === null || beats(sample, best)) best = sample;
+    if (best !== null && provider === "claude" && sample.resetsAt === best.resetsAt && sample.at !== best.at) {
+      if (sample.at > best.at) best = sample;
+    } else if (best === null || beats(sample, best)) {
+      best = sample;
+    }
   }
   return best;
 }
@@ -494,13 +496,14 @@ function planWindow(input: StatuslineWindow, old: StoredValue | null, nowMs: num
     return { next: { reason: input.reason, at: nowMs }, sample: null, write: !same };
   }
 
-  const keepOld = oldPoint !== null && oldSane && oldPoint.resetsAt === input.resetsAt && oldPoint.usedPercent > input.usedPercent;
-  const point: QuotaPoint = keepOld
-    ? { usedPercent: oldPoint.usedPercent, resetsAt: oldPoint.resetsAt }
-    : { usedPercent: input.usedPercent, resetsAt: input.resetsAt };
-  const changed = oldPoint === null || oldPoint.usedPercent !== point.usedPercent || oldPoint.resetsAt !== point.resetsAt;
-  // A stored time in the future (a clock that moved back) is refreshed too.
   const age = oldPoint === null ? 0 : nowMs - oldPoint.at;
+  if (oldPoint !== null && oldSane && oldPoint.resetsAt === input.resetsAt &&
+      oldPoint.usedPercent > input.usedPercent && age < QUOTA_LOWER_HOLD_MS) {
+    return { next: oldPoint, sample: null, write: false };
+  }
+  const point: QuotaPoint = { usedPercent: input.usedPercent, resetsAt: input.resetsAt };
+  const changed = oldPoint === null || oldPoint.usedPercent !== point.usedPercent || oldPoint.resetsAt !== point.resetsAt;
+  // A confirmation also refreshes a stored time in the future.
   return {
     next: { ...point, at: nowMs },
     sample: changed ? point : null,
