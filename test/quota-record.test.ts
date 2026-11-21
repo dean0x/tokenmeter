@@ -608,6 +608,17 @@ test("writer: a lower week percent at 10 minutes replaces the stored point and a
   ]);
 });
 
+test("writer: a lower week percent replaces a point from before a clock rollback", (t) => {
+  const w = makeWorld(t);
+  must(recordStatuslineQuota(w.dir, quotaOf(null, rawPoint(100, WEEK_RESET_MS)), NOW + HOUR_MS, BASE_DEPS));
+
+  must(recordStatuslineQuota(w.dir, quotaOf(null, rawPoint(36, WEEK_RESET_MS)), NOW, BASE_DEPS));
+
+  const point = { usedPercent: 36, resetsAt: WEEK_RESET_MS, at: NOW };
+  assert.deepEqual(JSON.parse(readText(join(w.dir, QUOTA_LATEST_FILE))).claude.week, point);
+  assert.deepEqual(readLatestQuota(w.dir, NOW, BASE_DEPS).week, { known: true, ...point });
+});
+
 test("writer: a higher percent with the same reset time replaces the stored value", (t) => {
   const w = makeWorld(t);
   must(recordStatuslineQuota(w.dir, quotaOf(rawPoint(4, FIVE_RESET_MS), null), NOW, BASE_DEPS));

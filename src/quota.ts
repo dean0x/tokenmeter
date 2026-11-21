@@ -17,7 +17,7 @@
 // Each writer keeps the other provider's section. The forecast uses the last
 // confirmed time (see readObservations).
 //
-// The Claude writer accepts a drop with the same reset time after 10 minutes
+// The Claude writer accepts a drop with the same reset time after about 10 minutes
 // without confirmation of the stored percent. This holds off stale readings
 // from idle sessions. A held drop does not confirm the stored percent.
 // A missing or invalid window keeps its stored value while its period is open.
@@ -392,6 +392,7 @@ export function pickLatestSample(
   let best: QuotaSample | null = null;
   for (const sample of samples) {
     if (sample.provider !== provider || sample.window !== window || sample.resetsAt <= nowMs) continue;
+    // Claude resets fall on whole hours, so exact matches keep the order transitive.
     if (best !== null && provider === "claude" && sample.resetsAt === best.resetsAt && sample.at !== best.at) {
       if (sample.at > best.at) best = sample;
     } else if (best === null || beats(sample, best)) {
@@ -497,8 +498,8 @@ function planWindow(input: StatuslineWindow, old: StoredValue | null, nowMs: num
   }
 
   const age = oldPoint === null ? 0 : nowMs - oldPoint.at;
-  if (oldPoint !== null && oldSane && oldPoint.resetsAt === input.resetsAt &&
-      oldPoint.usedPercent > input.usedPercent && age < QUOTA_LOWER_HOLD_MS) {
+  if (oldPoint !== null && oldSane && oldPoint.at <= nowMs + FUTURE_SLACK_MS &&
+      oldPoint.resetsAt === input.resetsAt && oldPoint.usedPercent > input.usedPercent && age < QUOTA_LOWER_HOLD_MS) {
     return { next: oldPoint, sample: null, write: false };
   }
   const point: QuotaPoint = { usedPercent: input.usedPercent, resetsAt: input.resetsAt };

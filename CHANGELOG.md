@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-- The Claude week and 5 h percentages can now drop within one reset period after 10 minutes without confirmation of the higher value.
+- The Claude week and 5 h percentages can now drop within one reset period after about 10 minutes without confirmation of the higher value.
 
 ## 0.2.0
 
