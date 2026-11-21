@@ -357,30 +357,27 @@ function codexLevels(samples: readonly QuotaSample[]): Level[] {
   return [...firstAt].map(([percent, at]) => ({ percent, at })).sort((a, b) => a.percent - b.percent);
 }
 
-// Claude uses time order and keeps the higher percent when two times match.
+// Claude keeps only new highs in time order. The higher percent wins a time tie.
 function claudeLevels(samples: readonly QuotaSample[]): Level[] {
+  let high = -Infinity;
   return samples.map(({ usedPercent, at }) => ({ percent: usedPercent, at }))
     .sort((a, b) => a.at - b.at || b.percent - a.percent)
-    .filter((level, index, levels) => level.at !== levels[index - 1]?.at);
+    .filter(({ percent }) => {
+      if (percent <= high) return false;
+      high = percent;
+      return true;
+    });
 }
 
 // Weighted tokens for 1 percent, one value for each interval. An interval needs
-// at least 1 hour and a rise of 5 points. Drops start new intervals for Claude.
+// at least 1 hour and a rise of 5 points.
 // Intervals do not overlap. An interval with no tokens gives no value.
-function intervalValues(
-  samples: readonly QuotaSample[], sums: SlotSums, provider: Provider,
-): { readonly values: number[]; readonly hadDrop: boolean } {
+function intervalValues(levels: readonly Level[], sums: SlotSums): number[] {
   const values: number[] = [];
-  const levels = provider === "claude" ? claudeLevels(samples) : codexLevels(samples);
   let anchor: Level | null = null;
-  let previous: Level | null = null;
-  let hadDrop = false;
   for (const level of levels) {
-    const drop = provider === "claude" && previous !== null && level.percent < previous.percent;
-    previous = level;
-    if (anchor === null || drop) {
+    if (anchor === null) {
       anchor = level;
-      if (drop) hadDrop = true;
       continue;
     }
     const elapsedMs = level.at - anchor.at;
@@ -390,7 +387,7 @@ function intervalValues(
     if (tokens > 0) values.push(tokens / points);
     anchor = level;
   }
-  return { values, hadDrop };
+  return values;
 }
 
 function confidenceOf(count: number, spread: number): Confidence {
@@ -417,9 +414,10 @@ interface CalibrationInput {
 // The interval method from two intervals on: the median, with a confidence from
 // the count and the spread. Else the day-one rough value: the weighted tokens
 // from the week start to the latest sample, divided by its percent. It needs
-// 5 percent, a finished scan (no backlog), and no drop within the week.
+// 5 percent, a finished scan (no backlog), and a latest percent at the week high.
 function calibrate(input: CalibrationInput): Calibration {
-  const { values, hadDrop } = intervalValues(input.inPeriod, input.sums, input.provider);
+  const levels = input.provider === "claude" ? claudeLevels(input.inPeriod) : codexLevels(input.inPeriod);
+  const values = intervalValues(levels, input.sums);
   if (values.length >= MIN_INTERVALS) {
     const sorted = [...values].sort((a, b) => a - b);
     const median = percentile(sorted, MEDIAN);
@@ -427,7 +425,9 @@ function calibrate(input: CalibrationInput): Calibration {
     return ready(median, confidenceOf(sorted.length, spread), sorted.length);
   }
   const { latest, week, sums, collectState } = input;
-  if (hadDrop || latest === null || collectState !== "ok" || latest.usedPercent < MIN_ROUGH_PERCENT) return NOT_READY;
+  if (latest === null || collectState !== "ok" || latest.usedPercent < MIN_ROUGH_PERCENT) return NOT_READY;
+  const high = levels.at(-1);
+  if (high !== undefined && latest.usedPercent < high.percent) return NOT_READY;
   const tokens = weightedBetween(sums, slotOf(week.start), slotOf(latest.at));
   return tokens > 0 ? ready(tokens / latest.usedPercent, "rough", values.length) : NOT_READY;
 }

@@ -637,23 +637,46 @@ test("Codex intervals ignore a restamped older percent and repeats of a percent"
   assert.equal(calibration.intervals, 2);
 });
 
-test("Claude calibration counts rises on both sides of a drop but not across it", () => {
-  const samples = chain("claude", START + 72 * HOUR_MS, 90, [[2, 10], [1, -64], [1, 5]]);
-  const tieAt = START + 73 * HOUR_MS;
-  const ties = [sample("claude", tieAt, 89), sample("claude", tieAt, 91)];
-  const calibration = readyOf(claudeCalibration({ samples: [...ties, ...samples.reverse()] }));
-  near(calibration.perPctWeighted, 800);
-  assert.equal(calibration.intervals, 2);
-  assert.equal(calibration.confidence, "low");
+test("Claude calibration gives the same intervals with or without a stale drop and its recovery", () => {
+  const clean = chain("claude", START + 60 * HOUR_MS, 50, [[4, 10], [4, 10]]);
+  const stale = sample("claude", START + 64.5 * HOUR_MS, 20);
+  const recovery = sample("claude", START + 64.8 * HOUR_MS, 60);
+  const expected = claudeCalibration({ samples: clean });
+
+  assert.equal(readyOf(expected).perPctWeighted, 1600);
+  assert.deepEqual(claudeCalibration({ samples: [stale, recovery, ...clean] }), expected);
 });
 
-test("Claude calibration does not divide the tokens of the whole week by the percent after a drop", () => {
-  const samples = chain("claude", START + 72 * HOUR_MS, 98, [[4, 1], [4, 1], [4, -64]]);
+test("Claude calibration ignores rises below a high that did not end an interval", () => {
+  const samples = chain("claude", START + 60 * HOUR_MS, 50, [[0.5, 15], [3.5, -5], [2, 10], [4, 10]]);
+  const calibration = readyOf(claudeCalibration({ samples }));
+
+  assert.equal(calibration.perPctWeighted, 1400);
+  assert.equal(calibration.intervals, 2);
+});
+
+test("Claude calibration counts no intervals from rises that stay below the high after a drop", () => {
+  const samples = chain("claude", START + 72 * HOUR_MS, 100, [[4, -64], [4, 4], [4, 5], [4, 5]]);
+
+  assert.equal(claudeCalibration({ samples }).ready, false);
+});
+
+test("Claude calibration does not use the rough value while the latest percent is below the high", () => {
+  const samples = chain("claude", START + 72 * HOUR_MS, 100, [[4, -64], [4, 4]]);
   const claude = sub(run({ rows: STEADY(), samples }), "claude");
 
   assert.equal(claude.calibration.ready, false);
-  assert.equal(claude.latest.week?.usedPercent, 36);
+  assert.equal(claude.latest.week?.usedPercent, 40);
   assert.equal(claude.week.end, RESET);
+});
+
+test("Claude calibration can use the rough value after a drop recovers to the high", () => {
+  const samples = chain("claude", START + 60 * HOUR_MS, 50, [[4, 10], [0.5, -40], [3.5, 40]]);
+  const calibration = readyOf(claudeCalibration({ samples }));
+
+  near(calibration.perPctWeighted, 68 * 4000 / 60);
+  assert.equal(calibration.confidence, "rough");
+  assert.equal(calibration.intervals, 1);
 });
 
 test("a reset time that moves by a second stays in the same reset period", () => {
@@ -812,7 +835,7 @@ test("each subscription lists the latest sample of its open windows, an ended wi
   assert.equal(sub(analysis, "claude").latest.week, null);
 });
 
-test("the latest sample of a window is the highest percent of the newest reset period", () => {
+test("Codex: the latest sample of a window is the highest percent of the newest reset period", () => {
   const samples = [
     sample("codex", NOW - 4 * HOUR_MS, 30, RESET),
     sample("codex", NOW - 3 * HOUR_MS, 41, RESET),
