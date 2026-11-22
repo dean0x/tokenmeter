@@ -46,9 +46,17 @@ function rpc() {
   input.on("line", (line) => {
     appendFileSync("rpc-input", line + "\n");
     const method = JSON.parse(line).method;
+    if (method === replies.switchOffOn) writeFileSync("config.json", '{"version":1,"app_server":"off"}', { mode: 0o600 });
     if (method === "initialize") process.stdout.write(replies.initialize.join("\n") + "\n");
     if (method === "account/rateLimits/read" && replies.limits.length > 0) {
-      process.stdout.write(replies.limits.join("\n") + "\n");
+      process.stdout.write(replies.limits.join("\n") + "\n", () => {
+        if (replies.afterLimits === "exit0") process.exit(0);
+        if (replies.afterLimits === "exit1") process.exit(1);
+      });
+    }
+    if (method === "account/usage/read") {
+      appendFileSync("usage-calls", "1\n");
+      if (replies.usage?.length > 0) process.stdout.write(replies.usage.join("\n") + "\n");
     }
   });
 }

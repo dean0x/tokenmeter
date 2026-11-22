@@ -1,16 +1,21 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
+import {
+  ACCOUNT_MAX_AGE_MS, ACCOUNT_USAGE_FILE, USAGE_INTERVAL_MS, readAccountFile, writeAccountFile, type AccountFile,
+} from "../src/account-usage.ts";
 import { writeAppServerSetting } from "../src/config.ts";
+import { STORE_VERSION } from "../src/core.ts";
 import { defaultDeps } from "../src/fsafe.ts";
 import { readRefreshState, REFRESH_INTERVAL_MS, writeRefreshState } from "../src/gate.ts";
 import { readCodexLatest } from "../src/quota.ts";
 import { refresh } from "../src/refresh.ts";
 import { resolveCodex } from "../src/spawn.ts";
+import type { StatusOutputData } from "../src/status.ts";
 import { writeFakeCodex, type FakeMode } from "./fixtures/fake-codex.mjs";
 import { installSuiteGuard, makeSandbox, type Sandbox } from "./helpers.ts";
 
@@ -46,14 +51,30 @@ function rollout(box: Sandbox, at: number, percent: number): void {
   }) + "\n");
 }
 
-function replies(box: Sandbox, result: object | null): void {
+const LIMITS = { result: { rateLimits: { primary: {
+  usedPercent: 33, windowDurationMins: 300, resetsAt: Math.floor(NOW / 1000) + 3600,
+} } } };
+const CANARY = "account-reply-canary";
+const DATE = new Date(NOW - 86_400_000).toISOString().slice(0, 10);
+const USAGE_OK = JSON.stringify({ id: 3, result: {
+  dailyUsageBuckets: [{ startDate: DATE, tokens: 123, extra: CANARY }], threadUsage: [CANARY], summary: CANARY,
+} });
+
+interface ReplyOptions {
+  readonly afterLimits?: "exit0" | "exit1" | undefined;
+  readonly switchOffOn?: "account/rateLimits/read" | "account/usage/read";
+}
+
+function replies(box: Sandbox, result: object | null, usage?: readonly string[], options: ReplyOptions = {}): void {
   writeFileSync(join(box.dataDir, "rpc-replies.json"), JSON.stringify({
     initialize: ['{"id":1,"result":{}}'], limits: result === null ? [] : [JSON.stringify({ id: 2, ...result })],
+    usage, ...options,
   }));
 }
 
-function runBin(env: NodeJS.ProcessEnv, arg = "refresh", t?: TestContext) {
-  const child = spawn(process.execPath, [BIN, arg], { env, stdio: ["pipe", "pipe", "pipe"] });
+function runBin(env: NodeJS.ProcessEnv, arg = "refresh", t?: TestContext, now?: number) {
+  const clock = now === undefined ? [] : [`--import=data:text/javascript,${encodeURIComponent(`Date.now = () => ${now};`)}`];
+  const child = spawn(process.execPath, [...clock, BIN, arg], { env, stdio: ["pipe", "pipe", "pipe"] });
   t?.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM"); });
   const watchdog = setTimeout(() => child.kill("SIGKILL"), 12_000);
   let stdout = "";
@@ -81,6 +102,129 @@ async function pass(box: Sandbox, env: NodeJS.ProcessEnv, now = NOW) {
 function assertQuiet(run: Awaited<ReturnType<typeof runBin>["done"]>): void {
   assert.deepEqual(run, { code: 0, signal: null, stdout: "", stderr: "" });
 }
+
+function accountFile(binKey: string | null, attempt: AccountFile["attempt"] = "error", now = NOW): AccountFile {
+  return { version: STORE_VERSION, fetched_at: null, attempt_at: now, attempt, bin_key: binKey, rows: [] };
+}
+
+function assertLimits(box: Sandbox): void {
+  const stored = state(box, NOW);
+  assert.ok(stored?.binKey);
+  assert.deepEqual(JSON.parse(readFileSync(join(box.dataDir, "refresh-state.json"), "utf8")), {
+    lastAttemptAt: NOW, nextRefreshAt: NOW + REFRESH_INTERVAL_MS, nextAppServerAt: NOW + REFRESH_INTERVAL_MS,
+    outcome: "ok", binKey: stored.binKey, codexFound: true,
+  });
+  assert.deepEqual(readCodexLatest(box.dataDir, NOW), [{
+    at: NOW, src: "appserver", window: "five_hour", usedPercent: 33,
+    resetsAt: LIMITS.result.rateLimits.primary.resetsAt * 1_000, reached: false,
+  }]);
+}
+
+const NOTIFICATION = JSON.stringify({ method: "note", params: "x".repeat(32_768) });
+const USAGE_ERROR = JSON.stringify({ id: 3, error: { code: -32600, message: CANARY } });
+const USAGE_CASES = [
+  ["valid rows", [USAGE_OK], "ok"],
+  ["code -32601", ['{"id":3,"error":{"code":-32601}}'], "unsupported"],
+  ["code -32600", [USAGE_ERROR], "error"],
+  ["another error code", ['{"id":3,"error":{"code":-32602}}'], "error"],
+  ["a malformed error", ['{"id":3,"error":{"code":"-32601"}}'], "shape"],
+  ["a bad result shape", ['{"id":3,"result":{}}'], "shape"],
+  ["null buckets", ['{"id":3,"result":{"dailyUsageBuckets":null}}'], "error"],
+  ["a non-JSON line", ["{"], "shape"],
+  ["a line over 64 KiB", ["x".repeat(65_537)], "too_large"],
+  ["total output over 256 KiB", Array<string>(8).fill(NOTIFICATION), "too_large"],
+  ["no reply", [], "timeout"],
+  ["exit 0", [], "error", "exit0"],
+  ["exit 1", [], "error", "exit1"],
+] as const;
+
+for (const [name, messages, attempt, afterLimits] of USAGE_CASES) {
+  test(`refresh keeps the limits and their schedule with ${name} from usage`, posix, async (t) => {
+    const { box, env } = setup(t, "rpc");
+    replies(box, LIMITS, messages, { afterLimits });
+    await pass(box, env);
+    const file = accountFile(state(box)?.binKey ?? null, attempt);
+    assertLimits(box);
+    assert.deepEqual(readAccountFile(box.dataDir, NOW), attempt === "ok"
+      ? { ...file, fetched_at: NOW, rows: [[DATE, 123]] } : file);
+  });
+}
+
+for (const usage of [USAGE_OK, USAGE_ERROR]) {
+  const label = usage === USAGE_OK ? "result" : "error";
+  test(`refresh keeps usage ${label} text out of the data folder and command output`, posix, async (t) => {
+    const { box, env } = setup(t, "rpc");
+    replies(box, LIMITS, [usage]);
+    await pass(box, env);
+    unlinkSync(join(box.dataDir, "rpc-replies.json"));
+    const path = join(box.dataDir, ACCOUNT_USAGE_FILE);
+    assert.equal(existsSync(path), true);
+    const before = readFileSync(path, "utf8");
+    assert.equal(statSync(path).mode & 0o777, 0o600);
+    assert.equal((await runBin(env, "collect", t).done).code, 0);
+    assert.equal(readFileSync(path, "utf8"), before);
+    for (const name of readdirSync(box.dataDir)) {
+      const file = join(box.dataDir, name);
+      if (statSync(file).isFile()) assert.equal(readFileSync(file, "utf8").includes(CANARY), false, name);
+    }
+    for (const command of ["status", "usage"]) {
+      const result = await runBin(env, command, t).done;
+      assert.equal(result.code, 0);
+      assert.equal((result.stdout + result.stderr).includes(CANARY), false, command);
+    }
+  });
+}
+
+test("refresh keeps older rows and their fetch time when the usage read fails", posix, async (t) => {
+  const { box, env } = setup(t, "rpc");
+  const old = { ...accountFile(null, "ok", NOW - USAGE_INTERVAL_MS), fetched_at: NOW - USAGE_INTERVAL_MS,
+    rows: [[DATE, 456]] } as const;
+  assert.ok(writeAccountFile(box.dataDir, old).ok);
+  replies(box, LIMITS, [USAGE_ERROR]);
+  await pass(box, env);
+  assert.deepEqual(readAccountFile(box.dataDir, NOW), {
+    ...old, attempt_at: NOW, attempt: "error", bin_key: state(box)?.binKey,
+  });
+});
+
+test("refresh reads just limits when it cannot record the usage attempt", posix, async (t) => {
+  const { box, env } = setup(t, "rpc");
+  const path = join(box.dataDir, ACCOUNT_USAGE_FILE);
+  writeFileSync(path, "loose account file");
+  chmodSync(path, 0o644);
+  replies(box, LIMITS, [USAGE_OK]);
+  await pass(box, env);
+  assertLimits(box);
+  assert.equal(existsSync(join(box.dataDir, "usage-calls")), false);
+  assert.equal(readFileSync(path, "utf8"), "loose account file");
+});
+
+test("a failed final account write leaves the limits and their schedule intact", posix, async (t) => {
+  const { box, env } = setup(t, "rpc");
+  replies(box, LIMITS, [USAGE_OK]);
+  const deps = depsAt(NOW);
+  const result = await refresh(box.dataDir, { homeDir: box.home, env }, {
+    ...deps, suffix: () => state(box)?.outcome === "ok" ? "" : deps.suffix(),
+  });
+  assert.ok(result.ok);
+  assertLimits(box);
+  assert.equal(readFileSync(join(box.dataDir, "usage-calls"), "utf8"), "1\n");
+  assert.deepEqual(readAccountFile(box.dataDir, NOW), accountFile(state(box)?.binKey ?? null));
+});
+
+test("separate refresh processes retry failed usage at 15 minutes, not before", posix, async (t) => {
+  const { box, env } = setup(t, "rpc");
+  replies(box, LIMITS, [USAGE_ERROR]);
+  // At 14:59 the limits from 14:00 are fresh. At 15:00 both reads are due.
+  for (const [elapsed, limits, usage] of [
+    [0, 1, 1], [61_000, 2, 1], [USAGE_INTERVAL_MS - REFRESH_INTERVAL_MS, 3, 1],
+    [USAGE_INTERVAL_MS - 1_000, 3, 1], [USAGE_INTERVAL_MS, 4, 2],
+  ] as const) {
+    assertQuiet(await runBin(env, "refresh", t, NOW + elapsed).done);
+    assert.equal(readFileSync(join(box.dataDir, "app-server-calls"), "utf8"), "1\n".repeat(limits));
+    assert.equal(readFileSync(join(box.dataDir, "usage-calls"), "utf8"), "1\n".repeat(usage));
+  }
+});
 
 test("refresh is silent and records a missing Codex but still stores the rollout time", posix, async (t) => {
   const { box, env } = setup(t);
@@ -126,6 +270,8 @@ test("off prevents all Codex starts from refresh and collect but admits a rollou
   assert.equal(state(box, next)?.outcome, "off");
   assert.equal((await runBin(env, "collect", t).done).code, 0);
   assert.equal(existsSync(join(box.dataDir, "version-calls")), false);
+  assert.equal(existsSync(join(box.dataDir, "usage-calls")), false);
+  assert.equal(existsSync(join(box.dataDir, ACCOUNT_USAGE_FILE)), false);
 });
 
 test("a switch change after the version probe stops the app-server spawn", posix, async (t) => {
@@ -135,6 +281,33 @@ test("a switch change after the version probe stops the app-server spawn", posix
   assert.equal(state(box)?.outcome, "off");
   assert.equal(readFileSync(join(box.dataDir, "version-calls"), "utf8"), "1\n");
   assert.equal(existsSync(join(box.dataDir, "rpc-input")), false);
+});
+
+for (const switchOffOn of ["account/rateLimits/read", "account/usage/read"] as const) {
+  test(`a switch change during ${switchOffOn} keeps limits but does not save new usage`, posix, async (t) => {
+    const { box, env } = setup(t, "rpc");
+    replies(box, LIMITS, [USAGE_OK], { switchOffOn });
+    await pass(box, env);
+    assertLimits(box);
+    assert.equal(existsSync(join(box.dataDir, "usage-calls")), switchOffOn === "account/usage/read");
+    assert.deepEqual(readAccountFile(box.dataDir, NOW), accountFile(state(box)?.binKey ?? null));
+  });
+}
+
+test("with the switch off, status uses the last good account fetch only until it expires", posix, async (t) => {
+  const { box, env } = setup(t, "rpc");
+  replies(box, LIMITS, [USAGE_OK]);
+  await pass(box, env);
+  assert.ok(writeAppServerSetting(box.dataDir, "off").ok);
+  assert.equal((await runBin(env, "collect", t, NOW).done).code, 0);
+  for (const [age, source, total] of [[ACCOUNT_MAX_AGE_MS - 1, "account", 123], [ACCOUNT_MAX_AGE_MS, "logs", 0]] as const) {
+    const run = await runBin(env, "status", t, NOW + age).done;
+    assert.equal(run.code, 0);
+    const { data } = JSON.parse(run.stdout) as { data: StatusOutputData };
+    const week = data.subscriptions.find((sub) => sub.id === "codex")?.tokens.week;
+    assert.deepEqual([week?.source, week?.total], [source, total]);
+  }
+  assert.equal(readFileSync(join(box.dataDir, "usage-calls"), "utf8"), "1\n");
 });
 
 test("the rollout read continues while sign-in backoff prevents a Codex start", posix, async (t) => {
@@ -150,6 +323,8 @@ test("the rollout read continues while sign-in backoff prevents a Codex start", 
   assert.equal(readCodexLatest(box.dataDir, next)[0]?.usedPercent, 43);
   assert.equal(state(box, next)?.nextAppServerAt, auth?.nextAppServerAt);
   assert.equal(readFileSync(join(box.dataDir, "app-server-calls"), "utf8"), "1\n");
+  assert.equal(existsSync(join(box.dataDir, "usage-calls")), false);
+  assert.deepEqual(readAccountFile(box.dataDir, next), accountFile(auth?.binKey ?? null));
 });
 
 test("a new refresher reuses the version result for the same binary", posix, async (t) => {
@@ -189,11 +364,9 @@ test("the off switch replaces a long backoff with the normal wait", posix, async
   assert.equal(state(box, later)?.outcome, "auth");
 });
 
-test("two refreshes produce one app-server call and a fresh reading stops a new attempt", posix, async (t) => {
+test("two refreshes produce one app-server call and one usage read", posix, async (t) => {
   const { box, env } = setup(t, "rpc");
-  replies(box, { result: { rateLimits: { primary: {
-    usedPercent: 33, windowDurationMins: 300, resetsAt: Math.floor(NOW / 1000) + 3600,
-  } } } });
+  replies(box, LIMITS, [USAGE_OK]);
   const runs = await Promise.all([runBin(env, "refresh", t).done, runBin(env, "refresh", t).done]);
   for (const run of runs) assertQuiet(run);
   const previous = state(box);
@@ -201,6 +374,7 @@ test("two refreshes produce one app-server call and a fresh reading stops a new 
   assert.equal(previous.outcome, "ok");
   assert.equal(readCodexLatest(box.dataDir, Date.now())[0]?.src, "appserver");
   assert.equal(readFileSync(join(box.dataDir, "app-server-calls"), "utf8"), "1\n");
+  assert.equal(readFileSync(join(box.dataDir, "usage-calls"), "utf8"), "1\n");
   assert.ok(writeRefreshState(box.dataDir, { ...previous, nextRefreshAt: 0, nextAppServerAt: 0 }).ok);
   assertQuiet(await runBin(env, "refresh", t).done);
   assert.equal(state(box)?.nextRefreshAt, 0);
@@ -223,6 +397,53 @@ test("stores the rollout before a hung Codex times out and kills the Codex proce
   await pass(box, env, early);
   assert.equal(readFileSync(join(box.dataDir, "app-server-calls"), "utf8"), "1\n");
   assert.deepEqual(state(box, early), timedOut);
+});
+
+async function waitForUsage(box: Sandbox): Promise<boolean> {
+  const path = join(box.dataDir, "usage-calls");
+  for (let attempt = 0; attempt < 300; attempt += 1) {
+    if (existsSync(path)) return true;
+    await delay(10);
+  }
+  return false;
+}
+
+test("SIGTERM during usage keeps limits and the attempt, and releases the lock", posix, async (t) => {
+  const { box, env } = setup(t, "rpc");
+  replies(box, LIMITS, []);
+  const run = runBin(env, "refresh", t, NOW);
+  const pid = await waitForServer(box);
+  const requested = await waitForUsage(box);
+  const attempt = readAccountFile(box.dataDir, NOW);
+  const locked = existsSync(join(box.dataDir, "refresh.lock"));
+  if (requested) assert.equal(run.child.kill("SIGTERM"), true);
+  assertQuiet(await run.done);
+  assert.equal(requested, true);
+  assert.equal(locked, true);
+  assert.deepEqual(attempt, accountFile(state(box)?.binKey ?? null));
+  assertLimits(box);
+  assert.equal(defaultDeps().isAlive(pid), false);
+  assert.equal(existsSync(join(box.dataDir, "refresh.lock")), false);
+  assertQuiet(await runBin(env, "refresh", t, NOW + 61_000).done);
+  assert.equal(readFileSync(join(box.dataDir, "app-server-calls"), "utf8"), "1\n1\n");
+  assert.equal(readFileSync(join(box.dataDir, "usage-calls"), "utf8"), "1\n");
+  assert.deepEqual(readAccountFile(box.dataDir, NOW + 61_000), attempt);
+});
+
+test("time spent on usage does not move the next limits attempt", posix, async (t) => {
+  const { box, env } = setup(t, "rpc");
+  replies(box, LIMITS, []);
+  const controller = new AbortController();
+  let now = NOW;
+  const run = refresh(box.dataDir, { homeDir: box.home, env, signal: controller.signal }, {
+    ...defaultDeps(), nowMs: () => now,
+  });
+  const requested = await waitForUsage(box);
+  now += 2_000;
+  controller.abort();
+  assert.ok((await run).ok);
+  assert.equal(requested, true);
+  assertLimits(box);
 });
 
 async function waitForServer(box: Sandbox): Promise<number> {

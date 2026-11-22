@@ -50,6 +50,15 @@ export function shiftDate(date: string, days: number): string {
   return new Date(Date.parse(`${date}T00:00:00Z`) + days * DAY_MS).toISOString().slice(0, 10);
 }
 
+export function monthStartDate(date: string): string {
+  return `${date.slice(0, 8)}01`;
+}
+
+// A month has 28 to 31 days, so 31 days after its first day is in the next month.
+export function nextMonthStartDate(date: string): string {
+  return monthStartDate(shiftDate(monthStartDate(date), 31));
+}
+
 // The oldest day that a day row may have at `nowMs`: the horizon holds
 // DAYS_HORIZON_DAYS days, today included.
 export function cutoffDateOf(zone: Zone, nowMs: number): string {

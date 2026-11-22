@@ -15,7 +15,10 @@ import {
   estimateFromSignals,
   hitRateBand,
 } from "../src/estimator.ts";
-import { localZone } from "../src/periods.ts";
+import { ACCOUNT_MAX_AGE_MS, type AccountUsage } from "../src/account-usage.ts";
+import { DayRows, shiftDate } from "../src/days.ts";
+import { type Zone, WEEK_MS, localZone, zoneNamed } from "../src/periods.ts";
+import { periodsOf } from "../src/rollup.ts";
 import type { PoolConfig } from "../src/pool.ts";
 import {
   type BuildInput,
@@ -30,6 +33,7 @@ import {
   type TokenColumnsJson,
   buildStatus,
   estimateJson,
+  overlayCodexAccount,
   refreshShares,
 } from "../src/status.ts";
 import type { Provider } from "../src/store.ts";
@@ -114,6 +118,147 @@ function firstShare(result: StatusData, index = 0): ShareJson {
   assert.ok(found !== undefined, "the share is missing");
   return found;
 }
+
+const UTC: Zone = { offsetMs: () => 0 };
+const CODEX: SubscriptionJson = { ...subscription("codex", 200, 25), label: "Codex" };
+const RAW = { input: 7, cache_write: 2, cache_write_1h: 3, cache_read: 5, output: 11, weighted: 200 };
+const FRESH: AccountUsage = { at: NOW, rows: [["2026-11-01", 800], ["2026-11-08", 200]] };
+
+function overlay(input: StatusData, account: AccountUsage | null, zone = UTC, nowMs = NOW) {
+  return overlayCodexAccount(input, account, zone, nowMs);
+}
+
+test("the Codex account supplies week and month totals, but not today", () => {
+  const codex = { ...CODEX, tokens: { today: RAW, week: RAW, month: RAW } };
+  const [result] = overlay(data([codex], []), FRESH).subscriptions;
+  assert.deepEqual(result, {
+    ...codex, label: "Codex (account)", account: { at: NOW, through: "2026-11-08" },
+    tokens: {
+      today: { ...RAW, total: 28, source: "logs" },
+      week: { ...RAW, total: 800, source: "account" },
+      month: { ...RAW, total: 1000, source: "account" },
+    },
+  });
+  const rows = new DayRows(true);
+  rows.add("2026-11-01", "codex", "test-model", [7, 0, 0, 5, 11], 1);
+  const { months } = periodsOf({
+    rows, zone: UTC, nowMs: NOW, weekStart: "sun", collect: { at: NOW, complete: true }, account: FRESH, maxBytes: 4096,
+  });
+  assert.equal(months[0]?.subs.codex.account, result?.tokens.month.total);
+});
+
+test("Claude always shows the log totals, and Codex uses the same keys without an account", () => {
+  const claude = { ...subscription("claude", 200, 30), label: "Claude" };
+  const input = data([claude, CODEX], []);
+  const logPeriod = { ...columns(200), total: 200, source: "logs" };
+  const logTokens = { today: logPeriod, week: logPeriod, month: logPeriod };
+  assert.deepEqual(overlay(input, FRESH).subscriptions[0], { ...claude, account: null, tokens: logTokens });
+  assert.deepEqual(overlay(input, null).subscriptions, [claude, CODEX].map((sub) => ({
+    ...sub, account: null, tokens: logTokens,
+  })));
+});
+
+test("a fresh empty Codex account uses the same log totals and label as an absent account", () => {
+  const codex = { ...CODEX, tokens: { today: RAW, week: RAW, month: RAW } };
+  const input = data([codex], []);
+  const [absent] = overlay(input, null).subscriptions;
+  const [empty] = overlay(input, { at: NOW, rows: [] }).subscriptions;
+  const logPeriod = { ...RAW, total: 28, source: "logs" };
+
+  assert.deepEqual(empty, absent);
+  assert.deepEqual(empty, {
+    ...codex, account: null, tokens: { today: logPeriod, week: logPeriod, month: logPeriod },
+  });
+});
+
+test("the Codex account leaves the share percent, calibration and forecast unchanged", () => {
+  const codex = {
+    ...CODEX,
+    calibration: { per_pct_weighted: 30, confidence: "low", intervals: 3, label: CALIBRATION_LABEL } as const,
+    forecast: { burn_pct_per_h: 1, at_reset_pct: 50, runs_out_at: null, at: NOW, basis: "latest sample" } as const,
+  };
+  const input = refreshShares(data([codex], [task("open", [share("codex", 100)])]), SEPARATE, NOW);
+  const before = structuredClone(input);
+  const result = overlay(input, FRESH);
+  assert.equal(result.subscriptions[0]?.tokens.week.source, "account");
+  assert.equal(firstShare(result).week_pct, 12.5);
+  assert.deepEqual(result.tasks, input.tasks);
+  assert.deepEqual(result.subscriptions[0]?.calibration, codex.calibration);
+  assert.deepEqual(result.subscriptions[0]?.forecast, codex.forecast);
+  assert.deepEqual(input, before);
+});
+
+test("an account contributes at 24 hours less 1 ms but not at 24 hours", () => {
+  const input = data([CODEX], []);
+  const ageLimit = NOW - ACCOUNT_MAX_AGE_MS;
+  const sources = [ageLimit + 1, ageLimit].map((at) =>
+    overlay(input, { ...FRESH, at }).subscriptions[0]?.tokens.week.source,
+  );
+  assert.deepEqual(sources, ["account", "logs"]);
+});
+
+test("missing, non-number and non-finite columns do not enter the log total", () => {
+  const tokens = { today: { input: 7, cache_read: "11", output: Infinity, weighted: 200 }, week: columns(200) };
+  const malformed = { ...CODEX, tokens } as unknown as SubscriptionJson;
+  const periods = overlay(data([malformed], []), null).subscriptions[0]?.tokens;
+  assert.deepEqual([periods?.today.total, periods?.week.total, periods?.month.total], [7, 200, 0]);
+});
+
+for (const [name, edge] of [
+  ["Europe/Berlin", "2026-10-31T23:00:00Z"],
+  ["America/New_York", "2026-11-01T04:00:00Z"],
+  ["Pacific/Auckland", "2026-10-31T11:00:00Z"],
+] as const) {
+  test(`the Codex month uses the local month at the boundary in ${name}`, () => {
+    const zone = zoneNamed(name);
+    assert.ok(zone.ok);
+    const at = Date.parse(edge);
+    const account: AccountUsage = { at, rows: [["2026-10-31", 17], ["2026-11-01", 19]] };
+    const input = data([CODEX], []);
+    const months = [at - 1, at].map((nowMs) => overlay(input, account, zone.value, nowMs).subscriptions[0]?.tokens.month.total);
+    assert.deepEqual(months, [17, 19]);
+  });
+}
+
+const WEEK_ROWS = Array.from({ length: 15 }, (_, index) => [shiftDate("2026-11-01", index), 2 ** index] as const);
+
+for (const [time, minutes, firstTotal, nextTotal] of [
+  ["00:00Z", 0, 127, 16256], ["11:59Z", 719, 127, 16256],
+  ["12:00Z", 720, 127, 16256], ["23:59Z", 1439, 254, 32512],
+] as const) {
+  test(`a reset at ${time} assigns seven distinct bucket midpoints to each adjacent week`, () => {
+    const start = START + minutes * 60_000;
+    const week = { start, end: start + WEEK_MS, kind: "reset" } as const;
+    const input = data([{ ...CODEX, week }], []);
+    const [first, next] = [start, week.end].map((nowMs) =>
+      overlay(input, { at: nowMs, rows: WEEK_ROWS }, UTC, nowMs).subscriptions[0],
+    );
+    assert.deepEqual([first?.tokens.week.total, next?.tokens.week.total], [firstTotal, nextTotal]);
+    assert.deepEqual(next?.week, week);
+  });
+}
+
+test("an old reset week rolls over multiple weeks, but a rolling week takes the newest slots", () => {
+  const oldWeek = { start: START - WEEK_MS, end: START };
+  const nowMs = START + WEEK_MS + 12 * HOUR;
+  const totals = (["reset", "rolling"] as const).map((kind) => {
+    const input = data([{ ...CODEX, week: { ...oldWeek, kind } }], []);
+    return overlay(input, { at: nowMs, rows: WEEK_ROWS }, UTC, nowMs).subscriptions[0]?.tokens.week.total;
+  });
+  assert.deepEqual(totals, [16256, 254]);
+});
+
+test("a month with partial account coverage uses account data and a week outside coverage uses logs", () => {
+  const nowMs = Date.parse("2026-11-25T00:00:00Z");
+  const account: AccountUsage = { at: nowMs, rows: [["2026-11-04", 10], ["2026-11-16", 20]] };
+  const input = data([CODEX], []);
+  const [gap, outside] = [Date.parse("2026-11-09T00:00:00Z"), nowMs].map((at) =>
+    overlay(input, { ...account, at }, UTC, at).subscriptions[0],
+  );
+  assert.deepEqual([gap?.tokens.week.total, gap?.tokens.week.source], [0, "account"]);
+  assert.deepEqual([outside?.tokens.week.total, outside?.tokens.week.source], [200, "logs"]);
+  assert.deepEqual([outside?.tokens.month.total, outside?.tokens.month.source, outside?.label], [30, "account", "Codex (account)"]);
+});
 
 test("week_pct is the part of the subscription's week tokens, times the seven day percent", () => {
   const input = data([subscription("claude", 1000, 40), subscription("codex", 500, 20)], [

@@ -10,7 +10,7 @@ import {
 const REFRESH_STATE_FILE = "refresh-state.json";
 const REFRESH_LOCK_FILE = "refresh.lock";
 const STATE_CAP_BYTES = 4 * 1024;
-const BIN_KEY = /^[a-f0-9]{64}$/;
+export const BIN_KEY = /^[a-f0-9]{64}$/;
 export const REFRESH_INTERVAL_MS = 60_000;
 const MAX_BACKOFF_MS = 24 * 60 * REFRESH_INTERVAL_MS;
 export type RefreshOutcome = AppServerError | "ok" | "off";
