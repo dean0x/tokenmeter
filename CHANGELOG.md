@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## 0.3.0
+
 - Show Codex account token totals in `status` and `usage`, with use from other machines and clients. Use local log totals when account data is absent or too old.
 
 ## 0.2.0
