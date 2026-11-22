@@ -1,9 +1,10 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { readAccountFile, usageDue, writeAccountFile, type AccountFile } from "./account-usage.ts";
 import { readAppServerLimits } from "./appserver.ts";
 import { readCodexTail } from "./codex-tail.ts";
 import { readAppServerSetting } from "./config.ts";
-import { ok, type Result } from "./core.ts";
+import { STORE_VERSION, ok, type Result } from "./core.ts";
 import { defaultDeps, prepareDataDir, releaseLock, resolveDataDirPath, type FsDeps, type FsError } from "./fsafe.ts";
 import {
   acquireRefreshLock, appServerGate, backoffMs, readRefreshState, refreshDue, REFRESH_INTERVAL_MS,
@@ -33,6 +34,17 @@ function startRecord(prior: RefreshState | null, now: number): RefreshState {
   };
 }
 
+function recordUsageAttempt(dataDir: string, binKey: string, deps: FsDeps): AccountFile | null {
+  const now = deps.nowMs();
+  const old = readAccountFile(dataDir, now, deps);
+  if (!usageDue(old, binKey, now)) return null;
+  const attempt: AccountFile = {
+    version: STORE_VERSION, fetched_at: old?.fetched_at ?? null, rows: old?.rows ?? [],
+    attempt_at: now, attempt: "error", bin_key: binKey,
+  };
+  return writeAccountFile(dataDir, attempt, deps).ok ? attempt : null;
+}
+
 async function refreshAppServer(
   dataDir: string,
   prior: RefreshState | null,
@@ -57,9 +69,10 @@ async function refreshAppServer(
   const recorded = writeRefreshState(dataDir, attempt, deps);
   if (!recorded.ok) return recorded;
 
+  const usageAttempt = binKey === null ? null : recordUsageAttempt(dataDir, binKey, deps);
   let switchedOff = false;
   const reading = await readAppServerLimits(codex, {
-    cwd: dataDir, env: options.env, now: deps.nowMs, signal: options.signal,
+    cwd: dataDir, env: options.env, now: deps.nowMs, signal: options.signal, usage: usageAttempt !== null,
     mayStart: () => {
       switchedOff = readAppServerSetting(dataDir, deps) === "off";
       return !switchedOff && timeLeft();
@@ -69,7 +82,17 @@ async function refreshAppServer(
   if (switchedOff) outcome = "off";
   else if (!reading.ok) outcome = reading.error;
   else outcome = storeAppServerReading(dataDir, reading.value.limits, deps).ok ? "ok" : "error";
-  return writeRefreshState(dataDir, { ...attempt, outcome, nextAppServerAt: deps.nowMs() + backoffMs(outcome) }, deps);
+  // The usage wait does not extend the limits schedule.
+  const limitsAt = (reading.ok ? reading.value.limits[0]?.at : undefined) ?? deps.nowMs();
+  const stored = writeRefreshState(dataDir, { ...attempt, outcome, nextAppServerAt: limitsAt + backoffMs(outcome) }, deps);
+
+  const usage = reading.ok ? reading.value.usage : null;
+  if (usageAttempt !== null && usage !== null && readAppServerSetting(dataDir, deps) === "on") {
+    writeAccountFile(dataDir, usage.ok
+      ? { ...usageAttempt, attempt: "ok", fetched_at: deps.nowMs(), rows: usage.value }
+      : { ...usageAttempt, attempt: usage.error }, deps);
+  }
+  return stored;
 }
 
 async function refreshLocked(

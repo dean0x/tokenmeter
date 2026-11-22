@@ -5,8 +5,9 @@ import { chmodSync, existsSync, mkdirSync, readdirSync, realpathSync, statSync, 
 import { dirname, join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
+import { USAGE_INTERVAL_MS, writeAccountFile } from "../src/account-usage.ts";
 import { writeAppServerSetting } from "../src/config.ts";
-import { SCHEMA_ID, asRow, parseJson } from "../src/core.ts";
+import { SCHEMA_ID, STORE_VERSION, asRow, parseJson } from "../src/core.ts";
 import { readRefreshState, writeRefreshState, type RefreshOutcome } from "../src/gate.ts";
 import { storeAppServerReading, storeCodexQuota } from "../src/quota.ts";
 import { resolveCodex } from "../src/spawn.ts";
@@ -206,6 +207,24 @@ for (const outcome of ["ok", "auth", "old", "shape", "timeout", "error", "off"] 
     storeRollout(box, at);
     assert.deepEqual(runHud(env), expectedRollout(at));
     assert.equal(existsSync(join(box.dataDir, "refresh.lock")), false);
+  });
+}
+
+for (const [age, starts] of [[MINUTE, 1], [0, 0]] as const) {
+  test(`hud starts ${starts} refresh when usage is due and limits are ${age === 0 ? "fresh" : "due"}`, POSIX, (t) => {
+    const { box, env } = setup(t);
+    assert.ok(writeAccountFile(box.dataDir, {
+      version: STORE_VERSION, fetched_at: null, attempt_at: NOW - USAGE_INTERVAL_MS,
+      attempt: "error", bin_key: null, rows: [],
+    }).ok);
+    assert.ok(storeAppServerReading(box.dataDir, [{
+      window: "week", at: NOW - age, usedPercent: 82, resetsAt: NOW + DAY, reached: false,
+    }]).ok);
+    const observed = observeStarts(box, "hud", (observer) =>
+      spawnSync(process.execPath, [observer, CLOCK, BIN, "hud"], { env, encoding: "utf8", timeout: 2_000 }));
+    assert.ifError(observed.result.error);
+    assert.equal(observed.result.status, 0, observed.result.stderr);
+    assert.equal(observed.starts.length, starts);
   });
 }
 
