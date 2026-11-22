@@ -94,6 +94,7 @@ export interface CodexExchange<T, E> {
   readonly initialInput?: string;
   readonly onLine: (line: string, send: Send) => Result<T, E> | undefined;
   readonly onExit: () => Result<T, E>;
+  readonly onStop?: (reason: CodexRunError) => Result<T, E> | undefined;
 }
 
 export type CodexRunError = "missing" | "timeout" | "output_limit" | "aborted" | "error";
@@ -198,9 +199,10 @@ export async function runCodex<T, E>(
     }
 
     let settled = false;
+    let stopping = false;
     let inputBytes = 0;
-    const abort = () => settle(err("aborted"));
-    const deadline = setTimeout(() => settle(err("timeout")), timeout);
+    const abort = () => stop("aborted");
+    const deadline = setTimeout(() => stop("timeout"), timeout);
 
     function settle(result: Result<T, E | CodexRunError>): void {
       if (settled) return;
@@ -217,6 +219,18 @@ export async function runCodex<T, E>(
         signalGroup(child.pid, "SIGKILL");
         resolve(result);
       }, KILL_GRACE_MS);
+    }
+
+    function stop(reason: CodexRunError): void {
+      if (settled || stopping) return;
+      stopping = true;
+      let result: Result<T, E> | undefined;
+      try {
+        result = exchange.onStop?.(reason);
+      } catch {
+        // Keep the original stop reason if the hook fails.
+      }
+      settle(result ?? err(reason));
     }
 
     const send: Send = (text) => {
@@ -237,13 +251,13 @@ export async function runCodex<T, E>(
 
     child.stdout.on("data", (chunk: Buffer) => {
       try {
-        if (!lines.receive(chunk)) settle(err("output_limit"));
+        if (!lines.receive(chunk)) stop("output_limit");
       } catch {
-        settle(err("error"));
+        stop("error");
       }
     });
 
-    const failed = () => settle(err("error"));
+    const failed = () => stop("error");
     child.on("error", failed);
     child.stdin.on("error", failed);
     child.stdout.on("error", failed);

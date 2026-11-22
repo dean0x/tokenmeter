@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { delimiter, relative } from "node:path";
 import { test, type TestContext } from "node:test";
-import { setTimeout as wait } from "node:timers/promises";
+import { setImmediate as afterIo, setTimeout as wait } from "node:timers/promises";
 import { asRow, err, ok } from "../src/core.ts";
 import { checkCodexVersion, resolveCodex, runCodex, startRefresh } from "../src/spawn.ts";
 import { writeFakeCodex, type FakeMode } from "./fixtures/fake-codex.mjs";
@@ -187,6 +187,83 @@ test("an abort stops an active session", posix, async (t) => {
   });
   assert.deepEqual(result, err("aborted"));
   assert.equal(existsSync(box.path("data", "term")), true);
+});
+
+for (const [mode, arg, reason] of [
+  ["hang", "app-server", "timeout"],
+  ["wide", "app-server", "output_limit"],
+  ["fail", "--version", "error"],
+] as const) {
+  test(`the stop hook can replace ${reason} with a result`, posix, async (t) => {
+    const { codex, cwd, env } = fake(t, mode);
+    const result = await runCodex(codex, [arg], { cwd, env, timeoutMs: 1_000 }, {
+      onLine: () => undefined, onExit: () => err("early_exit"), onStop: (stop) => ok(stop),
+    });
+    assert.deepEqual(result, ok(reason));
+  });
+}
+
+test("the stop hook replaces abort once, even when the data handler fails after the abort", posix, async (t) => {
+  const { codex, cwd, env } = fake(t, "hang");
+  const controller = new AbortController();
+  const reasons: string[] = [];
+  const result = await runCodex(codex, ["app-server"], { cwd, env, signal: controller.signal }, {
+    onLine: () => { controller.abort(); throw new Error("test callback failure"); },
+    onExit: () => err("early_exit"),
+    onStop: (reason) => { reasons.push(reason); return err("held_result"); },
+  });
+  assert.deepEqual({ result, reasons }, { result: err("held_result"), reasons: ["aborted"] });
+});
+
+test("a child error after the abort does not call the stop hook again", posix, async (t) => {
+  const { box, codex, cwd, env } = fake(t);
+  const controller = new AbortController();
+  const reasons: string[] = [];
+  const stopped = runCodex({ ...codex, path: box.path("missing-codex") }, ["app-server"], { cwd, env, signal: controller.signal }, {
+    onLine: () => undefined, onExit: () => err("early_exit"),
+    onStop: (reason) => { reasons.push(reason); return ok(reason); },
+  });
+  controller.abort();
+  const result = await stopped;
+  await afterIo();
+  assert.deepEqual({ result, reasons }, { result: ok("aborted"), reasons: ["aborted"] });
+});
+
+test("a stop hook that aborts the signal does not run again", posix, async (t) => {
+  const { codex, cwd, env } = fake(t, "wide");
+  const controller = new AbortController();
+  const reasons: string[] = [];
+  const result = await runCodex(codex, ["app-server"], { cwd, env, signal: controller.signal }, {
+    onLine: () => undefined,
+    onExit: () => err("early_exit"),
+    onStop: (reason) => { reasons.push(reason); controller.abort(); return ok(reason); },
+  });
+  assert.deepEqual({ result, reasons }, { result: ok("output_limit"), reasons: ["output_limit"] });
+});
+
+for (const outcome of ["undefined", "throw"] as const) {
+  test(`the plain stop reason survives when the stop hook gives ${outcome}`, posix, async (t) => {
+    const { codex, cwd, env } = fake(t, "eof");
+    const reasons: string[] = [];
+    const result = await runCodex(codex, ["app-server"], { cwd, env }, {
+      onLine: () => { throw new Error("test callback failure"); },
+      onExit: () => err("early_exit"),
+      onStop: (reason) => {
+        reasons.push(reason);
+        if (outcome === "throw") throw new Error("test hook failure");
+        return undefined;
+      },
+    });
+    assert.deepEqual({ result, reasons }, { result: err("error"), reasons: ["error"] });
+  });
+}
+
+test("a pre-aborted session does not call the stop hook", posix, async (t) => {
+  const { codex, cwd, env } = fake(t, "eof");
+  const result = await runCodex(codex, ["app-server"], { cwd, env, signal: AbortSignal.abort() }, {
+    onLine: () => undefined, onExit: () => err("early_exit"), onStop: () => ok("unexpected"),
+  });
+  assert.deepEqual(result, err("aborted"));
 });
 
 test("version support is cached by binary identity and a changed mtime ends the cache hit", posix, async (t) => {
