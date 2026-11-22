@@ -158,6 +158,19 @@ test("Claude always shows the log totals, and Codex uses the same keys without a
   })));
 });
 
+test("a fresh empty Codex account uses the same log totals and label as an absent account", () => {
+  const codex = { ...CODEX, tokens: { today: RAW, week: RAW, month: RAW } };
+  const input = data([codex], []);
+  const [absent] = overlay(input, null).subscriptions;
+  const [empty] = overlay(input, { at: NOW, rows: [] }).subscriptions;
+  const logPeriod = { ...RAW, total: 28, source: "logs" };
+
+  assert.deepEqual(empty, absent);
+  assert.deepEqual(empty, {
+    ...codex, account: null, tokens: { today: logPeriod, week: logPeriod, month: logPeriod },
+  });
+});
+
 test("the Codex account leaves the share percent, calibration and forecast unchanged", () => {
   const codex = {
     ...CODEX,
@@ -235,7 +248,7 @@ test("an old reset week rolls over multiple weeks, but a rolling week takes the 
   assert.deepEqual(totals, [16256, 254]);
 });
 
-test("a month with one covered date uses account data and a week outside coverage uses logs", () => {
+test("a month with partial account coverage uses account data and a week outside coverage uses logs", () => {
   const nowMs = Date.parse("2026-11-25T00:00:00Z");
   const account: AccountUsage = { at: nowMs, rows: [["2026-11-04", 10], ["2026-11-16", 20]] };
   const input = data([CODEX], []);

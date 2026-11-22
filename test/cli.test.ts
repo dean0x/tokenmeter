@@ -880,9 +880,10 @@ for (const fault of ACCOUNT_FAULTS) {
       const { subscriptions: [, codex], periods } = run.env.data;
       assert.equal(codex.label, "Codex");
       assert.equal(codex.account, null);
-      assert.equal(codex.tokens.week.source, "logs");
+      const week: PeriodTotalJson = codex.tokens.week;
+      assert.equal(week.source, "logs");
       assert.equal(codex.tokens.month.source, "logs");
-      assert.ok(codex.tokens.week.total > 31);
+      assert.equal(week.total, week.input + (week.cache_write ?? 0) + (week.cache_write_1h ?? 0) + week.cache_read + week.output);
       assert.deepEqual([periods.days[0].subs.codex.account, periods.weeks[0].subs.codex.account, periods.months[0].subs.codex.account], [null, null, null]);
     }
   });
