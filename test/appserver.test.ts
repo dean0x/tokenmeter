@@ -104,12 +104,12 @@ test("the client asks for usage in the same session only after valid limits", po
   assert.equal(readFileSync(usageCalls, "utf8"), "1\n");
 });
 
-test("a switch change after initialize prevents both account requests", posix, async (t) => {
+test("a switch change after initialize permits the limits request but stops the usage request", posix, async (t) => {
   const { box, codex, options } = fake(t, { limits: [reply()] });
   const input = box.path("data", "rpc-input");
   const result = await readAppServerLimits(codex, { ...options, usage: true, mayStart: () => !existsSync(input) });
-  assert.deepEqual(result, err("error"));
-  assert.deepEqual(sentMessages(input), limitsRequests().slice(0, 1));
+  assert.deepEqual(sentMessages(input), limitsRequests());
+  assert.deepEqual(result, ok({ limits: LIMITS, usage: null }));
 });
 
 test("an old Codex receives no app-server start", posix, async (t) => {

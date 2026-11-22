@@ -832,7 +832,7 @@ tokenmeter config
 tokenmeter config app_server off
 ```
 
-The off switch stops new Codex starts and both account requests. The refresh still reads the local logs.
+The off switch prevents new Codex processes and stops the account usage request. The refresh still reads the local logs.
 Saved account totals stay available until they expire. `status` and `usage` do not start a refresh.
 Run `tokenmeter config app_server on` to enable both requests again.
 

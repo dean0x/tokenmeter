@@ -97,7 +97,6 @@ function accountExchange({ now = Date.now, usage, mayStart }: AppServerOptions):
         return err(body.error === -32600 ? "auth" : "error");
       }
       if (session.id === INITIALIZE_ID) {
-        if (mayStart?.() === false) return err("error");
         session = { id: LIMITS_ID };
         return send(READ_LIMITS) ? undefined : err("error");
       }
