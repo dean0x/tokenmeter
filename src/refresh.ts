@@ -79,9 +79,8 @@ async function refreshAppServer(
     },
   });
   let outcome: RefreshOutcome;
-  if (switchedOff) outcome = "off";
-  else if (!reading.ok) outcome = reading.error;
-  else outcome = storeAppServerReading(dataDir, reading.value.limits, deps).ok ? "ok" : "error";
+  if (reading.ok) outcome = storeAppServerReading(dataDir, reading.value.limits, deps).ok ? "ok" : "error";
+  else outcome = switchedOff ? "off" : reading.error;
   // The usage wait does not extend the limits schedule.
   const limitsAt = (reading.ok ? reading.value.limits[0]?.at : undefined) ?? deps.nowMs();
   const stored = writeRefreshState(dataDir, { ...attempt, outcome, nextAppServerAt: limitsAt + backoffMs(outcome) }, deps);

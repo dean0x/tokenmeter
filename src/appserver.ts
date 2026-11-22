@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 import { replyRows, type AccountRow, type UsageError } from "./account-usage.ts";
 import { asRow, err, ok, parseJson, quotaPoint, type Result } from "./core.ts";
 import type { CodexQuotaSample } from "./sources.ts";
-import { checkCodexVersion, runCodex, type CodexRunError, type CodexRunOptions, type ResolvedCodex } from "./spawn.ts";
+import { checkCodexVersion, runCodex, type CodexExchange, type CodexRunError, type CodexRunOptions, type ResolvedCodex } from "./spawn.ts";
 
 const DEADLINE_MS = 5_000;
 const RESET_SLACK_MS = 300_000;
@@ -74,23 +74,11 @@ function usageReplyError(code: number | "shape"): UsageError {
   return code === -32601 ? "unsupported" : "error";
 }
 
-export async function readAppServerLimits(
-  codex: ResolvedCodex | null,
-  options: AppServerOptions,
-): Promise<Result<AppServerReading, AppServerError>> {
-  if (codex === null) return err("missing");
-  if (typeof packageVersion !== "string" || packageVersion.length === 0) return err("error");
-  const deadline = performance.now() + DEADLINE_MS;
-  const { now = Date.now, usage, ...runOptions } = options;
-  const version = await checkCodexVersion(codex, runOptions);
-  if (!version.ok) return err(outcome(version.error));
-
-  const timeoutMs = Math.floor(deadline - performance.now());
-  if (timeoutMs <= 0) return err("timeout");
+function accountExchange({ now = Date.now, usage, mayStart }: AppServerOptions): CodexExchange<AppServerReading, AppServerError> {
   let session: Session = { id: INITIALIZE_ID };
   const keepLimits = (error: UsageError) => session.id === USAGE_ID
     ? ok({ limits: session.limits, usage: err(error) }) : undefined;
-  const result = await runCodex<AppServerReading, AppServerError>(codex, ["app-server"], { ...runOptions, timeoutMs }, {
+  return {
     initialInput: JSON.stringify({
       id: INITIALIZE_ID, method: "initialize", params: { clientInfo: { name: "tokenmeter", version: packageVersion } },
     }) + "\n",
@@ -109,12 +97,13 @@ export async function readAppServerLimits(
         return err(body.error === -32600 ? "auth" : "error");
       }
       if (session.id === INITIALIZE_ID) {
+        if (mayStart?.() === false) return err("error");
         session = { id: LIMITS_ID };
         return send(READ_LIMITS) ? undefined : err("error");
       }
       const limits = reading(body.value, now());
       if (!limits.ok) return limits;
-      if (!usage) return ok({ limits: limits.value, usage: null });
+      if (!usage || mayStart?.() === false) return ok({ limits: limits.value, usage: null });
       session = { id: USAGE_ID, limits: limits.value };
       return send(READ_USAGE) ? undefined : keepLimits("error");
     },
@@ -123,6 +112,20 @@ export async function readAppServerLimits(
       if (reason === "output_limit") return keepLimits("too_large");
       return keepLimits(reason === "timeout" ? "timeout" : "error");
     },
-  });
+  };
+}
+
+export async function readAppServerLimits(
+  codex: ResolvedCodex | null,
+  options: AppServerOptions,
+): Promise<Result<AppServerReading, AppServerError>> {
+  if (codex === null) return err("missing");
+  if (typeof packageVersion !== "string" || packageVersion.length === 0) return err("error");
+  const deadline = performance.now() + DEADLINE_MS;
+  const version = await checkCodexVersion(codex, options);
+  if (!version.ok) return err(outcome(version.error));
+  const timeoutMs = Math.floor(deadline - performance.now());
+  if (timeoutMs <= 0) return err("timeout");
+  const result = await runCodex(codex, ["app-server"], { ...options, timeoutMs }, accountExchange(options));
   return result.ok ? result : err(outcome(result.error));
 }

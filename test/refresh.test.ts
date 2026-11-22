@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import {
-  ACCOUNT_USAGE_FILE, USAGE_INTERVAL_MS, readAccountFile, writeAccountFile, type AccountFile,
+  ACCOUNT_MAX_AGE_MS, ACCOUNT_USAGE_FILE, USAGE_INTERVAL_MS, readAccountFile, writeAccountFile, type AccountFile,
 } from "../src/account-usage.ts";
 import { writeAppServerSetting } from "../src/config.ts";
 import { STORE_VERSION } from "../src/core.ts";
@@ -15,6 +15,7 @@ import { readRefreshState, REFRESH_INTERVAL_MS, writeRefreshState } from "../src
 import { readCodexLatest } from "../src/quota.ts";
 import { refresh } from "../src/refresh.ts";
 import { resolveCodex } from "../src/spawn.ts";
+import type { StatusOutputData } from "../src/status.ts";
 import { writeFakeCodex, type FakeMode } from "./fixtures/fake-codex.mjs";
 import { installSuiteGuard, makeSandbox, type Sandbox } from "./helpers.ts";
 
@@ -59,10 +60,15 @@ const USAGE_OK = JSON.stringify({ id: 3, result: {
   dailyUsageBuckets: [{ startDate: DATE, tokens: 123, extra: CANARY }], threadUsage: [CANARY], summary: CANARY,
 } });
 
-function replies(box: Sandbox, result: object | null, usage?: readonly string[], afterLimits?: "exit0" | "exit1"): void {
+interface ReplyOptions {
+  readonly afterLimits?: "exit0" | "exit1" | undefined;
+  readonly switchOffOn?: "account/rateLimits/read" | "account/usage/read";
+}
+
+function replies(box: Sandbox, result: object | null, usage?: readonly string[], options: ReplyOptions = {}): void {
   writeFileSync(join(box.dataDir, "rpc-replies.json"), JSON.stringify({
     initialize: ['{"id":1,"result":{}}'], limits: result === null ? [] : [JSON.stringify({ id: 2, ...result })],
-    usage, afterLimits,
+    usage, ...options,
   }));
 }
 
@@ -135,7 +141,7 @@ const USAGE_CASES = [
 for (const [name, messages, attempt, afterLimits] of USAGE_CASES) {
   test(`refresh keeps the limits and their schedule with ${name} from usage`, posix, async (t) => {
     const { box, env } = setup(t, "rpc");
-    replies(box, LIMITS, messages, afterLimits);
+    replies(box, LIMITS, messages, { afterLimits });
     await pass(box, env);
     const file = accountFile(state(box)?.binKey ?? null, attempt);
     assertLimits(box);
@@ -275,6 +281,33 @@ test("a switch change after the version probe stops the app-server spawn", posix
   assert.equal(state(box)?.outcome, "off");
   assert.equal(readFileSync(join(box.dataDir, "version-calls"), "utf8"), "1\n");
   assert.equal(existsSync(join(box.dataDir, "rpc-input")), false);
+});
+
+for (const switchOffOn of ["account/rateLimits/read", "account/usage/read"] as const) {
+  test(`a switch change during ${switchOffOn} keeps limits but does not save new usage`, posix, async (t) => {
+    const { box, env } = setup(t, "rpc");
+    replies(box, LIMITS, [USAGE_OK], { switchOffOn });
+    await pass(box, env);
+    assertLimits(box);
+    assert.equal(existsSync(join(box.dataDir, "usage-calls")), switchOffOn === "account/usage/read");
+    assert.deepEqual(readAccountFile(box.dataDir, NOW), accountFile(state(box)?.binKey ?? null));
+  });
+}
+
+test("with the switch off, status uses the last good account fetch only until it expires", posix, async (t) => {
+  const { box, env } = setup(t, "rpc");
+  replies(box, LIMITS, [USAGE_OK]);
+  await pass(box, env);
+  assert.ok(writeAppServerSetting(box.dataDir, "off").ok);
+  assert.equal((await runBin(env, "collect", t, NOW).done).code, 0);
+  for (const [age, source, total] of [[ACCOUNT_MAX_AGE_MS - 1, "account", 123], [ACCOUNT_MAX_AGE_MS, "logs", 0]] as const) {
+    const run = await runBin(env, "status", t, NOW + age).done;
+    assert.equal(run.code, 0);
+    const { data } = JSON.parse(run.stdout) as { data: StatusOutputData };
+    const week = data.subscriptions.find((sub) => sub.id === "codex")?.tokens.week;
+    assert.deepEqual([week?.source, week?.total], [source, total]);
+  }
+  assert.equal(readFileSync(join(box.dataDir, "usage-calls"), "utf8"), "1\n");
 });
 
 test("the rollout read continues while sign-in backoff prevents a Codex start", posix, async (t) => {
