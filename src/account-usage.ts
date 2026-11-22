@@ -28,6 +28,7 @@ export interface AccountFile {
 
 export interface AccountUsage {
   readonly at: number;
+  // The store returns the rows in date order, oldest first.
   readonly rows: readonly AccountRow[];
 }
 
@@ -126,9 +127,13 @@ export function usageDue(file: AccountFile | null, binKey: string, nowMs: number
   return nowMs - file.attempt_at >= wait;
 }
 
+export function isFreshAccount(at: number, nowMs: number): boolean {
+  return isTime(at, nowMs) && nowMs - at < ACCOUNT_MAX_AGE_MS;
+}
+
 export function freshAccount(file: AccountFile | null, nowMs: number): AccountUsage | null {
   const at = file?.fetched_at ?? null;
-  if (file === null || at === null || nowMs - at >= ACCOUNT_MAX_AGE_MS) return null;
+  if (file === null || at === null || !isFreshAccount(at, nowMs)) return null;
   return { at, rows: file.rows };
 }
 
@@ -136,11 +141,17 @@ export function readAccountUsage(dataDir: string, nowMs: number, deps: FsDeps = 
   return freshAccount(readAccountFile(dataDir, nowMs, deps), nowMs);
 }
 
-// No covered date gives null. A covered date with zero tokens gives zero.
+// The checked rows are in date order. A gap inside that span counts as zero.
 export function accountSum(account: AccountUsage, from: string, until: string): number | null {
-  let total: number | null = null;
-  for (const [date, tokens] of account.rows) {
-    if (date >= from && date < until) total = (total ?? 0) + tokens;
+  const { rows } = account;
+  if (rows.length > ACCOUNT_MAX_ROWS || from >= until) return null;
+  const oldest = rows[0]?.[0];
+  const newest = rows.at(-1)?.[0];
+  if (oldest === undefined || newest === undefined || from > newest || until <= oldest) return null;
+  let total = 0;
+  for (const [date, tokens] of rows) {
+    if (date >= until) break;
+    if (date >= from) total += tokens;
   }
   return total;
 }

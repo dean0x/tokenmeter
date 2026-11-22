@@ -122,7 +122,8 @@ test("a reply and file sort dates, keep 62 days through today, and accept tomorr
 test("100 rows at the day cap sum to a safe integer", () => {
   const total = ACCOUNT_DAY_TOKENS_MAX * ACCOUNT_MAX_ROWS;
   assert.ok(Number.isSafeInteger(total));
-  assert.equal(accountSum({ at: NOW, rows: AT_CAP }, shiftDate(TODAY, -99), shiftDate(TODAY, 1)), total);
+  const rows = [...AT_CAP].reverse();
+  assert.equal(accountSum({ at: NOW, rows }, shiftDate(TODAY, -99), shiftDate(TODAY, 1)), total);
 });
 
 test("an account sum uses a half-open date range and separates zero from no covered date", () => {
@@ -134,6 +135,16 @@ test("an account sum uses a half-open date range and separates zero from no cove
     accountSum(account, zero, from), accountSum(account, from, TODAY),
     accountSum(account, from, next), accountSum(account, next, shiftDate(next, 1)),
   ], [0, 4, 16, null]);
+});
+
+test("an account sum counts a gap as zero only inside its covered dates", () => {
+  const first = shiftDate(TODAY, -4);
+  const account = { at: NOW, rows: [[first, 3], [TODAY, 12]] as const };
+  const gap = shiftDate(first, 1);
+  assert.deepEqual([
+    accountSum(account, gap, TODAY), accountSum(account, gap, gap),
+    accountSum(account, shiftDate(first, -1), first), accountSum({ at: NOW, rows: [] }, gap, TODAY),
+  ], [0, null, null, null]);
 });
 
 test("no attempt file is due", () => {
