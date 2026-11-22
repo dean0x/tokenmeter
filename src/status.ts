@@ -45,7 +45,9 @@ import {
   forecastFrom,
   periodSlots,
 } from "./analysis.ts";
+import { accountSum, isFreshAccount, type AccountUsage } from "./account-usage.ts";
 import type { CollectReport, RootState } from "./collect.ts";
+import { localDateOf, monthStartDate, nextMonthStartDate } from "./days.ts";
 import {
   type EstimateItem,
   type EstimateLogLine,
@@ -64,10 +66,10 @@ import {
   selfCheck,
 } from "./estimator.ts";
 import { type FsDeps, defaultDeps, writeAtomic } from "./fsafe.ts";
-import type { WeekKind } from "./periods.ts";
+import { currentWeek, type WeekKind, type Zone } from "./periods.ts";
 import type { LatestQuota, QuotaSample, QuotaWriteReport, UnknownReason } from "./quota.ts";
 import type { PoolConfig } from "./pool.ts";
-import { FILE_CAPS, type Provider, type StoreError, failure, openVersioned, readJson } from "./store.ts";
+import { DAY_MS, FILE_CAPS, type Provider, type StoreError, failure, openVersioned, readJson } from "./store.ts";
 import {
   type FreezeReport,
   type OpenItem,
@@ -155,6 +157,23 @@ export interface SubscriptionJson {
   readonly tokens: PeriodTokensJson;
   readonly forecast: ForecastJson | null;
   readonly calibration: CalibrationJson | null;
+}
+
+export type TokenSource = "logs" | "account";
+
+export interface PeriodTotalJson extends TokenColumnsJson {
+  readonly total: number;
+  readonly source: TokenSource;
+}
+
+export interface AccountJson {
+  readonly at: number;
+  readonly through: string;
+}
+
+export interface SubscriptionOutputJson extends SubscriptionJson {
+  readonly tokens: Readonly<Record<PeriodName, PeriodTotalJson>>;
+  readonly account: AccountJson | null;
 }
 
 export interface ModelJson {
@@ -314,6 +333,10 @@ export interface StatusData {
   // more than 500 open items. It is not part of the check of a snapshot: a bad
   // queue reads as null and never makes the snapshot corrupt.
   readonly queue: QueueJson | null;
+}
+
+export interface StatusOutputData extends StatusData {
+  readonly subscriptions: readonly SubscriptionOutputJson[];
 }
 
 // ---------------------------------------------------------------------------
@@ -975,6 +998,60 @@ export function overlayClaudeQuota(data: StatusData, latest: LatestQuota, pool: 
     pool,
     nowMs,
   );
+}
+
+function periodTotal(columns: TokenColumnsJson, account: number | null): PeriodTotalJson {
+  if (account !== null) return { ...columns, total: account, source: "account" };
+  const raw = [columns?.input, columns?.cache_write, columns?.cache_write_1h, columns?.cache_read, columns?.output];
+  const total = raw.reduce<number>((sum, value) => sum + finiteOrZero(value ?? 0), 0);
+  return { ...columns, total: finiteOrZero(total), source: "logs" };
+}
+
+// Round each half-open week edge up to the first bucket midpoint at or after it.
+function midpointDateAtOrAfter(ms: number): string | null {
+  const date = new Date(Math.ceil((ms - DAY_MS / 2) / DAY_MS) * DAY_MS);
+  return Number.isFinite(date.getTime()) ? date.toISOString().slice(0, 10) : null;
+}
+
+function weekAccountSum(account: AccountUsage, week: SubscriptionJson["week"], nowMs: number): number | null {
+  const { start, end } = currentWeek(week.kind === "reset" ? week : null, nowMs);
+  const from = midpointDateAtOrAfter(start);
+  const until = midpointDateAtOrAfter(end);
+  return from === null || until === null ? null : accountSum(account, from, until);
+}
+
+// Add output fields after the quota overlay. The snapshot and its weighted
+// columns, shares, forecasts and windows still describe the local logs.
+export function overlayCodexAccount(
+  data: StatusData, account: AccountUsage | null, zone: Zone, nowMs: number,
+): StatusOutputData {
+  const fresh = account !== null && isFreshAccount(account.at, nowMs) ? account : null;
+  return {
+    ...data,
+    subscriptions: data.subscriptions.map((sub) => {
+      const usage = sub.id === "codex" ? fresh : null;
+      const through = usage?.rows.at(-1)?.[0];
+      let week = null;
+      let month = null;
+      let details = null;
+      if (usage !== null && through !== undefined) {
+        const first = monthStartDate(localDateOf(zone, nowMs));
+        week = weekAccountSum(usage, sub.week, nowMs);
+        month = accountSum(usage, first, nextMonthStartDate(first));
+        details = { at: usage.at, through };
+      }
+      return {
+        ...sub,
+        label: sub.id === "codex" && (week !== null || month !== null) ? "Codex (account)" : sub.label,
+        tokens: {
+          today: periodTotal(sub.tokens.today, null),
+          week: periodTotal(sub.tokens.week, week),
+          month: periodTotal(sub.tokens.month, month),
+        },
+        account: details,
+      };
+    }),
+  };
 }
 
 // The status keeps the busiest models only.

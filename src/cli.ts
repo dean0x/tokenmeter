@@ -501,6 +501,7 @@ function periodsPart(ctx: Ctx, dataDir: string, shaped: StatusData, weekStart: W
     nowMs: ctx.io.deps.nowMs(),
     weekStart,
     collect: { at: shaped.collect.at, complete: shaped.collect.state === "ok" },
+    account: null,
     maxBytes: periodsBudget(shaped),
   });
   return ok({ periods, periods_error: null });

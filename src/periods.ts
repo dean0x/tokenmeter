@@ -141,15 +141,19 @@ export function monthPeriod(zone: Zone, nowMs: number): Period {
 // latest reset time. A reset time that is past rolls forward by whole weeks,
 // until the reset is after `nowMs`. With no sample: the newest 672 slots, so
 // the slot of `nowMs` counts, marked "rolling".
-export function weekPeriod(samples: readonly QuotaSample[], provider: QuotaProvider, nowMs: number): WeekPeriod {
-  const latest = pickLatestSample(samples, provider, "week", ANY_RESET);
-  if (latest === null) {
+export function currentWeek(reset: Period | null, nowMs: number): WeekPeriod {
+  if (reset === null) {
     const end = (slotOf(nowMs) + 1) * SLOT_MS;
     return { start: end - WEEK_MS, end, kind: "rolling" };
   }
-  const weeksPast = latest.resetsAt > nowMs ? 0 : Math.floor((nowMs - latest.resetsAt) / WEEK_MS) + 1;
-  const end = latest.resetsAt + weeksPast * WEEK_MS;
-  return { start: end - WEEK_MS, end, kind: "reset" };
+  const weeksPast = reset.end > nowMs ? 0 : Math.floor((nowMs - reset.end) / WEEK_MS) + 1;
+  const shift = weeksPast * WEEK_MS;
+  return { start: reset.start + shift, end: reset.end + shift, kind: "reset" };
+}
+
+export function weekPeriod(samples: readonly QuotaSample[], provider: QuotaProvider, nowMs: number): WeekPeriod {
+  const latest = pickLatestSample(samples, provider, "week", ANY_RESET);
+  return currentWeek(latest === null ? null : { start: latest.resetsAt - WEEK_MS, end: latest.resetsAt }, nowMs);
 }
 
 // The slots [from, to) of a period.

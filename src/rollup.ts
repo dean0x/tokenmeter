@@ -29,8 +29,11 @@ import {
   PERIODS_MAX_MONTHS,
   PERIODS_MAX_WEEKS,
 } from "./core.ts";
+import { accountSum, isFreshAccount, type AccountUsage } from "./account-usage.ts";
 import { totalsOf } from "./analysis.ts";
-import { type DayRows, type DayTotals, cutoffDateOf, localDateOf, shiftDate, topModels, zeroColumns } from "./days.ts";
+import {
+  type DayRows, type DayTotals, cutoffDateOf, localDateOf, monthStartDate, nextMonthStartDate, shiftDate, topModels, zeroColumns,
+} from "./days.ts";
 import { type Zone, localDayStart } from "./periods.ts";
 import { type TokenColumnsJson, tokensJson } from "./status.ts";
 
@@ -85,7 +88,11 @@ export interface PeriodRowJson {
   readonly end_ms: number;
   readonly full: boolean;
   readonly current: boolean;
-  readonly subs: { readonly claude: TotalJson; readonly codex: TotalJson; readonly total: TotalJson };
+  readonly subs: {
+    readonly claude: TotalJson;
+    readonly codex: TotalJson & { readonly account: number | null };
+    readonly total: TotalJson;
+  };
   readonly models: Readonly<Record<string, TotalJson>>;
 }
 
@@ -153,15 +160,6 @@ function weekStartDate(date: string, weekStart: Weekday): string {
   return shiftDate(date, -back);
 }
 
-function monthStartDate(date: string): string {
-  return `${date.slice(0, 8)}01`;
-}
-
-// A month has 28 to 31 days, so 31 days after its first day is in the next month.
-function nextMonthStartDate(date: string): string {
-  return monthStartDate(shiftDate(monthStartDate(date), 31));
-}
-
 // ---------------------------------------------------------------------------
 // Rows
 // ---------------------------------------------------------------------------
@@ -169,6 +167,7 @@ function nextMonthStartDate(date: string): string {
 interface Clock {
   readonly zone: Zone;
   readonly nowMs: number;
+  readonly account: AccountUsage | null;
   // A row is full only if it ended by this time: the end of the last collect, or
   // never when that collect left a backlog.
   readonly coveredUntilMs: number;
@@ -208,7 +207,11 @@ function rowOf(clock: Clock, start: string, next: string, sum: Sum, modelLimit: 
     end_ms: endMs,
     full: covered && endMs <= clock.coveredUntilMs,
     current: startMs <= clock.nowMs && clock.nowMs < endMs,
-    subs: { claude, codex, total: totalJson(both, "claude") },
+    subs: {
+      claude,
+      codex: { ...codex, account: clock.account === null ? null : accountSum(clock.account, start, next) },
+      total: totalJson(both, "claude"),
+    },
     models: Object.fromEntries(models),
   };
 }
@@ -254,11 +257,12 @@ export interface PeriodsInput {
   readonly weekStart: Weekday;
   // The last collect: when it ended, and whether it read every line.
   readonly collect: { readonly at: number; readonly complete: boolean };
+  readonly account: AccountUsage | null;
   // The bytes that the periods may take as JSON text.
   readonly maxBytes: number;
 }
 
-export function periodsOf({ rows, zone, nowMs, weekStart, collect, maxBytes }: PeriodsInput): PeriodsJson {
+export function periodsOf({ rows, zone, nowMs, weekStart, collect, account, maxBytes }: PeriodsInput): PeriodsJson {
   const today = localDateOf(zone, nowMs);
   const newest = shiftDate(today, FUTURE_SLACK_DAYS);
   const cutoff = cutoffDateOf(zone, nowMs);
@@ -270,6 +274,7 @@ export function periodsOf({ rows, zone, nowMs, weekStart, collect, maxBytes }: P
   const clock: Clock = {
     zone,
     nowMs,
+    account: account !== null && isFreshAccount(account.at, nowMs) ? account : null,
     coveredUntilMs: collect.complete ? Math.min(collect.at, nowMs) : Number.NEGATIVE_INFINITY,
     first,
     cutThrough: rows.cutThrough,

@@ -13,6 +13,7 @@ import {
   type Result,
   STATUS_OUTPUT_MAX_BYTES,
 } from "../src/core.ts";
+import { ACCOUNT_DAY_TOKENS_MAX, ACCOUNT_KEEP_DAYS, ACCOUNT_MAX_AGE_MS, type AccountUsage } from "../src/account-usage.ts";
 import { DayRows, cutoffDateOf, shiftDate } from "../src/days.ts";
 import { type Zone, zoneNamed } from "../src/periods.ts";
 import { type PeriodRowJson, type PeriodsInput, type PeriodsJson, type Weekday, firstWeekdayOf, periodsOf } from "../src/rollup.ts";
@@ -50,6 +51,7 @@ function inputOf(rows: DayRows, patch: Partial<PeriodsInput> = {}): PeriodsInput
     nowMs,
     weekStart: "sun",
     collect: { at: nowMs, complete: true },
+    account: null,
     maxBytes: STATUS_OUTPUT_MAX_BYTES,
     ...patch,
   };
@@ -98,6 +100,30 @@ function assertSumsOfDays(days: readonly PeriodRowJson[], group: readonly Period
     }
   }
 }
+
+test("account sums use date names for days, weeks and months, even across the DST change", () => {
+  const account: AccountUsage = { at: NOW, rows: [["2026-11-01", 13], ["2026-11-08", 37]] };
+  const input = inputOf(rowsOf(BASE));
+  const baseline = periodsOf(input);
+  const result = periodsOf({ ...input, account });
+  const expect = (rows: readonly PeriodRowJson[], sums: readonly (number | null)[]) => rows.map((row, index) => ({
+    ...row, subs: { ...row.subs, codex: { ...row.subs.codex, account: sums[index] ?? null } },
+  }));
+  assert.deepEqual(result, {
+    ...baseline,
+    days: expect(baseline.days, [null, 13, 0, 0, 0, 0, 0, 0, 37]),
+    weeks: expect(baseline.weeks, [null, 13, 37]),
+    months: expect(baseline.months, [null, 50]),
+  });
+});
+
+test("absent or stale account data leaves account null on every row", () => {
+  const stale: AccountUsage = { at: NOW - ACCOUNT_MAX_AGE_MS, rows: [["2026-11-01", 13]] };
+  for (const account of [null, stale]) {
+    const { days, weeks, months } = periodsOf(inputOf(rowsOf(BASE), { account }));
+    for (const row of [...days, ...weeks, ...months]) assert.equal(row.subs.codex.account, null, row.start);
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Days
@@ -149,7 +175,10 @@ test("in is input and every cache column, out is output, raw keeps the form of t
   assert.ok(day !== undefined);
   assert.deepEqual(day.subs.claude, { raw: { input: 2, cache_write: 0, cache_write_1h: 0, cache_read: 0, output: 20, weighted: 102 }, in: 2, out: 20 });
   // The Codex cache write columns are null in raw, and the 3 tokens of the column count in `in`.
-  assert.deepEqual(day.subs.codex, { raw: { input: 4, cache_write: null, cache_write_1h: null, cache_read: 2, output: 1, weighted: 12.95 }, in: 9, out: 1 });
+  assert.deepEqual(day.subs.codex, {
+    raw: { input: 4, cache_write: null, cache_write_1h: null, cache_read: 2, output: 1, weighted: 12.95 },
+    in: 9, out: 1, account: null,
+  });
   assert.equal(day.subs.total.in, 11);
   assert.equal(day.subs.total.out, 21);
   assert.deepEqual(Object.keys(day.subs), ["claude", "codex", "total"]);
@@ -328,12 +357,24 @@ test("400 days give 400 day rows, and the weeks and the months stay under their 
   assert.equal(weeks[0]?.full, false);
 });
 
-test("the worst store gives periods under the output budget, and the other fields of the output take their bytes first", () => {
+test("the worst store and maximum account sums stay within the bytes left by other fields", () => {
   const rows = fullHorizon(DAYS_MAX_MODELS);
-  for (const others of [0, 100 * KIB, 400 * KIB, 800 * KIB]) {
-    const maxBytes = STATUS_OUTPUT_MAX_BYTES - others;
-    const result = periodsOf(inputOf(rows, { maxBytes }));
-    assert.ok(jsonBytes(result) <= maxBytes, `${others} bytes of other fields: ${jsonBytes(result)} bytes of periods`);
+  const account: AccountUsage = {
+    at: NOW,
+    rows: Array.from({ length: ACCOUNT_KEEP_DAYS }, (_, index) => [
+      shiftDate("2026-11-11", index + 1 - ACCOUNT_KEEP_DAYS), ACCOUNT_DAY_TOKENS_MAX,
+    ]),
+  };
+  const whole = periodsOf(inputOf(rows, { account, maxBytes: Number.MAX_SAFE_INTEGER }));
+  assert.equal(whole.months.at(-2)?.subs.codex.account, 31 * ACCOUNT_DAY_TOKENS_MAX);
+  for (const maxBytes of [STATUS_OUTPUT_MAX_BYTES, STATUS_OUTPUT_MAX_BYTES - 100 * KIB, 400 * KIB, 100 * KIB, 100]) {
+    const result = periodsOf(inputOf(rows, { account, maxBytes }));
+    assert.ok(jsonBytes(result) <= maxBytes, `${jsonBytes(result)} bytes of periods exceed ${maxBytes}`);
+    assert.deepEqual(result.cut, {
+      days: whole.days.length - result.days.length,
+      weeks: whole.weeks.length - result.weeks.length,
+      months: whole.months.length - result.months.length,
+    });
   }
 });
 
