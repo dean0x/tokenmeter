@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Show Codex account token totals in `status` and `usage`, with use from other machines and clients. Use local log totals when account data is absent or too old.
+
 ## 0.2.0
 
 - The Claude week and 5 h percentages can now drop within one reset period after about 10 minutes without confirmation of the higher value.

@@ -2,7 +2,7 @@
 
 tokenmeter counts your Claude Code and Codex tokens on your own machine.
 It shows how much of your weekly limit you have used and where you are heading.
-Its token counts come from local logs. It has no runtime dependencies.
+Its token counts come from local logs and, when available, from your Codex account. It has no runtime dependencies.
 
 Use it to:
 
@@ -34,7 +34,9 @@ npm run build
 ## Credentials and network access
 
 tokenmeter needs no credentials. It does not read credential files or make HTTP calls itself.
-The optional Codex limits read runs the installed Codex CLI, which may contact its service.
+The optional Codex refresh runs the installed Codex CLI, which may contact its service.
+It requests account rate limits and can make a second request for daily account token totals.
+The account totals include use from other machines and clients.
 `record` and `statusline` start no other program.
 
 tokenmeter never prints or stores text from your sessions.
@@ -57,7 +59,7 @@ The exit code is 0 for success, 2 for `usage_error` and 1 for every other error.
 | Command | What it does |
 |---|---|
 | `tokenmeter collect` | Reads new lines of the logs and updates the data folder. |
-| `tokenmeter status` | Prints the last result of `collect`, with the latest Claude quota and the `periods` (days, weeks and months). It never reads the logs. |
+| `tokenmeter status` | Prints the last result of `collect`, the latest Claude quota, available Codex account totals, and `periods` (days, weeks and months). It never reads the logs. |
 | `tokenmeter usage` | The same as `status`, with every model. `status` keeps the 8 busiest. |
 | `tokenmeter tasks sync` | Reads task windows and open items from stdin. |
 | `tokenmeter tasks` | Prints the tasks of the last result, with their shares of the week. |
@@ -96,7 +98,10 @@ Then the code is `data_dir_unsafe`, and nothing is written.
 The folder holds the token counts from 7 days before the start of the current month, in UTC. See "The horizon" in the section about the folder match.
 It also holds the totals of each local day for the last 400 days (`days.json`). See "Days, weeks and months".
 It also holds the quota samples, the task windows, the task history and the estimate log.
-It holds no path of a log file, no session id and no text from a session.
+`account-usage.json` holds UTC dates and raw Codex account totals, the fetch time, and the last attempt time and result.
+It also holds an executable key for the retry schedule, but no account ID.
+A reply can have at most 100 rows. The file keeps 62 days through today and can also hold a row for tomorrow.
+The folder holds no log file path, session ID or text from a session.
 
 ## Error and empty states
 
@@ -111,7 +116,8 @@ It holds no path of a log file, no session id and no text from a session.
 | Damaged or newer days file | ok, `periods: null`, `periods_error` | `status` and `usage` print all their other fields. `periods_error` is `store_corrupt` or `store_newer`. `collect` stops with that code. Delete `days.json` to clear it. See "Days, weeks and months". |
 | Data folder unsafe | `data_dir_unsafe` | The folder is refused. See the section about the data folder. |
 | No Claude samples | ok, `quota.source: none` | No status line has run `record` or `statusline` yet. |
-| Codex folder missing | ok, `root: root_missing` | You have not used Codex yet. |
+| Codex folder missing | ok, `root: root_missing` | No local Codex logs are available. |
+| Codex account data absent, damaged or at least 24 hours old | ok, `source: logs` | `status` and `usage` use log totals. `account` and `subs.codex.account` are `null`. |
 | No calibration | ok, `calibration: null` | Shares of the week are not ready yet. |
 | Rough calibration | ok, `confidence: rough` | Shares are shown, with a low confidence. |
 | Estimate fall-back | ok, `basis: wide` | No feature fit or pair fit beats the finished tasks of the same type, or all finished tasks. The range is wide and has a low confidence. |
@@ -572,6 +578,7 @@ If you go back to an older tokenmeter:
 - It reads each field of an estimate and of the self-check by name. So it drops `typical_pct` and `budget_pct`, and `width` and `useful_rate`.
 - A build before 0.2.0 drops `basis_project` from estimate rows and `projects` from `self_check`. It ignores `basis_project` in the log.
 - It does not know `queue`. It passes `queue` through unchecked, as it finds it in the snapshot, until its next `collect` writes a snapshot without it.
+- A build before 0.3.0 ignores `account-usage.json`. It shows the label `Codex` and uses only the log totals.
 
 `tokenmeter tasks sync` refuses a window or an open item with a `stage` tag that is not a label, and counts it.
 Such an item has no estimate and writes no line to the log.
@@ -678,11 +685,14 @@ A row has these fields:
   A day row has at most 40 models. A week row and a month row have at most 20.
   Two subscriptions with one model name add into one entry. The totals of `subs` keep every model.
 
-A total has three fields: `raw`, `in` and `out`.
-`raw` has the form of `subscriptions[].tokens.today`: the five columns and `weighted`. The Codex cache write columns are `null`.
-`in` is the input and all the cache columns added with no weight. `out` is the output. Both are whole numbers.
+Each log total has three fields: `raw`, `in` and `out`.
+`raw` has the five token columns and `weighted`. The Codex cache write columns are `null`.
+`in` is the sum of the input and cache columns without weights. `out` is the output. Both are whole numbers.
 
-A week and a month are the sum of their days, so every total agrees with the days.
+Each day, week and month row also has `subs.codex.account`. It is the raw account sum for the row, or `null`.
+The account sum does not change `raw`, `in`, `out`, model totals or `full`.
+
+A week and a month add their log totals from the days.
 The week starts on the day of `week_start`. `status --week-start sun|mon|tue|wed|thu|fri|sat` sets it.
 Without the flag it is the first weekday of the locale of the process (`Intl.Locale` week info), and Sunday when the locale has none.
 Any other value of the flag gives `usage_error`.
@@ -704,6 +714,13 @@ Every time in the JSON is in milliseconds since 1970.
 Today and the month follow the time zone of the process.
 The days of `days.json` follow the zone of the `collect` process.
 `TZ` sets the zone, for example on a remote server: `TZ=Europe/Berlin tokenmeter collect`.
+
+Codex reports account totals by UTC date. A period row or a subscription month matches those date names without a time zone shift.
+The subscription week uses UTC noon to select dates. Noon must be at or after the week start and before the week end.
+After a reset, the account sum uses the new week, but the saved `week` and log columns stay the same until the next `collect`.
+Without a reset time, the account sum uses the last seven days at the 15-minute boundary.
+The sum uses the dates between the oldest and newest stored dates. A gap between those dates counts as zero.
+A period that overlaps only part of that span can show a partial sum. A period outside the span has no account sum.
 
 ## Three ways to use it
 
@@ -776,6 +793,16 @@ tokenmeter estimate < items.json
 Check `ok` and `schema` before you use `data`.
 The names of the fields are in snake_case. Times are in milliseconds since 1970.
 
+Match subscriptions by `id`, not by `label`. The Codex label is `Codex (account)` if its week or month uses account data.
+Each subscription token period has `total` in raw tokens and `source` as `logs` or `account`.
+Today always uses the logs. Claude uses the logs for all periods.
+When account dates are available, `subscriptions[].account` gives the fetch time (`at`) and the newest date (`through`).
+Otherwise it is `null`.
+
+`weighted` still applies the weights to the five local log columns. It does not use `total`.
+Models, shares, calibration and forecasts do not use the account total.
+The account total and the raw log sum can count different tokens.
+
 ### Codex quota for a HUD
 
 Run `tokenmeter hud` with no flags or stdin. From a source checkout, run `npm run build` first.
@@ -794,16 +821,20 @@ The Codex limits read is on by default. It needs Codex 0.56.0 or newer on `PATH`
 The Codex lookup and the child process `PATH` use only folders that you or root own.
 Group and other users must not have write access to these folders or to the Codex executable.
 You or root must also own the executable and its folder.
-The refresher checks `codex --version` when necessary and runs `codex app-server` to request account rate limits over stdin and stdout.
+The refresher checks `codex --version` when necessary. It runs `codex app-server` to request account rate limits over stdin and stdout.
 It tries the limits read at most once per minute per data folder. Some failures extend the wait before another attempt.
+After a limits reply, it can request daily account totals in the same process.
+It tries the account totals at most once every 15 minutes per data folder. Some failures extend that wait to 24 hours.
+An account request can fail without a change to the limits result.
 
 ```sh
 tokenmeter config
 tokenmeter config app_server off
 ```
 
-The off switch stops Codex starts. The refresh still reads the session logs.
-Run `tokenmeter config app_server on` to enable the limits read again.
+The off switch stops new Codex starts and both account requests. The refresh still reads the local logs.
+Saved account totals stay available until they expire. `status` and `usage` do not start a refresh.
+Run `tokenmeter config app_server on` to enable both requests again.
 
 ### Keep the numbers fresh
 
