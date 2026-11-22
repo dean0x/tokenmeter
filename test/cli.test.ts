@@ -30,11 +30,13 @@ import fs, {
 import { syncBuiltinESMExports } from "node:module";
 import { basename, dirname, join } from "node:path";
 import { PassThrough, Readable, Writable } from "node:stream";
-import { DAYS_HORIZON_DAYS, DAYS_MAX_MODELS, SCHEMA_ID, STATUS_OUTPUT_MAX_BYTES, SYNC_MAX_BYTES, SYNC_MAX_OPEN_ITEMS, errorRecord, weighted } from "../src/core.ts";
+import { ACCOUNT_DAY_TOKENS_MAX, ACCOUNT_KEEP_DAYS, ACCOUNT_MAX_AGE_MS, ACCOUNT_READ_CAP_BYTES, ACCOUNT_USAGE_FILE } from "../src/account-usage.ts";
+import type { AccountFile, AccountRow } from "../src/account-usage.ts";
+import { DAYS_HORIZON_DAYS, DAYS_MAX_MODELS, SCHEMA_ID, STATUS_OUTPUT_MAX_BYTES, STORE_VERSION, SYNC_MAX_BYTES, SYNC_MAX_OPEN_ITEMS, errorRecord, weighted } from "../src/core.ts";
 import { type CliIo, parseArgs, runCli } from "../src/cli.ts";
 import { DEFAULT_BUDGET } from "../src/collect.ts";
 import { DEFAULT_APP_SERVER } from "../src/config.ts";
-import { DayRows, cutoffDateOf, shiftDate } from "../src/days.ts";
+import { DayRows, cutoffDateOf, localDateOf, shiftDate } from "../src/days.ts";
 import { ESTIMATE_LOG_CAP_BYTES, logLineText } from "../src/estimate-log.ts";
 import type { EstimateLogLine, RangedLogLine } from "../src/estimator.ts";
 import { type FsDeps, acquireLock, defaultDeps, prepareDataDir, releaseLock } from "../src/fsafe.ts";
@@ -48,6 +50,7 @@ import {
 } from "../src/quota.ts";
 import { FILE_CAPS, loadDayRows } from "../src/store.ts";
 import { RECORD_DEADLINE_MS, type RecordIo, runRecord } from "../src/record.ts";
+import type { PeriodTotalJson, StatusData } from "../src/status.ts";
 import { NO_DATA_LINE, renderStatusline, runStatusline } from "../src/statusline.ts";
 import { type Sandbox, assertGuarded, installSuiteGuard, makeSandbox } from "./helpers.ts";
 import { TIMING_RUNS, judgeTiming, measurePaired, writeBaselineScript } from "./timing.ts";
@@ -728,14 +731,20 @@ test("status: the top level fields, the subscriptions and the token columns", as
   const [claude, codex] = data.subscriptions;
   assert.equal(claude.endpoint, null);
   assert.equal(claude.root, "ok");
-  assert.deepEqual(Object.keys(claude), ["id", "label", "endpoint", "root", "quota", "week", "tokens", "forecast", "calibration"]);
-  for (const period of ["today", "week", "month"]) {
-    assert.deepEqual(Object.keys(claude.tokens[period]), ["input", "cache_write", "cache_write_1h", "cache_read", "output", "weighted"]);
+  assert.deepEqual(Object.keys(claude), ["id", "label", "endpoint", "root", "quota", "week", "tokens", "forecast", "calibration", "account"]);
+  for (const sub of [claude, codex]) {
+    assert.equal(sub.account, null);
+    for (const period of ["today", "week", "month"]) {
+      const row = sub.tokens[period];
+      assert.deepEqual(Object.keys(row), ["input", "cache_write", "cache_write_1h", "cache_read", "output", "weighted", "total", "source"]);
+      assert.equal(row.source, "logs");
+      assert.equal(row.total, row.input + (row.cache_write ?? 0) + (row.cache_write_1h ?? 0) + row.cache_read + row.output);
+    }
   }
   assert.equal(claude.week.kind, "rolling");
   assert.deepEqual(
     { ...claude.tokens.today, weighted: Math.round(claude.tokens.today.weighted) },
-    { input: 112, cache_write: 720, cache_write_1h: 600, cache_read: 350, output: 84, weighted: CLAUDE_FIXTURE_WEIGHTED },
+    { input: 112, cache_write: 720, cache_write_1h: 600, cache_read: 350, output: 84, weighted: CLAUDE_FIXTURE_WEIGHTED, total: 1866, source: "logs" },
   );
   // Codex has no cache write columns; its input and output are counted.
   assert.equal(codex.tokens.week.cache_write, null);
@@ -770,6 +779,116 @@ test("status keeps the top 8 models by week, and usage lists all of them", async
 });
 
 // ---------------------------------------------------------------------------
+// Codex account totals on snapshot reads
+// ---------------------------------------------------------------------------
+
+const ACCOUNT_ROWS: readonly AccountRow[] = [["2026-11-01", 7], ["2026-11-02", 11], ["2026-11-03", 13]];
+
+function accountText(rows: readonly AccountRow[] = ACCOUNT_ROWS, fetchedAt = NOW): string {
+  return JSON.stringify({ version: STORE_VERSION, fetched_at: fetchedAt, attempt_at: fetchedAt, attempt: "ok", bin_key: null, rows } satisfies AccountFile);
+}
+
+function logColumns({ total, source, ...columns }: PeriodTotalJson) {
+  return columns;
+}
+
+test("TP-32: snapshot queries read the account once, add its totals and preserve the snapshot and tasks", async (t) => {
+  const w = makeWorld(t);
+  seedFixtures(w);
+  assert.equal((await cli(w, ["tasks", "sync"], { stdin: SYNC_BODY })).code, 0);
+  await collectOk(w);
+  const snapshotPath = join(dataDir(w), "status.json");
+  const snapshot = readFileSync(snapshotPath, "utf8");
+  const legacy = (JSON.parse(snapshot) as { data: StatusData }).data;
+  const accountPath = join(dataDir(w), ACCOUNT_USAGE_FILE);
+  writeFileSync(accountPath, accountText(), { mode: 0o600 });
+
+  const open = fs.openSync;
+  const spy = t.mock.method(fs, "openSync", (...args: Parameters<typeof fs.openSync>) => open(...args));
+  syncBuiltinESMExports();
+  t.after(() => {
+    spy.mock.restore();
+    syncBuiltinESMExports();
+  });
+
+  const accountOpens = () => spy.mock.calls.filter(({ arguments: [path] }) => path === accountPath).length;
+  const tasks = (await dataOf(w, "tasks")).tasks;
+  assert.equal(accountOpens(), 1, "tasks");
+  assert.ok(tasks.length > 0);
+  for (const command of ["status", "usage"] as const) {
+    const before = accountOpens();
+    const run = await cli(w, [command, "--week-start", "sun"]);
+    assert.equal(run.code, 0, run.text);
+    assert.equal(accountOpens() - before, 1, command);
+    const { subscriptions: [, codex], periods } = run.env.data;
+    assert.equal(codex.label, "Codex (account)");
+    assert.deepEqual(codex.account, { at: NOW, through: "2026-11-03" });
+    assert.equal(codex.tokens.today.source, "logs");
+    assert.deepEqual([codex.tokens.week.source, codex.tokens.month.source], ["account", "account"]);
+    assert.deepEqual([codex.tokens.week.total, codex.tokens.month.total], [31, 31]);
+    assert.deepEqual(logColumns(codex.tokens.week), legacy.subscriptions[1]?.tokens.week);
+    assert.deepEqual([periods.days[0].subs.codex.account, periods.weeks[0].subs.codex.account, periods.months[0].subs.codex.account], [13, 31, 31]);
+    assert.deepEqual(run.env.data.tasks, tasks);
+  }
+  assert.equal(readFileSync(snapshotPath, "utf8"), snapshot);
+});
+
+function mockForeignAccountOwner(t: TestContext, path: string): void {
+  const account = statSync(path);
+  const fstat = fs.fstatSync;
+  const spy = t.mock.method(fs, "fstatSync", (fd: number) => {
+    const info = fstat(fd);
+    return info.dev === account.dev && info.ino === account.ino ? Object.assign(info, { uid: info.uid + 1 }) : info;
+  });
+  syncBuiltinESMExports();
+  t.after(() => {
+    spy.mock.restore();
+    syncBuiltinESMExports();
+  });
+}
+
+const ACCOUNT_FAULTS = ["missing", "damaged", "newer", "over cap", "linked", "loose mode", "foreign owner", "stale"] as const;
+
+for (const fault of ACCOUNT_FAULTS) {
+  test(`TP-21/40: ${fault} account data leaves status and usage on the logs`, { skip: fault === "linked" && process.platform === "win32" }, async (t) => {
+    const w = makeWorld(t);
+    seedFixtures(w);
+    await collectOk(w);
+    const path = join(dataDir(w), ACCOUNT_USAGE_FILE);
+    const good = accountText();
+    const mode = { mode: 0o600 };
+    switch (fault) {
+      case "missing": break;
+      case "damaged": writeFileSync(path, "{", mode); break;
+      case "newer": writeFileSync(path, JSON.stringify({ ...JSON.parse(good), version: STORE_VERSION + 1 }), mode); break;
+      case "over cap": writeFileSync(path, good.padEnd(ACCOUNT_READ_CAP_BYTES + 1), mode); break;
+      case "loose mode": writeFileSync(path, good); chmodSync(path, 0o644); break;
+      case "stale": writeFileSync(path, accountText(ACCOUNT_ROWS, NOW - ACCOUNT_MAX_AGE_MS), mode); break;
+      case "foreign owner": writeFileSync(path, good, mode); mockForeignAccountOwner(t, path); break;
+      case "linked": {
+        const target = w.sb.path("other-account.json");
+        writeFileSync(target, good, mode);
+        symlinkSync(target, path);
+        break;
+      }
+    }
+
+    for (const command of ["status", "usage"] as const) {
+      const run = await cli(w, [command]);
+      assert.equal(run.code, 0, run.text);
+      assert.equal(run.env.ok, true);
+      const { subscriptions: [, codex], periods } = run.env.data;
+      assert.equal(codex.label, "Codex");
+      assert.equal(codex.account, null);
+      assert.equal(codex.tokens.week.source, "logs");
+      assert.equal(codex.tokens.month.source, "logs");
+      assert.ok(codex.tokens.week.total > 31);
+      assert.deepEqual([periods.days[0].subs.codex.account, periods.weeks[0].subs.codex.account, periods.months[0].subs.codex.account], [null, null, null]);
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
 // The periods: days, weeks and months from the day rows
 // ---------------------------------------------------------------------------
 
@@ -793,17 +912,17 @@ test("periods: the day, the week and the month of the collected rows agree with 
   assert.equal(day.end_ms, Date.parse("2026-11-04T00:00:00Z"));
   assert.equal(day.current, true);
   assert.equal(day.full, false, "the first day with data is never full");
-  assert.deepEqual(day.subs.claude.raw, subscriptions[0].tokens.today);
-  assert.deepEqual(day.subs.codex.raw, subscriptions[1].tokens.today);
-  assert.deepEqual(day.subs.claude, { raw: subscriptions[0].tokens.today, in: 1782, out: 84 });
+  const claudeToday = logColumns(subscriptions[0].tokens.today);
+  assert.deepEqual(day.subs.codex.raw, logColumns(subscriptions[1].tokens.today));
+  assert.deepEqual(day.subs.claude, { raw: claudeToday, in: 1782, out: 84 });
   assert.equal(day.subs.total.out, day.subs.claude.out + day.subs.codex.out);
   assert.deepEqual(Object.keys(day.models).sort(), ["claude-opus-4-5", "claude-sonnet-5-5", "gpt-5-codex", "gpt-5.1"]);
   // Nov 3 2026 is a Tuesday: the week starts on Sunday Nov 1, and the month on Nov 1.
   assert.equal(week.start, "2026-11-01");
   assert.deepEqual(week.subs.claude.raw, day.subs.claude.raw);
   assert.equal(month.start, "2026-11-01");
-  assert.deepEqual(month.subs.claude.raw, subscriptions[0].tokens.month);
-  assert.deepEqual(month.subs.codex.raw, subscriptions[1].tokens.month);
+  assert.deepEqual(month.subs.claude.raw, logColumns(subscriptions[0].tokens.month));
+  assert.deepEqual(month.subs.codex.raw, logColumns(subscriptions[1].tokens.month));
   assert.equal(month.current, true);
   assert.equal(month.full, false);
 });
@@ -920,9 +1039,8 @@ test("periods: the days follow the zone of the collect and the status", async (t
   assert.equal(utc.env.data.periods.days[0].start_ms, Date.parse("2026-11-03T00:00:00Z"));
 });
 
-// The days file of the worst store: every day of the horizon, with the most models
-// of the longest names in both providers.
-function worstDays(): DayRows {
+// Every day of the horizon with the most models, and the full account span at the token cap.
+function plantWorstPeriods(w: World): void {
   const rows = new DayRows(true);
   const first = cutoffDateOf(UTC, NOW);
   for (let offset = 0; offset < DAYS_HORIZON_DAYS; offset += 1) {
@@ -932,15 +1050,20 @@ function worstDays(): DayRows {
       rows.add(shiftDate(first, offset), "codex", name, [2_000_000 + model, 0, 0, 300_000_000, 7_000 + offset], 1);
     }
   }
-  return rows;
+  const today = localDateOf(UTC, NOW);
+  const account = Array.from({ length: ACCOUNT_KEEP_DAYS + 1 }, (_, i): AccountRow => [
+    shiftDate(today, i + 1 - ACCOUNT_KEEP_DAYS), ACCOUNT_DAY_TOKENS_MAX,
+  ]);
+  writeFileSync(join(dataDir(w), "days.json"), JSON.stringify(rows.toJson()), { mode: 0o600 });
+  writeFileSync(join(dataDir(w), ACCOUNT_USAGE_FILE), accountText(account), { mode: 0o600 });
 }
 
 for (const command of ["status", "usage"] as const) {
-  test(`periods: ${command} of the worst store stays under the output budget, under the reader cap of 1 MiB`, async (t) => {
+  test(`TP-41: ${command} of the worst store with full account usage stays under the output budget`, async (t) => {
     const w = makeWorld(t);
     seedFixtures(w);
     await collectOk(w);
-    writeFileSync(join(dataDir(w), "days.json"), JSON.stringify(worstDays().toJson()), { mode: 0o600 });
+    plantWorstPeriods(w);
 
     const run = await cli(w, [command]);
 
@@ -948,6 +1071,9 @@ for (const command of ["status", "usage"] as const) {
     assert.ok(Buffer.byteLength(run.text) <= STATUS_OUTPUT_MAX_BYTES, `${Buffer.byteLength(run.text)} bytes`);
     assert.ok(STATUS_OUTPUT_MAX_BYTES < MIB);
     const { periods } = run.env.data;
+    assert.equal(periods.days.at(-1)?.subs.codex.account, ACCOUNT_DAY_TOKENS_MAX);
+    assert.equal(periods.cut.weeks, 0);
+    assert.equal(periods.cut.months, 0);
     assert.ok(periods.months.length >= 13, `${periods.months.length} months`);
     assert.ok(periods.weeks.length >= 57, `${periods.weeks.length} weeks`);
     assert.ok(periods.days.length > 0 && periods.days.length < DAYS_HORIZON_DAYS, `${periods.days.length} days`);
@@ -961,7 +1087,8 @@ function longKey(index: number): string {
 }
 
 // A raise to this ceiling needs a reason in its PR.
-const FIXED_OUTPUT_CEILING_BYTES = 13 * 16 * 1024;
+// Codex account fields (total, source, account) add about 300 bytes to the worst-case fixed part.
+const FIXED_OUTPUT_CEILING_BYTES = 13 * 16 * 1024 + 256;
 const MIN_PERIOD_ROOM_BYTES = 60 * 1024;
 const LONG_PROJECTS = Array.from({ length: 8 }, (_, i) => `alpha${i}`.padEnd(64, "a"));
 
@@ -993,24 +1120,28 @@ test("TP-64/132: 500 long project estimates keep the snapshot and output within 
   const stored = statSync(path).size;
   t.diagnostic(`status.json: ${collected} bytes collected, ${stored} bytes with project checks`);
   assert.ok(collected <= MIB && stored <= MIB, `status.json is ${stored} bytes`);
-  writeFileSync(join(dataDir(w), "days.json"), JSON.stringify(worstDays().toJson()), { mode: 0o600 });
+  plantWorstPeriods(w);
 
+  let maxFixed = 0;
   for (const command of ["status", "usage"] as const) {
     const run = await cli(w, [command]);
     assert.equal(run.code, 0, run.text.slice(0, 200));
-    const { periods, estimates, queue, self_check } = run.env.data;
+    const { periods, estimates, queue, self_check, subscriptions: [, codex] } = run.env.data;
+    assert.equal(codex.tokens.month.total, 4 * ACCOUNT_DAY_TOKENS_MAX);
+    assert.equal(periods.days.at(-1)?.subs.codex.account, ACCOUNT_DAY_TOKENS_MAX);
     const fixed = Buffer.byteLength(JSON.stringify({ ...run.env, data: { ...run.env.data, periods: null, periods_error: null } })) + 1;
+    maxFixed = Math.max(maxFixed, fixed);
     const output = Buffer.byteLength(run.text);
     t.diagnostic(`${command}: fixed=${fixed}, output=${output}, rows=${[periods.days.length, periods.weeks.length, periods.months.length]}, cut=${JSON.stringify(periods.cut)}`);
     assert.ok(output <= STATUS_OUTPUT_MAX_BYTES, `${command}: ${output} bytes`);
     assert.ok(periods.days.length > 0 && periods.days.length < DAYS_HORIZON_DAYS);
     assert.deepEqual(periods.cut, { days: DAYS_HORIZON_DAYS - periods.days.length, weeks: 0, months: 0 });
-    assert.ok(fixed <= FIXED_OUTPUT_CEILING_BYTES, `${command} fixed part: ${fixed} bytes`);
     assert.ok(STATUS_OUTPUT_MAX_BYTES - fixed >= MIN_PERIOD_ROOM_BYTES, `${command} period room: ${STATUS_OUTPUT_MAX_BYTES - fixed} bytes`);
     assert.deepEqual(self_check.projects, projects);
     assert.deepEqual(estimates.map((row: Record<string, unknown>) => [row.key, row.basis_project]), open.map((item) => [item.key, item.tags.project]));
     assert.equal(queue.count, SYNC_MAX_OPEN_ITEMS, "the queue counts every item");
   }
+  assert.ok(maxFixed <= FIXED_OUTPUT_CEILING_BYTES, `largest fixed part: ${maxFixed} bytes`);
 });
 
 // Days 2026-11-01 and 2026-11-02 beside the collected 2026-11-03.

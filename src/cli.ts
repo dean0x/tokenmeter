@@ -32,6 +32,7 @@ import {
   errorRecord,
   ok,
 } from "./core.ts";
+import { type AccountUsage, readAccountUsage } from "./account-usage.ts";
 import { type CollectState, loadBucketRows, periodSlots, readAnalysis } from "./analysis.ts";
 import { DEFAULT_APP_SERVER, isAppServerSetting, readAppServerSetting, writeAppServerSetting, type AppServerSetting } from "./config.ts";
 import {
@@ -68,12 +69,14 @@ import {
   type Counters,
   type Snapshot,
   type StatusData,
+  type StatusOutputData,
   buildStatus,
   calibrationsOf,
   claudeQuotaJson,
   countersOf,
   estimateJson,
   overlayClaudeQuota,
+  overlayCodexAccount,
   progressPercent,
   readSnapshot,
   withTopModels,
@@ -447,16 +450,21 @@ function loadData(ctx: Ctx): Result<{ readonly dataDir: string; readonly snapsho
 
 interface Current {
   readonly dataDir: string;
-  readonly data: StatusData;
+  readonly data: StatusOutputData;
+  readonly account: AccountUsage | null;
+  readonly nowMs: number;
 }
 
 function currentStatus(ctx: Ctx): Result<Current, ErrorRecord> {
   const loaded = loadData(ctx);
   if (!loaded.ok) return loaded;
   const { dataDir } = loaded.value;
-  const nowMs = ctx.io.deps.nowMs();
-  const latest = readLatestQuota(dataDir, nowMs, ctx.io.deps);
-  return ok({ dataDir, data: overlayClaudeQuota(loaded.value.data, latest, poolFromEnv(ctx.io.env), nowMs) });
+  const { deps, env, zone } = ctx.io;
+  const nowMs = deps.nowMs();
+  const latest = readLatestQuota(dataDir, nowMs, deps);
+  const withQuota = overlayClaudeQuota(loaded.value.data, latest, poolFromEnv(env), nowMs);
+  const account = readAccountUsage(dataDir, nowMs, deps);
+  return ok({ dataDir, data: overlayCodexAccount(withQuota, account, zone, nowMs), account, nowMs });
 }
 
 // The first day of the week: the flag, else the first weekday of the locale.
@@ -490,7 +498,8 @@ interface PeriodsPart {
 // The days, weeks and months come from days.json, read when the command runs:
 // the snapshot stays small, and a day row is as new as the last collect. A damaged,
 // newer or too large file gives no periods and its code; any other fault fails.
-function periodsPart(ctx: Ctx, dataDir: string, shaped: StatusData, weekStart: Weekday): Result<PeriodsPart, ErrorRecord> {
+function periodsPart(ctx: Ctx, current: Current, shaped: StatusData, weekStart: Weekday): Result<PeriodsPart, ErrorRecord> {
+  const { dataDir, account, nowMs } = current;
   const rows = loadDayRows(dataDir, ctx.io.deps);
   if (!rows.ok) {
     return isDaysFault(rows.error.code) ? ok({ periods: null, periods_error: rows.error.code }) : fail(rows.error.code);
@@ -498,22 +507,22 @@ function periodsPart(ctx: Ctx, dataDir: string, shaped: StatusData, weekStart: W
   const periods = periodsOf({
     rows: rows.value,
     zone: ctx.io.zone,
-    nowMs: ctx.io.deps.nowMs(),
+    nowMs,
     weekStart,
     collect: { at: shaped.collect.at, complete: shaped.collect.state === "ok" },
-    account: null,
+    account,
     maxBytes: periodsBudget(shaped),
   });
   return ok({ periods, periods_error: null });
 }
 
-function withPeriods(ctx: Ctx, shape: (data: StatusData) => StatusData): Result<unknown, ErrorRecord> {
+function withPeriods(ctx: Ctx, shape: (data: StatusOutputData) => StatusData): Result<unknown, ErrorRecord> {
   const weekStart = weekStartOf(ctx);
   if (!weekStart.ok) return weekStart;
   const current = currentStatus(ctx);
   if (!current.ok) return current;
   const shaped = shape(current.value.data);
-  const part = periodsPart(ctx, current.value.dataDir, shaped, weekStart.value);
+  const part = periodsPart(ctx, current.value, shaped, weekStart.value);
   return part.ok ? ok({ ...shaped, ...part.value }) : part;
 }
 
