@@ -68,7 +68,7 @@ async function refreshAppServer(
   let outcome: RefreshOutcome;
   if (switchedOff) outcome = "off";
   else if (!reading.ok) outcome = reading.error;
-  else outcome = storeAppServerReading(dataDir, reading.value, deps).ok ? "ok" : "error";
+  else outcome = storeAppServerReading(dataDir, reading.value.limits, deps).ok ? "ok" : "error";
   return writeRefreshState(dataDir, { ...attempt, outcome, nextAppServerAt: deps.nowMs() + backoffMs(outcome) }, deps);
 }
 
