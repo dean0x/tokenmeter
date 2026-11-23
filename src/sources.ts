@@ -7,6 +7,8 @@
 
 import { createHash } from "node:crypto";
 import {
+  CLAUDE_KEY_SEPARATOR,
+  CODEX_PROXY_KEY_TAG,
   type Result,
   type TokenRecord,
   asRow,
@@ -69,7 +71,7 @@ function optionalCount(value: unknown, read: CountReader): Result<number, "bad_t
 // ---------------------------------------------------------------------------
 
 export interface ClaudeEntry {
-  // message.id and requestId, joined with "|". Neither id can hold "|".
+  // Join message.id and the request id or reserved proxy tag with "|".
   readonly key: string;
   // Epoch milliseconds.
   readonly at: number;
@@ -78,7 +80,8 @@ export interface ClaudeEntry {
   readonly tokens: TokenRecord;
 }
 
-const CLAUDE_KEY_SEPARATOR = "|";
+// Bump this when the Claude parser rule changes. Each bump re-reads all discovered Claude data once.
+export const CLAUDE_PARSER_REV = 1;
 
 function readOneHourWrite(creation: unknown): Result<number, "bad_token"> {
   if (creation === undefined || creation === null) return ok(0);
@@ -119,16 +122,20 @@ export function parseClaudeRow(row: Row, nowMs: number): Result<ClaudeEntry, Ski
 
   const messageId = readId(message["id"]);
   const requestId = readId(row["requestId"]);
-  if (messageId === null || requestId === null) return err("missing_id");
+  if (messageId === null || requestId === CODEX_PROXY_KEY_TAG) return err("missing_id");
+  const model = sanitizeModel(message["model"]);
+  const proxy = row["requestId"] === undefined && messageId.startsWith("resp_") && model.startsWith("gpt-");
+  const suffix = proxy ? CODEX_PROXY_KEY_TAG : requestId;
+  if (suffix === null) return err("missing_id");
   const at = sanitizeTime(row["timestamp"], nowMs);
   if (!at.ok) return at;
   const tokens = readClaudeTokens(usage);
   if (!tokens.ok) return tokens;
 
   return ok({
-    key: `${messageId}${CLAUDE_KEY_SEPARATOR}${requestId}`,
+    key: `${messageId}${CLAUDE_KEY_SEPARATOR}${suffix}`,
     at: at.value,
-    model: sanitizeModel(message["model"]),
+    model,
     folderKey: folderOf(row["cwd"]),
     tokens: tokens.value,
   });

@@ -2,7 +2,15 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { type Result, type TokenRecord, TOKEN_BUCKETS, WEIGHTS, rawTokens, weighted } from "../src/core.ts";
+import {
+  type Result,
+  type TokenRecord,
+  TOKEN_BUCKETS,
+  WEIGHTS,
+  providerOfClaudeKey,
+  rawTokens,
+  weighted,
+} from "../src/core.ts";
 import { type Row, type RowScan, readRows } from "../src/lines.ts";
 import {
   CODEX_INITIAL_STATE,
@@ -184,6 +192,39 @@ test("claude fixture: each row gives its five buckets or a skip reason", () => {
   assert.deepEqual(outcomes.map(summarise), expected);
 });
 
+test("claude proxy fixture: only valid proxy rows keep their model, key and token counts", () => {
+  const { outcomes } = runClaude("claude-proxy.jsonl");
+  const actual = outcomes.map((outcome) => {
+    if (!outcome.ok) return outcome.error;
+    const { key, model, tokens } = outcome.value;
+    return [key, model, bucketsOf(tokens)];
+  });
+  assert.deepEqual(actual, [
+    ["resp_A|codex", "gpt-9-test", [100, 0, 0, 30, 10]],
+    ["resp_A|codex", "gpt-9-test", [100, 0, 0, 30, 20]],
+    ["resp_A|codex", "gpt-9-test", [100, 0, 0, 30, 30]],
+    ["resp_B|codex", "gpt-9-test", [50, 0, 0, 10, 5]],
+    "missing_id",
+    "missing_id",
+    "missing_id",
+  ]);
+});
+
+test("claude proxy: the key preserves a 128-character message id", () => {
+  const id = `resp_${"x".repeat(123)}`;
+  const row = assistantRow(BASE_USAGE, { id, model: "gpt-9-test" }, { requestId: undefined });
+  const outcome = parseClaudeRow(row, NOW);
+  assert.equal(outcome.ok ? outcome.value.key : outcome.error, `${id}|codex`);
+});
+
+test("claude keys: only the reserved suffix marks a row as Codex", () => {
+  const message = { id: "resp_X", model: "gpt-9-test" };
+  const proxy = must(parseClaudeRow(assistantRow(BASE_USAGE, message, { requestId: undefined }), NOW));
+  const native = must(parseClaudeRow(assistantRow(BASE_USAGE, message, { requestId: "codex_other" }), NOW));
+  assert.equal(providerOfClaudeKey(proxy.key), "codex");
+  assert.equal(providerOfClaudeKey(native.key), "claude");
+});
+
 test("claude fixture: the line reader counts the bad lines by reason", () => {
   const { scan } = runClaude("claude-basic.jsonl");
   assert.equal(scan.lines, 16);
@@ -284,18 +325,34 @@ test("claude: bad or out of range times skip the row", () => {
   }
 });
 
-test("claude: a missing or unsafe id skips the row", () => {
+test("claude: an invalid or reserved request id skips even a proxy-shaped message", () => {
+  const ids = [null, 7, "", "req with space", "req|pipe", "r".repeat(129), "codex"];
+  for (const requestId of ids) {
+    const row = assistantRow(
+      { output_tokens: -1 },
+      { id: "resp_X", model: "gpt-9-test" },
+      { requestId, timestamp: undefined },
+    );
+    assert.deepEqual(parseClaudeRow(row, NOW), { ok: false, error: "missing_id" });
+  }
+});
+
+test("claude: a missing request id requires a safe proxy message id and model", () => {
   const cases: Row[] = [
     assistantRow(BASE_USAGE, {}, { requestId: undefined }),
-    assistantRow(BASE_USAGE, {}, { requestId: 7 }),
-    assistantRow(BASE_USAGE, {}, { requestId: "" }),
-    assistantRow(BASE_USAGE, {}, { requestId: "req with space" }),
-    assistantRow(BASE_USAGE, {}, { requestId: "req|pipe" }),
-    assistantRow(BASE_USAGE, {}, { requestId: "r".repeat(129) }),
-    assistantRow(BASE_USAGE, { id: undefined }),
-    assistantRow(BASE_USAGE, { id: "msg\nline" }),
+    assistantRow(BASE_USAGE, { id: "resp_X", model: "other-test" }, { requestId: undefined }),
+    assistantRow(BASE_USAGE, { id: "resp_X", model: "gpt-unsafe model" }, { requestId: undefined }),
+    assistantRow(BASE_USAGE, { model: "gpt-9-test" }, { requestId: undefined }),
+    assistantRow(BASE_USAGE, { id: "resp_X|other", model: "gpt-9-test" }, { requestId: undefined }),
   ];
   for (const row of cases) {
+    assert.deepEqual(parseClaudeRow(row, NOW), { ok: false, error: "missing_id" });
+  }
+});
+
+test("claude: a missing or unsafe message id skips the row", () => {
+  for (const id of [undefined, "msg\nline"]) {
+    const row = assistantRow(BASE_USAGE, { id });
     assert.deepEqual(parseClaudeRow(row, NOW), { ok: false, error: "missing_id" });
   }
 });
@@ -851,6 +908,7 @@ test("codex quota: a counted event carries its samples too", () => {
 
 const FIXTURE_NAMES = [
   "claude-basic.jsonl",
+  "claude-proxy.jsonl",
   "codex-basic.jsonl",
   "codex-child.jsonl",
   "codex-child-own-meta.jsonl",
@@ -896,18 +954,17 @@ test("canary fixtures: every text field of every fixture holds the canary", () =
     }
     assert.ok(found.length > 0, `${name} has text fields`);
     for (const text of found) assert.ok(text.includes(CANARY), `${name}: a text field has no canary`);
+    if (name.startsWith("claude")) {
+      assert.ok(lines.every((line) => line.includes(CANARY)), `${name}: a line has no canary`);
+    }
   }
-  const claudeLines = readFileSync(fixture("claude-basic.jsonl"), "utf8").split("\n").filter((line) => line.length > 0);
-  assert.ok(claudeLines.every((line) => line.includes(CANARY)), "every claude line carries the canary");
 });
 
 test("canary: no parser output holds the canary", () => {
-  const claude = runClaude("claude-basic.jsonl");
-  assert.ok(claude.outcomes.length > 0);
-  assert.ok(!JSON.stringify(claude).includes(CANARY));
-  for (const name of FIXTURE_NAMES.filter((n) => n.startsWith("codex"))) {
-    const run = runCodex(name);
-    assert.ok(run.steps.length > 0);
+  for (const name of FIXTURE_NAMES) {
+    const run = name.startsWith("claude") ? runClaude(name) : runCodex(name);
+    const rows = "outcomes" in run ? run.outcomes : run.steps;
+    assert.ok(rows.length > 0);
     assert.ok(!JSON.stringify(run).includes(CANARY), `${name}: output holds the canary`);
   }
 });

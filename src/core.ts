@@ -190,6 +190,13 @@ export const TASK_HISTORY_MAX = 5000;
 export const SLOT_MS = 15 * MINUTE_MS;
 export const HORIZON_DAYS = 7;
 
+export const CLAUDE_KEY_SEPARATOR = "|";
+export const CODEX_PROXY_KEY_TAG = "codex";
+
+export function providerOfClaudeKey(key: string): "claude" | "codex" {
+  return key.endsWith(`${CLAUDE_KEY_SEPARATOR}${CODEX_PROXY_KEY_TAG}`) ? "codex" : "claude";
+}
+
 // ---------------------------------------------------------------------------
 // Sanitisers (3.3, 3.7)
 // ---------------------------------------------------------------------------
