@@ -22,6 +22,7 @@ import { type CliIo, runCli } from "../src/cli.ts";
 import { DEFAULT_BUDGET } from "../src/collect.ts";
 import { type FsDeps, defaultDeps } from "../src/fsafe.ts";
 import type { Zone } from "../src/periods.ts";
+import { LEDGER_FILE } from "../src/store.ts";
 import { type Sandbox, assertGuarded, installSuiteGuard, makeSandbox } from "./helpers.ts";
 import { probeStarts } from "./spawn-probe.ts";
 
@@ -140,6 +141,7 @@ function overLongLine(type: string): string {
 function plantSources(w: World, mtimeMs: number, date: string = FIXTURE_DATE): void {
   const day = join(w.codex, ...date.split("-"));
   plant(join(w.claude, "-work-proj", "sess-a.jsonl"), fixtureText("claude-basic.jsonl", date), mtimeMs);
+  plant(join(w.claude, "-work-proj", "sess-proxy.jsonl"), fixtureText("claude-proxy.jsonl", date), mtimeMs);
   plant(join(w.claude, "-work-proj", "sess-corrupt.jsonl"), CLAUDE_CORRUPT, mtimeMs);
   plant(join(w.claude, "-work-proj", "sess-long.jsonl"), overLongLine("assistant"), mtimeMs);
   plant(join(day, "rollout-a-parent.jsonl"), fixtureText("codex-basic.jsonl", date), mtimeMs);
@@ -245,14 +247,27 @@ async function runHere(w: World, step: Step): Promise<Output> {
   return { code, stdout: out.join(""), stderr: errs.join("") };
 }
 
+function jsonObject(text: string): Record<string, unknown> {
+  const parsed = parseJson(text);
+  const row = parsed.ok ? asRow(parsed.value) : null;
+  assert.ok(row !== null, "expected a JSON object");
+  return row;
+}
+
+function countersOf(collectStdout: string): Record<string, unknown> {
+  const counters = asRow(asRow(jsonObject(collectStdout).data)?.counters);
+  assert.ok(counters !== null, "collect reports counters");
+  return counters;
+}
+
 // Without these counts, a clean output would prove nothing: the sources, the
 // corrupt lines and the over-long lines must have been read.
 function assertBadLinesWereRead(collectStdout: string): void {
-  const counters = (JSON.parse(collectStdout) as { data: { counters: Record<string, number> } }).data.counters;
-  assert.ok((counters["counted"] ?? 0) > 0, "rows were counted");
-  assert.ok((counters["bad_json"] ?? 0) > 0, "corrupt lines were read");
-  assert.ok((counters["not_object"] ?? 0) > 0, "lines that are not objects were read");
-  assert.ok((counters["skipped_long"] ?? 0) > 0, "over-long lines were read");
+  const counters = countersOf(collectStdout);
+  for (const key of ["counted", "bad_json", "not_object", "skipped_long"]) {
+    const count = counters[key];
+    assert.ok(typeof count === "number" && count > 0, `collect reports ${key} above zero`);
+  }
 }
 
 // The canary is in no data file of the folder.
@@ -267,7 +282,7 @@ function assertNoCanaryStored(step: string, dataDir: string): void {
 // ---------------------------------------------------------------------------
 
 test("TP-10: the fixtures carry the canary in their text fields", () => {
-  for (const name of ["claude-basic.jsonl", "codex-basic.jsonl", "codex-child.jsonl", "codex-child-own-meta.jsonl"]) {
+  for (const name of ["claude-basic.jsonl", "claude-proxy.jsonl", "codex-basic.jsonl", "codex-child.jsonl", "codex-child-own-meta.jsonl"]) {
     const lines = fixtureText(name).split("\n").filter((line) => line !== "");
     assert.ok(lines.some((line) => line.includes(CANARY)), name);
   }
@@ -287,6 +302,42 @@ test("TP-10: the JSON commands print and store no canary, and the bad lines were
     if (step.name === "collect") assertBadLinesWereRead(run.stdout);
   }
   assert.ok(filesUnder(dataDir).length >= 3, "the data folder holds files");
+});
+
+test("proxy collection and parser re-read keep reply text out of output and the store", async (t) => {
+  const w = makeWorld(t);
+  const { dataDir } = w.sb;
+  plant(join(w.claude, "-work-proj", "sess-proxy.jsonl"), fixtureText("claude-proxy.jsonl"), NOW - HOUR_MS);
+  const step = { name: "collect", args: ["collect", "--claude-root", w.claude, "--codex-root", w.codex], stdin: "" };
+  async function collectWithoutText(phase: string): Promise<Record<string, unknown>> {
+    const run = await runHere(w, step);
+    assert.equal(run.code, 0, phase);
+    assert.equal(run.stdout.includes(CANARY), false, phase);
+    assert.doesNotMatch(run.stdout, /resp_|\|codex/, phase);
+    assert.equal(run.stderr, "", phase);
+    assertNoCanaryStored(phase, dataDir);
+    const snapshot = readFileSync(join(dataDir, "status.json"), "utf8");
+    assert.doesNotMatch(snapshot, /resp_|\|codex/, phase);
+    assert.deepEqual(asRow(jsonObject(snapshot).data)?.codex_raw, {
+      today: 225, week: 225, month: 225, utc_days: { [FIXTURE_DATE]: 225 },
+    });
+    return countersOf(run.stdout);
+  }
+
+  assert.equal((await collectWithoutText("first collect")).counted, 2);
+  const path = join(dataDir, LEDGER_FILE);
+  const ledger = jsonObject(readFileSync(path, "utf8"));
+  const files = asRow(ledger.files);
+  assert.ok(files !== null);
+  const [[key, value] = []] = Object.entries(files);
+  const entry = asRow(value);
+  assert.ok(key !== undefined && entry !== null && typeof entry.rev === "number");
+  const { rev, ...legacy } = entry;
+  writeFileSync(path, JSON.stringify({ ...ledger, files: { [key]: legacy } }));
+
+  const replay = await collectWithoutText("re-read");
+  assert.equal(replay.counted, 0);
+  assert.ok(typeof replay.repeats === "number" && replay.repeats > 0, "the proxy file was read again");
 });
 
 test("TP-10: in child processes, no command prints a canary to stdout or stderr or stores one, record and statusline included", async (t) => {
@@ -669,4 +720,15 @@ test("README: it names every command, every error code and the limits of what it
   // The second use names no program: the status line command is a placeholder.
   assert.ok(text.includes("{ tokenmeter record 2>/dev/null || cat; } | { <your status line command>; }"));
   assert.ok(text.includes("tokenmeter collect"), "the schedule line");
+});
+
+test("README and Unreleased notes describe proxy counts, the re-read and the mixed source", () => {
+  const readme = readFileSync(join(REPO, "README.md"), "utf8");
+  const changelog = readFileSync(join(REPO, "CHANGELOG.md"), "utf8");
+  const unreleased = changelog.split("\n## ").find((section) => section.startsWith("[Unreleased]\n"));
+  assert.ok(unreleased !== undefined, "the Unreleased section exists");
+  for (const term of ["proxy", "re-read", "`rev`", "`mixed`"]) {
+    assert.ok(readme.includes(term), `README: ${term}`);
+    assert.ok(unreleased.includes(term), `Unreleased: ${term}`);
+  }
 });

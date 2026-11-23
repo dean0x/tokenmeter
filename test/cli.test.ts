@@ -50,7 +50,8 @@ import {
 } from "../src/quota.ts";
 import { FILE_CAPS, loadDayRows } from "../src/store.ts";
 import { RECORD_DEADLINE_MS, type RecordIo, runRecord } from "../src/record.ts";
-import { readSnapshot, type PeriodTotalJson, type StatusData } from "../src/status.ts";
+import type { PeriodsJson } from "../src/rollup.ts";
+import { readSnapshot, type PeriodTotalJson, type StatusData, type StatusOutputData } from "../src/status.ts";
 import { NO_DATA_LINE, renderStatusline, runStatusline } from "../src/statusline.ts";
 import { type Sandbox, assertGuarded, installSuiteGuard, makeSandbox } from "./helpers.ts";
 import { TIMING_RUNS, judgeTiming, measurePaired, writeBaselineScript } from "./timing.ts";
@@ -833,45 +834,72 @@ test("TP-32: snapshot queries read the account once, add its totals and preserve
   assert.equal(readFileSync(snapshotPath, "utf8"), snapshot);
 });
 
-test("collect stores five-column Codex totals and status adds only the dates missing from the account", async (t) => {
+test("proxy tokens reach Codex models and task shares, and count only once on each account date", async (t) => {
   const w = makeWorld(t);
-  seedFixtures(w);
+  seedClaude(w);
+  const firstUsage = '"last_token_usage":{"input_tokens":1000,"cached_input_tokens":400';
+  put(codexFile(w, "a-parent"), fixtureText("codex-basic.jsonl")
+    .replace(firstUsage, `${firstUsage},"cache_write_input_tokens":30`), NOW - 5 * MINUTE_MS);
+  const proxy = fixtureText("claude-proxy.jsonl").replaceAll("/work/beta", "/work/proxy");
+  put(claudeFile(w, "proxy"), proxy + proxy.replaceAll("2026-11-03T", "2026-11-02T"));
   recordPoints(w, 5, 10);
-  put(claudeFile(w, "proxy"), ["02", "03"].map((day) => `${JSON.stringify({
-    type: "assistant", timestamp: `2026-11-${day}T08:00:00Z`, cwd: "/work/alpha",
-    message: { id: `resp_fixture_${day}`, model: "gpt-test", usage: {
-      input_tokens: 100, output_tokens: 50, cache_creation_input_tokens: 30, cache_read_input_tokens: 20,
-    } },
-  })}\n`).join(""));
   const options = { io: withEnv(w, POOL_ENV) };
-  assert.equal((await cli(w, ["tasks", "sync"], { ...options, stdin: SYNC_BODY })).code, 0);
+  const stdin = JSON.stringify({ windows: [{ label: "T-PROXY", start: "2026-11-03T07:00:00Z", match: { folders: ["/work/proxy"] }, tags: {} }], open: [] });
+  assert.equal((await cli(w, ["tasks", "sync"], { ...options, stdin })).code, 0);
   await collectOk(w, options);
-  const logs = await dataOf(w, "status", options);
-  const before = logs.subscriptions[1];
+
+  const logs: StatusOutputData & { periods: PeriodsJson | null } = await dataOf(w, "status", options);
+  const before = at(logs.subscriptions, 1);
   const read = readSnapshot(dataDir(w), DEPS);
   assert.ok(read.ok && read.value?.data);
   assert.deepEqual(read.value.data.codex_raw, {
-    today: 2605, week: 2805, month: 2805, utc_days: { "2026-11-02": 200, "2026-11-03": 2605 },
+    today: 2630, week: 2855, month: 2855, utc_days: { "2026-11-02": 225, "2026-11-03": 2630 },
   });
-  assert.deepEqual([before.tokens.today.total, before.tokens.week.total, before.tokens.month.total], [2605, 2805, 2805]);
+  assert.deepEqual([before.tokens.today.total, before.tokens.week.total, before.tokens.month.total], [2630, 2855, 2855]);
+  assert.equal(before.tokens.today.input, 1420);
   assert.equal(before.tokens.today.cache_write, null);
+  assert.equal(before.tokens.today.source, "logs");
+  const claude = at(logs.subscriptions, 0);
+  assert.equal(claude.tokens.month.total, SONNET_ALPHA_RAW + OPUS_BETA_RAW);
+  const model = logs.models.find(({ name }) => name === "gpt-9-test");
+  assert.equal(model?.subscription, "codex");
+  assert.equal(model?.month.weighted, 658);
+  assert.ok(before.calibration !== null);
+  assert.equal(before.calibration.confidence, "rough");
+  // Only the previous day's proxy tokens precede the latest quota sample's slot.
+  near(before.calibration.per_pct_weighted, 329 / CODEX_WEEK_PCT, "Codex calibration includes proxy tokens");
+  const task = logs.tasks.find(({ label }) => label === "T-PROXY");
+  assert.ok(task !== undefined && task.pool_pct !== null);
+  const share = task.shares.find(({ subscription }) => subscription === "codex");
+  assert.equal(share?.raw, 65);
+  assert.equal(share?.weighted, 76);
 
+  const localMonth = logs.periods?.months.find(({ current }) => current);
+  assert.ok(localMonth !== undefined);
+  assert.equal(localMonth.subs.codex.account, null);
   writeFileSync(join(dataDir(w), ACCOUNT_USAGE_FILE), accountText(ACCOUNT_ROWS.slice(0, 2)), { mode: 0o600 });
-  const over = await dataOf(w, "status", options);
-  const after = over.subscriptions[1];
-  assert.deepEqual(after.tokens.today, before.tokens.today);
-  assert.deepEqual([after.tokens.week.total, after.tokens.month.total], [2623, 2623]);
-  assert.deepEqual([after.tokens.week.source, after.tokens.month.source], ["mixed", "mixed"]);
-  assert.deepEqual(logColumns(after.tokens.week), logColumns(before.tokens.week));
-  assert.notEqual(before.calibration, null);
-  assert.deepEqual(after.calibration, before.calibration);
-  assert.equal(logs.pool.mode, "combined");
-  assert.ok(logs.tasks.some((task: StatusData["tasks"][number]) => task.pool_pct !== null &&
-    task.shares.some((share) => share.subscription === "codex" && share.weighted > 0)));
-  assert.deepEqual(over.tasks, logs.tasks);
-  assert.equal(Object.hasOwn(over, "codex_raw"), false);
-  assert.equal(over.periods.months[0].subs.codex.account, 18);
-  assert.deepEqual(over.periods.months[0].subs.total, logs.periods.months[0].subs.total);
+  for (const command of ["status", "usage"] as const) {
+    const over: StatusOutputData & { periods: PeriodsJson | null } = await dataOf(w, command, options);
+    const after = at(over.subscriptions, 1);
+    assert.equal(after.label, "Codex (account)");
+    assert.deepEqual(after.tokens.today, before.tokens.today);
+    for (const period of ["week", "month"] as const) {
+      assert.equal(after.tokens[period].total, 2648, `${command}: ${period}`);
+      assert.equal(after.tokens[period].source, "mixed");
+      assert.deepEqual(logColumns(after.tokens[period]), logColumns(before.tokens[period]));
+    }
+    assert.deepEqual(after.calibration, before.calibration);
+    assert.deepEqual(over.tasks, logs.tasks);
+    assert.equal(Object.hasOwn(over, "codex_raw"), false);
+    const month = over.periods?.months.find(({ current }) => current);
+    assert.ok(month !== undefined);
+    assert.equal(month.subs.codex.account, 18);
+    assert.notEqual(month.subs.codex.account, after.tokens.month.total);
+    assert.deepEqual(month.subs.total, localMonth.subs.total);
+    assert.equal(month.subs.total.in + month.subs.total.out, SONNET_ALPHA_RAW + OPUS_BETA_RAW + 2855);
+  }
+  const tasks: { tasks: StatusData["tasks"] } = await dataOf(w, "tasks", options);
+  assert.deepEqual(tasks, { tasks: logs.tasks });
 });
 
 test("an optional Codex raw field does not change the version 1 snapshot check", async (t) => {

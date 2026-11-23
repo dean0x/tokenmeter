@@ -64,7 +64,7 @@ The exit code is 0 for success, 2 for `usage_error` and 1 for every other error.
 | `tokenmeter tasks sync` | Reads task windows and open items from stdin. |
 | `tokenmeter tasks` | Prints the tasks of the last result, with their shares of the week. |
 | `tokenmeter estimate` | Reads open items from stdin and prints an estimate for each. |
-| `tokenmeter doctor` | Prints counters only, to check that the logs are read. |
+| `tokenmeter doctor` | Prints counters only, to check that the logs are read. The `cross_day_claude_keys` counter excludes proxy replies. |
 | `tokenmeter record` | A filter for a status line. It copies stdin to stdout and stores the rate limits. |
 | `tokenmeter statusline` | A status line. It stores the rate limits and prints one short line. |
 | `tokenmeter hud` | Prints the stored Codex quota. It can start a background refresh. |
@@ -79,7 +79,12 @@ An unknown command or flag gives `usage_error`.
 
 `collect` stops after a fixed amount of bytes and time.
 A large backlog takes several passes.
-While it lasts, `status` shows `collect.state: counting` and a `progress_pct`.
+After this update, `collect` reads the Claude files it finds again once, within the normal budget.
+Only rows inside the store horizon can add tokens. A row that already counts does not count twice.
+If the month changes before the re-read ends, unread rows can fall outside the horizon.
+To estimate the number of passes, divide the Claude bytes found by the byte limit per pass and round up.
+Multiply the result by the interval between passes. The time limit or new log data can increase the wait.
+While a backlog remains, `status` shows `collect.state: counting` and a `progress_pct`.
 
 ## The data folder
 
@@ -98,6 +103,9 @@ Then the code is `data_dir_unsafe`, and nothing is written.
 The folder holds the token counts from 7 days before the start of the current month, in UTC. See "The horizon" in the section about the folder match.
 It also holds the totals of each local day for the last 400 days (`days.json`). See "Days, weeks and months".
 It also holds the quota samples, the task windows, the task history and the estimate log.
+`ledger.json` stores the Claude parser revision in `rev`. If the revision is absent or older, `collect` reads that file again from the start.
+`status.json` stores Codex raw log totals for today, the week, the month and each UTC date in `codex_raw`.
+That field holds only dates and token counts. It does not appear in command output.
 `account-usage.json` holds UTC dates and raw Codex account totals, the fetch time, and the last attempt time and result.
 It also holds an executable key for the retry schedule, but no account ID.
 A reply can have at most 100 rows. The file keeps 62 days through today and can also hold a row for tomorrow.
@@ -109,7 +117,7 @@ The folder holds no log file path, session ID or text from a session.
 |---|---|---|
 | `tokenmeter` was not found | `not_installed` | A tool that calls tokenmeter reports this when the command is missing. tokenmeter itself never prints it. |
 | Never collected | `not_collected` | Run `tokenmeter collect`. |
-| Scan backlog | ok, `collect.state: counting` | The first scan is not finished. `progress_pct` shows how far it is. |
+| Scan backlog | ok, `collect.state: counting` | The scan is not complete. This includes the one-time re-read after the update. `progress_pct` shows the progress. No period row is full. |
 | Damaged store file | `store_corrupt` | `collect` stops and writes nothing. Move the data folder away and run `collect` again. The counts come back from the logs. The task history does not. |
 | Store newer than the program | `store_newer` | A newer tokenmeter wrote the data. Nothing is written. Update tokenmeter. |
 | Store file too large | `store_too_large` | A store file would pass its size limit. `collect` stops and writes nothing. Move the data folder away and run `collect` again. The counts come back from the logs. The task history does not. |
@@ -149,6 +157,13 @@ The run-out time and `at_reset_pct` use the same burn and the same reading.
 A token count has five columns: input, cache write (5 minutes), cache write (1 hour), cache read and output.
 A weighted count adds them with the weights 1, 1.25, 2, 0.1 and 5.
 A message that appears twice in the logs counts once.
+
+A local proxy can send Claude Code requests to Codex and record the replies in a Claude log.
+An assistant row with no `requestId` key, an ID that starts with `resp_`, and a model name that starts with `gpt-` counts as Codex.
+The row keeps its model name. Rows of one reply count once per UTC date, with the largest output count.
+A `gpt-` row with a valid `requestId` counts as Claude. A row with no `requestId` and no match for the proxy rule does not count.
+If the proxy reports cache reads as input, those tokens get weight 1 instead of 0.1.
+This can make weighted counts too high and affect task `week_pct`, `pool_pct` and Codex calibration.
 
 A Codex event can state a cache write in `cache_write_input_tokens`.
 tokenmeter moves that amount from the input column to the cache write (5 minutes) column.
@@ -418,8 +433,8 @@ These limits are known. tokenmeter does not fix them:
 
 `collect` freezes a finished task into the task history. It does this once, more than 1 hour after the task ended, and only when the scan has no backlog.
 The history keeps the totals and the features that the task had at that time.
-A frozen row keeps its stored values.
-A later change of a rule does not change it. For example, an earlier Codex row keeps its old cache split.
+A frozen row keeps its stored values. Tasks that froze before the update keep their old totals.
+The freeze waits until the one-time re-read is complete.
 A feature that you send after the freeze does not reach the frozen task.
 There is no command to cost a frozen row again, and no command to unfreeze it.
 
@@ -579,6 +594,9 @@ If you go back to an older tokenmeter:
 - A build before 0.2.0 drops `basis_project` from estimate rows and `projects` from `self_check`. It ignores `basis_project` in the log.
 - It does not know `queue`. It passes `queue` through unchecked, as it finds it in the snapshot, until its next `collect` writes a snapshot without it.
 - A build before 0.3.0 ignores `account-usage.json`. It shows the label `Codex` and uses only the log totals.
+- Build 0.3.0 accepts the proxy keys and new fields without `store_corrupt`. It skips new proxy replies in the Claude logs.
+  Its `doctor` can count stored proxy keys in `cross_day_claude_keys`. Its `status` can show `codex_raw` from a newer snapshot.
+  When it writes the ledger, it drops `rev`. The current build then reads the Claude files it finds again within the normal scan budget.
 
 `tokenmeter tasks sync` refuses a window or an open item with a `stage` tag that is not a label, and counts it.
 Such an item has no estimate and writes no line to the log.
@@ -644,6 +662,7 @@ The backfill fills the days from all the data that tokenmeter still has:
 - The lines of the logs that are older than that horizon. These are the logs that `collect` reads. The backfill adds no other source.
   It reads each file from the start, for the last 400 days. It counts a line only when its day has no row in the bucket files, or when the line is before the first bucket row.
   So a line that the bucket files hold is not counted twice. A Claude message that appears twice counts once, with its largest output, for each UTC day.
+  Proxy replies count as Codex. The backfill does not add a proxy reply on a date that already has bucket rows.
   A Codex event counts once for each key. It does not count again when the dedupe days of the 15 minute horizon already hold its key.
 
 The backfill reads the files that hold only old lines first (a file time before the horizon). Then it reads the files with a newer file time.
@@ -689,8 +708,10 @@ Each log total has three fields: `raw`, `in` and `out`.
 `raw` has the five token columns and `weighted`. The Codex cache write columns are `null`.
 `in` is the sum of the input and cache columns without weights. `out` is the output. Both are whole numbers.
 
-Each day, week and month row also has `subs.codex.account`. It is the raw account sum for the row, or `null`.
-The account sum does not change `raw`, `in`, `out`, model totals or `full`.
+Each day, week and month row also has `subs.codex.account`. It is the raw account sum alone, or `null`.
+A date with no account row counts as zero in that sum if it lies inside the account date span.
+The account sum does not change `raw`, `in`, `out`, `subs.total`, model totals or `full`.
+For the Codex week and month total, use `subscriptions[].tokens`. Do not add `subs.codex.account` to the Codex log columns.
 
 A week and a month add their log totals from the days.
 The week starts on the day of `week_start`. `status --week-start sun|mon|tue|wed|thu|fri|sat` sets it.
@@ -715,12 +736,13 @@ Today and the month follow the time zone of the process.
 The days of `days.json` follow the zone of the `collect` process.
 `TZ` sets the zone, for example on a remote server: `TZ=Europe/Berlin tokenmeter collect`.
 
-Codex reports account totals by UTC date. A period row or a subscription month matches those date names without a time zone shift.
-The subscription week uses UTC noon to select dates. Noon must be at or after the week start and before the week end.
-After a reset, the account sum uses the new week, but the saved `week` and log columns stay the same until the next `collect`.
-Without a reset time, the account sum uses the last seven days at the 15-minute boundary.
-The sum uses the dates between the oldest and newest stored dates. A gap between those dates counts as zero.
-A period that overlaps only part of that span can show a partial sum. A period outside the span has no account sum.
+Codex reports account totals by UTC date. A period row matches those date names without a time zone shift.
+The Codex subscription month uses the date names of the local month to select UTC dates.
+The Codex subscription week selects whole UTC dates for both sources. Noon must be at or after the week start and before the week end.
+After a reset, that sum uses the new week. The saved `week` and log columns stay the same until the next `collect`.
+Without a reset time, the sum uses the last seven days at the 15-minute boundary.
+The account-only sum for period rows uses the dates between the oldest and newest stored dates. A gap in that span counts as zero.
+A period that overlaps only part of that span can show a partial account sum. A period outside the span has no account sum.
 
 ## Three ways to use it
 
@@ -793,11 +815,26 @@ tokenmeter estimate < items.json
 Check `ok` and `schema` before you use `data`.
 The names of the fields are in snake_case. Times are in milliseconds since 1970.
 
-Match subscriptions by `id`, not by `label`. The Codex label is `Codex (account)` if its week or month uses account data.
-Each subscription token period has `total` in raw tokens and `source` as `logs` or `account`.
+Match subscriptions by `id`, not by `label`.
+Each subscription token period has `total` in raw tokens and `source` as `logs`, `account` or `mixed`.
 Today always uses the logs. Claude uses the logs for all periods.
+
+For the Codex week and month, use the account value for each UTC date it reports.
+For other dates, use the Codex log total for that UTC date. A `mixed` total adds no date twice.
+The account can report a date about one day late. If a date has a partial account value, it still takes precedence over the logs.
+If a date has no account row and is outside the store horizon, it adds no tokens.
+
+- `logs`: No account date is in the period, or the account file is absent, damaged or old. Use the exact log total for the period.
+  A Codex `logs` total includes all five raw columns, including cache writes.
+- `account`: The period has account dates and no log-only date adds tokens.
+- `mixed`: The period has account dates and at least one log-only date adds tokens.
+
+The label is `Codex (account)` if the week or month is `account` or `mixed`. Otherwise it is `Codex`.
+Treat any `source` other than `logs` as a total that includes account data.
 When account dates are available, `subscriptions[].account` gives the fetch time (`at`) and the newest date (`through`).
 Otherwise it is `null`.
+If `codex_raw` is absent or damaged, the Codex week and month use `logs`, but `account` can still have a value.
+Until the next `collect`, the log total uses the visible columns, which omit Codex cache writes.
 
 `weighted` still applies the weights to the five local log columns. It does not use `total`.
 Models, shares, calibration and forecasts do not use the account total.

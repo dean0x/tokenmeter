@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- Count use from a local proxy that sends Claude Code requests to Codex. Task shares and calibration include this use. If the proxy reports cache reads as input, the weighted counts can be too high.
+- Run a one-time re-read of Claude log files after the update, within the normal scan budget. The ledger field `rev` records the parser revision. Rows outside the store horizon stay out, and frozen tasks keep their totals.
+- For the Codex week and month, use the account for each UTC date it reports and the logs for the other dates. The account can report a date about one day late, so `source` can be `mixed`. With no account date in the period, use the log total. Codex log totals include cache writes.
+
 ## 0.3.0
 
 - Show Codex account token totals in `status` and `usage`, with use from other machines and clients. Use local log totals when account data is absent or too old.
