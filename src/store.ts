@@ -714,7 +714,10 @@ export class Store {
   // Claude, as applyClaude does for one UTC day: the largest output wins and the
   // earliest slot wins. Nothing here reaches the bucket rows or the dedupe days.
   backfillClaude(key: string, incoming: DedupeEntry): void {
-    if (this.#backfillDate(incoming[SLOT_INDEX]) === null) return;
+    const date = this.#backfillDate(incoming[SLOT_INDEX]);
+    if (date === null) return;
+    // Proxy replies cannot fill part of a date that already has bucket rows.
+    if (providerOfClaudeKey(key) === "codex" && this.#guard?.dates.has(date)) return;
     const mapKey = `${dayOfSlot(incoming[SLOT_INDEX])}|${key}`;
     const existing = this.#oldClaude.get(mapKey);
     if (existing === undefined) {

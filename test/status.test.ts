@@ -184,6 +184,7 @@ test("missing and invalid Codex raw fields use log totals but keep account detai
   const { codex_raw, ...input } = data([CODEX], []);
   const raw = { today: 7, week: 8, month: 9, utc_days: {} };
   const invalid = [null, [], { ...raw, today: -1 }, { ...raw, week: Infinity }, { ...raw, month: "9" },
+    { ...raw, today: 1.5 }, { ...raw, utc_days: { "2026-11-01": Number.MAX_SAFE_INTEGER + 1 } },
     { ...raw, utc_days: [] }, { ...raw, utc_days: { "2026-11-31": 1 } }, { ...raw, utc_days: { "2026-11-01": -1 } },
     { ...raw, utc_days: Object.fromEntries(Array.from({ length: 65 }, (_, i) => [shiftDate("2026-09-01", i), 1])) }];
   for (const snapshot of [input, ...invalid.map((value) => ({ ...input, codex_raw: value }) as StatusData)]) {

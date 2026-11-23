@@ -366,7 +366,8 @@ for (const rebuild of [false, true]) {
     }
     put(
       claudeFile(w, "proxy"),
-      proxyLine("covered", "2026-08-10T12:00:00Z", 50) +
+      proxyLine("before-first-slot", "2026-08-10T09:00:00Z", 20) +
+        proxyLine("covered", "2026-08-10T12:00:00Z", 50) +
         proxyLine("uncovered", "2026-09-10T10:00:00Z", 10) +
         proxyLine("uncovered", "2026-09-10T10:01:00Z", 30),
     );

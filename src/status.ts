@@ -1019,21 +1019,17 @@ const CODEX_UTC_DAYS_MAX = 64;
 
 type CodexRaw = Omit<CodexRawJson, "utc_days"> & { readonly utc_days: ReadonlyMap<string, number> };
 
-function isRawCount(value: unknown): value is number {
-  return isNumber(value) && value >= 0;
-}
-
 function codexRawOf(value: unknown): CodexRaw | null {
   const row = asRow(value);
   if (row === null) return null;
   const { today, week, month, utc_days } = row;
   const days = asRow(utc_days);
-  if (!isRawCount(today) || !isRawCount(week) || !isRawCount(month) || days === null) return null;
+  if (!isCountValue(today) || !isCountValue(week) || !isCountValue(month) || days === null) return null;
   const entries = Object.entries(days);
   if (entries.length > CODEX_UTC_DAYS_MAX) return null;
   const parsed = new Map<string, number>();
   for (const [date, count] of entries) {
-    if (!isDateName(date) || !isRawCount(count)) return null;
+    if (!isDateName(date) || !isCountValue(count)) return null;
     parsed.set(date, count);
   }
   return { today, week, month, utc_days: parsed };
