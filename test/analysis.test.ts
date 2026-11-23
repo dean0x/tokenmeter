@@ -120,6 +120,19 @@ function sub(analysis: Analysis, provider: Provider): SubscriptionUsage {
   return found;
 }
 
+test("analysis sums all five Codex columns by UTC date across the store horizon", () => {
+  const rows = [
+    row(utc("2026-10-25T12:00:00Z"), "codex", "m", { input: 9 }),
+    row(utc("2026-11-04T23:45:00Z"), "codex", "m", { input: 1, cacheWrite5m: 2, cacheWrite1h: 3, cacheRead: 4, output: 5 }),
+    row(utc("2026-11-05T00:00:00Z"), "codex", "m", { input: 6 }),
+    row(utc("2026-11-05T00:00:00Z"), "codex", "n", { output: 7 }),
+    row(utc("2026-11-05T00:00:00Z"), "claude", "m", { input: 100 }),
+    row(utc("2026-11-03T00:00:00Z"), "codex", "m", {}),
+  ];
+  const analysis = run({ rows, zone: must(zoneNamed("Europe/Berlin")) });
+  assert.deepEqual(analysis.codexUtcDays, new Map([["2026-10-25", 9], ["2026-11-04", 15], ["2026-11-05", 13]]));
+});
+
 // ---------------------------------------------------------------------------
 // Zones
 // ---------------------------------------------------------------------------

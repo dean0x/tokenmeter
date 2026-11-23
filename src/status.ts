@@ -26,8 +26,10 @@ import {
   STORE_VERSION,
   SYNC_MAX_OPEN_ITEMS,
   asRow,
+  compareText,
   isLabel,
   ok,
+  rawTokens,
 } from "./core.ts";
 import {
   type Analysis,
@@ -45,9 +47,9 @@ import {
   forecastFrom,
   periodSlots,
 } from "./analysis.ts";
-import { accountSum, isFreshAccount, type AccountUsage } from "./account-usage.ts";
+import { ACCOUNT_MAX_ROWS, isFreshAccount, type AccountUsage } from "./account-usage.ts";
 import type { CollectReport, RootState } from "./collect.ts";
-import { localDateOf, monthStartDate, nextMonthStartDate } from "./days.ts";
+import { isDateName, localDateOf, monthStartDate, nextMonthStartDate, shiftDate } from "./days.ts";
 import {
   type EstimateItem,
   type EstimateLogLine,
@@ -159,7 +161,7 @@ export interface SubscriptionJson {
   readonly calibration: CalibrationJson | null;
 }
 
-export type TokenSource = "logs" | "account";
+export type TokenSource = "logs" | "account" | "mixed";
 
 export interface PeriodTotalJson extends TokenColumnsJson {
   readonly total: number;
@@ -318,6 +320,10 @@ export interface QueueJson {
   readonly spent_pct: number | null;
 }
 
+interface CodexRawJson extends Readonly<Record<PeriodName, number>> {
+  readonly utc_days: Readonly<Record<string, number>>;
+}
+
 export interface StatusData {
   readonly version: number;
   readonly written_at: number;
@@ -333,9 +339,11 @@ export interface StatusData {
   // more than 500 open items. It is not part of the check of a snapshot: a bad
   // queue reads as null and never makes the snapshot corrupt.
   readonly queue: QueueJson | null;
+  // The output overlay checks this optional field, not the snapshot reader.
+  readonly codex_raw?: CodexRawJson;
 }
 
-export interface StatusOutputData extends StatusData {
+export interface StatusOutputData extends Omit<StatusData, "codex_raw"> {
   readonly subscriptions: readonly SubscriptionOutputJson[];
 }
 
@@ -922,6 +930,7 @@ export function buildStatus(input: BuildInput): BuiltStatus {
     const usage = analysis.subscriptions.find((s) => s.provider === provider);
     return usage === undefined ? null : subscriptionJson(usage, input.roots[provider]);
   }).filter((entry): entry is SubscriptionJson => entry !== null);
+  const codex = analysis.subscriptions.find((sub) => sub.provider === "codex")?.tokens;
   const data: StatusData = {
     version: STORE_VERSION,
     written_at: input.nowMs,
@@ -941,6 +950,12 @@ export function buildStatus(input: BuildInput): BuiltStatus {
     self_check: check === null ? UNREADABLE_SELF_CHECK : selfCheckJson(check),
     pool: { mode: "separate" },
     queue: queueJson(queueSum(items, input.history, calibrations, ESTIMATE_SUBSCRIPTION)),
+    codex_raw: {
+      today: codex === undefined ? 0 : rawTokens(codex.today),
+      week: codex === undefined ? 0 : rawTokens(codex.week),
+      month: codex === undefined ? 0 : rawTokens(codex.month),
+      utc_days: Object.fromEntries([...analysis.codexUtcDays].sort(([a], [b]) => compareText(a, b))),
+    },
   };
   return {
     data: refreshShares(data, input.pool, input.nowMs),
@@ -1000,10 +1015,40 @@ export function overlayClaudeQuota(data: StatusData, latest: LatestQuota, pool: 
   );
 }
 
-function periodTotal(columns: TokenColumnsJson, account: number | null): PeriodTotalJson {
-  if (account !== null) return { ...columns, total: account, source: "account" };
-  const raw = [columns?.input, columns?.cache_write, columns?.cache_write_1h, columns?.cache_read, columns?.output];
-  const total = raw.reduce<number>((sum, value) => sum + finiteOrZero(value ?? 0), 0);
+const CODEX_UTC_DAYS_MAX = 64;
+
+type CodexRaw = Omit<CodexRawJson, "utc_days"> & { readonly utc_days: ReadonlyMap<string, number> };
+
+function isRawCount(value: unknown): value is number {
+  return isNumber(value) && value >= 0;
+}
+
+function codexRawOf(value: unknown): CodexRaw | null {
+  const row = asRow(value);
+  if (row === null) return null;
+  const { today, week, month, utc_days } = row;
+  const days = asRow(utc_days);
+  if (!isRawCount(today) || !isRawCount(week) || !isRawCount(month) || days === null) return null;
+  const entries = Object.entries(days);
+  if (entries.length > CODEX_UTC_DAYS_MAX) return null;
+  const parsed = new Map<string, number>();
+  for (const [date, count] of entries) {
+    if (!isDateName(date) || !isRawCount(count)) return null;
+    parsed.set(date, count);
+  }
+  return { today, week, month, utc_days: parsed };
+}
+
+interface MergedSum {
+  readonly total: number;
+  readonly logs: boolean;
+}
+
+function periodTotal(columns: TokenColumnsJson, merged: MergedSum | null, raw: number | null): PeriodTotalJson {
+  if (merged !== null) return { ...columns, total: merged.total, source: merged.logs ? "mixed" : "account" };
+  if (raw !== null) return { ...columns, total: raw, source: "logs" };
+  const values = [columns?.input, columns?.cache_write, columns?.cache_write_1h, columns?.cache_read, columns?.output];
+  const total = values.reduce<number>((sum, value) => sum + finiteOrZero(value ?? 0), 0);
   return { ...columns, total: finiteOrZero(total), source: "logs" };
 }
 
@@ -1013,11 +1058,35 @@ function midpointDateAtOrAfter(ms: number): string | null {
   return Number.isFinite(date.getTime()) ? date.toISOString().slice(0, 10) : null;
 }
 
-function weekAccountSum(account: AccountUsage, week: SubscriptionJson["week"], nowMs: number): number | null {
+// Account rows own their dates, even when a row reports zero tokens.
+function mergedSum(
+  account: AccountUsage, local: ReadonlyMap<string, number>, from: string, until: string,
+): MergedSum | null {
+  if (account.rows.length > ACCOUNT_MAX_ROWS || from >= until) return null;
+  const accountDates = new Set<string>();
+  let total = 0;
+  for (const [date, count] of account.rows) {
+    if (date < from || date >= until) continue;
+    accountDates.add(date);
+    total += count;
+  }
+  if (accountDates.size === 0) return null;
+  let logs = false;
+  for (const [date, count] of local) {
+    if (date < from || date >= until || count <= 0 || accountDates.has(date)) continue;
+    total += count;
+    logs = true;
+  }
+  return { total: finiteOrZero(total), logs };
+}
+
+function weekMergedSum(
+  account: AccountUsage, local: ReadonlyMap<string, number>, week: SubscriptionJson["week"], nowMs: number, tomorrow: string,
+): MergedSum | null {
   const { start, end } = currentWeek(week.kind === "reset" ? week : null, nowMs);
   const from = midpointDateAtOrAfter(start);
   const until = midpointDateAtOrAfter(end);
-  return from === null || until === null ? null : accountSum(account, from, until);
+  return from === null || until === null ? null : mergedSum(account, local, from, until < tomorrow ? until : tomorrow);
 }
 
 // Add output fields after the quota overlay. The snapshot and its weighted
@@ -1025,28 +1094,32 @@ function weekAccountSum(account: AccountUsage, week: SubscriptionJson["week"], n
 export function overlayCodexAccount(
   data: StatusData, account: AccountUsage | null, zone: Zone, nowMs: number,
 ): StatusOutputData {
+  const { codex_raw, ...output } = data;
+  const codexRaw = codexRawOf(codex_raw);
   const fresh = account !== null && isFreshAccount(account.at, nowMs) ? account : null;
   return {
-    ...data,
+    ...output,
     subscriptions: data.subscriptions.map((sub) => {
       const usage = sub.id === "codex" ? fresh : null;
+      const raw = sub.id === "codex" ? codexRaw : null;
       const through = usage?.rows.at(-1)?.[0];
+      const details = usage !== null && through !== undefined ? { at: usage.at, through } : null;
       let week = null;
       let month = null;
-      let details = null;
-      if (usage !== null && through !== undefined) {
+      if (usage !== null && details !== null && raw !== null) {
+        const tomorrow = shiftDate(new Date(nowMs).toISOString().slice(0, 10), 1);
+        week = weekMergedSum(usage, raw.utc_days, sub.week, nowMs, tomorrow);
         const first = monthStartDate(localDateOf(zone, nowMs));
-        week = weekAccountSum(usage, sub.week, nowMs);
-        month = accountSum(usage, first, nextMonthStartDate(first));
-        details = { at: usage.at, through };
+        const next = nextMonthStartDate(first);
+        month = mergedSum(usage, raw.utc_days, first, next < tomorrow ? next : tomorrow);
       }
       return {
         ...sub,
-        label: sub.id === "codex" && (week !== null || month !== null) ? "Codex (account)" : sub.label,
+        label: week !== null || month !== null ? "Codex (account)" : sub.label,
         tokens: {
-          today: periodTotal(sub.tokens.today, null),
-          week: periodTotal(sub.tokens.week, week),
-          month: periodTotal(sub.tokens.month, month),
+          today: periodTotal(sub.tokens.today, null, raw?.today ?? null),
+          week: periodTotal(sub.tokens.week, week, raw?.week ?? null),
+          month: periodTotal(sub.tokens.month, month, raw?.month ?? null),
         },
         account: details,
       };

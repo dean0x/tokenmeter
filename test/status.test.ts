@@ -95,7 +95,11 @@ function task(label: string, shares: readonly ShareJson[]): TaskJson {
 }
 
 function data(subscriptions: readonly SubscriptionJson[], tasks: readonly TaskJson[]): StatusData {
+  const codex = subscriptions.find((sub) => sub.id === "codex")?.tokens;
+  const raw = (period: TokenColumnsJson | undefined): number => period === undefined ? 0 :
+    period.input + (period.cache_write ?? 0) + (period.cache_write_1h ?? 0) + period.cache_read + period.output;
   return {
+    codex_raw: { today: raw(codex?.today), week: raw(codex?.week), month: raw(codex?.month), utc_days: {} },
     version: 1,
     written_at: START + HOUR,
     collect: { at: START + HOUR, state: "ok", progress_pct: 100 },
@@ -122,7 +126,7 @@ function firstShare(result: StatusData, index = 0): ShareJson {
 const UTC: Zone = { offsetMs: () => 0 };
 const CODEX: SubscriptionJson = { ...subscription("codex", 200, 25), label: "Codex" };
 const RAW = { input: 7, cache_write: 2, cache_write_1h: 3, cache_read: 5, output: 11, weighted: 200 };
-const FRESH: AccountUsage = { at: NOW, rows: [["2026-11-01", 800], ["2026-11-08", 200]] };
+const FRESH: AccountUsage = { at: NOW, rows: [["2026-10-31", 200], ["2026-11-01", 800]] };
 
 function overlay(input: StatusData, account: AccountUsage | null, zone = UTC, nowMs = NOW) {
   return overlayCodexAccount(input, account, zone, nowMs);
@@ -132,11 +136,11 @@ test("the Codex account supplies week and month totals, but not today", () => {
   const codex = { ...CODEX, tokens: { today: RAW, week: RAW, month: RAW } };
   const [result] = overlay(data([codex], []), FRESH).subscriptions;
   assert.deepEqual(result, {
-    ...codex, label: "Codex (account)", account: { at: NOW, through: "2026-11-08" },
+    ...codex, label: "Codex (account)", account: { at: NOW, through: "2026-11-01" },
     tokens: {
       today: { ...RAW, total: 28, source: "logs" },
       week: { ...RAW, total: 800, source: "account" },
-      month: { ...RAW, total: 1000, source: "account" },
+      month: { ...RAW, total: 800, source: "account" },
     },
   });
   const rows = new DayRows(true);
@@ -145,6 +149,52 @@ test("the Codex account supplies week and month totals, but not today", () => {
     rows, zone: UTC, nowMs: NOW, weekStart: "sun", collect: { at: NOW, complete: true }, account: FRESH, maxBytes: 4096,
   });
   assert.equal(months[0]?.subs.codex.account, result?.tokens.month.total);
+});
+
+test("each date uses the account when present and counts each log-only date once", () => {
+  const at = Date.parse("2026-11-05T23:00:00Z");
+  const input = {
+    ...data([CODEX], []),
+    codex_raw: { today: 400, week: 1200, month: 1200, utc_days: {
+      "2026-11-01": 500, "2026-11-02": 300, "2026-11-04": 0, "2026-11-05": 400, "2026-11-06": 10000,
+    } },
+  };
+  const account = { at, rows: [["2026-11-01", 10], ["2026-11-03", 20], ["2026-11-05", 0], ["2026-11-06", 1000]] } as const;
+  const result = overlay(input, account, UTC, at);
+  const tokens = result.subscriptions[0]?.tokens;
+  assert.deepEqual([tokens?.week.total, tokens?.month.total, tokens?.today.total], [330, 330, 400]);
+  assert.deepEqual([tokens?.week.source, tokens?.month.source, tokens?.today.source], ["mixed", "mixed", "logs"]);
+  assert.equal(result.subscriptions[0]?.label, "Codex (account)");
+  assert.equal(Object.hasOwn(result, "codex_raw"), false);
+});
+
+test("a reported zero date takes precedence and zero log dates do not make a mixed total", () => {
+  const at = Date.parse("2026-11-02T12:00:00Z");
+  const input = {
+    ...data([CODEX], []),
+    codex_raw: { today: 0, week: 99, month: 99, utc_days: { "2026-11-01": 99, "2026-11-02": 0 } },
+  };
+  const account = { at, rows: [["2026-11-01", 0]] } as const;
+  const [sub] = overlay(input, account, UTC, at).subscriptions;
+  assert.deepEqual([sub?.tokens.week.total, sub?.tokens.week.source], [0, "account"]);
+  assert.deepEqual([sub?.tokens.month.total, sub?.tokens.month.source], [0, "account"]);
+});
+
+test("missing and invalid Codex raw fields use log totals but keep account details", () => {
+  const { codex_raw, ...input } = data([CODEX], []);
+  const raw = { today: 7, week: 8, month: 9, utc_days: {} };
+  const invalid = [null, [], { ...raw, today: -1 }, { ...raw, week: Infinity }, { ...raw, month: "9" },
+    { ...raw, utc_days: [] }, { ...raw, utc_days: { "2026-11-31": 1 } }, { ...raw, utc_days: { "2026-11-01": -1 } },
+    { ...raw, utc_days: Object.fromEntries(Array.from({ length: 65 }, (_, i) => [shiftDate("2026-09-01", i), 1])) }];
+  for (const snapshot of [input, ...invalid.map((value) => ({ ...input, codex_raw: value }) as StatusData)]) {
+    const result = overlay(snapshot, FRESH);
+    const [sub] = result.subscriptions;
+    const log = { ...columns(200), total: 200, source: "logs" };
+    assert.deepEqual(sub?.tokens, { today: log, week: log, month: log });
+    assert.equal(sub?.label, "Codex");
+    assert.deepEqual(sub?.account, { at: NOW, through: "2026-11-01" });
+    assert.equal(Object.hasOwn(result, "codex_raw"), false);
+  }
 });
 
 test("Claude always shows the log totals, and Codex uses the same keys without an account", () => {
@@ -204,19 +254,21 @@ test("missing, non-number and non-finite columns do not enter the log total", ()
   assert.deepEqual([periods?.today.total, periods?.week.total, periods?.month.total], [7, 200, 0]);
 });
 
-for (const [name, edge] of [
-  ["Europe/Berlin", "2026-10-31T23:00:00Z"],
-  ["America/New_York", "2026-11-01T04:00:00Z"],
-  ["Pacific/Auckland", "2026-10-31T11:00:00Z"],
+for (const [name, edge, atEdge] of [
+  ["Europe/Berlin", "2026-10-31T23:00:00Z", 200],
+  ["America/New_York", "2026-11-01T04:00:00Z", 19],
+  ["Pacific/Auckland", "2026-10-31T11:00:00Z", 200],
 ] as const) {
-  test(`the Codex month uses the local month at the boundary in ${name}`, () => {
+  test(`the Codex month uses the local month but skips future UTC dates in ${name}`, () => {
     const zone = zoneNamed(name);
     assert.ok(zone.ok);
     const at = Date.parse(edge);
     const account: AccountUsage = { at, rows: [["2026-10-31", 17], ["2026-11-01", 19]] };
     const input = data([CODEX], []);
-    const months = [at - 1, at].map((nowMs) => overlay(input, account, zone.value, nowMs).subscriptions[0]?.tokens.month.total);
-    assert.deepEqual(months, [17, 19]);
+    const months = [at - 1, at, START + 4 * HOUR].map((nowMs) =>
+      overlay(input, account, zone.value, nowMs).subscriptions[0]?.tokens.month.total,
+    );
+    assert.deepEqual(months, [17, atEdge, 19]);
   });
 }
 
@@ -230,13 +282,26 @@ for (const [time, minutes, firstTotal, nextTotal] of [
     const start = START + minutes * 60_000;
     const week = { start, end: start + WEEK_MS, kind: "reset" } as const;
     const input = data([{ ...CODEX, week }], []);
-    const [first, next] = [start, week.end].map((nowMs) =>
+    const [first, next] = [week.end - 1, week.end + WEEK_MS - 1].map((nowMs) =>
       overlay(input, { at: nowMs, rows: WEEK_ROWS }, UTC, nowMs).subscriptions[0],
     );
     assert.deepEqual([first?.tokens.week.total, next?.tokens.week.total], [firstTotal, nextTotal]);
     assert.deepEqual(next?.week, week);
   });
 }
+
+test("one UTC-noon week edge applies to log and account dates", () => {
+  const start = START + 12 * HOUR + 1;
+  const at = Date.parse("2026-11-05T23:00:00Z");
+  const week = { start, end: start + WEEK_MS, kind: "reset" } as const;
+  const input = {
+    ...data([{ ...CODEX, week }], []),
+    codex_raw: { today: 0, week: 90, month: 90, utc_days: { "2026-11-01": 80, "2026-11-02": 10 } },
+  };
+  const account = { at, rows: [["2026-11-01", 40], ["2026-11-03", 20]] } as const;
+  const [sub] = overlay(input, account, UTC, at).subscriptions;
+  assert.deepEqual([sub?.tokens.week.total, sub?.tokens.month.total], [30, 70]);
+});
 
 test("an old reset week rolls over multiple weeks, but a rolling week takes the newest slots", () => {
   const oldWeek = { start: START - WEEK_MS, end: START };
@@ -245,7 +310,7 @@ test("an old reset week rolls over multiple weeks, but a rolling week takes the 
     const input = data([{ ...CODEX, week: { ...oldWeek, kind } }], []);
     return overlay(input, { at: nowMs, rows: WEEK_ROWS }, UTC, nowMs).subscriptions[0]?.tokens.week.total;
   });
-  assert.deepEqual(totals, [16256, 254]);
+  assert.deepEqual(totals, [128, 254]);
 });
 
 test("a month with partial account coverage uses account data and a week outside coverage uses logs", () => {
@@ -255,7 +320,7 @@ test("a month with partial account coverage uses account data and a week outside
   const [gap, outside] = [Date.parse("2026-11-09T00:00:00Z"), nowMs].map((at) =>
     overlay(input, { ...account, at }, UTC, at).subscriptions[0],
   );
-  assert.deepEqual([gap?.tokens.week.total, gap?.tokens.week.source], [0, "account"]);
+  assert.deepEqual([gap?.tokens.week.total, gap?.tokens.week.source], [200, "logs"]);
   assert.deepEqual([outside?.tokens.week.total, outside?.tokens.week.source], [200, "logs"]);
   assert.deepEqual([outside?.tokens.month.total, outside?.tokens.month.source, outside?.label], [30, "account", "Codex (account)"]);
 });
@@ -1331,7 +1396,7 @@ function openItems(count: number): BuildInput["openItems"] {
 
 test("TP-43: a built status has the queue right after the pool: count of the open items, and no sums while the week is not known", () => {
   const built = buildStatus({ ...buildInput([], history([100, 200, 300])), openItems: openItems(2) }).data;
-  assert.deepEqual(Object.keys(built).slice(-2), ["pool", "queue"]);
+  assert.deepEqual(Object.keys(built).slice(-3), ["pool", "queue", "codex_raw"]);
   assert.deepEqual(built.queue, { count: 2, ...NO_SUMS });
   assert.deepEqual(Object.keys(built.queue ?? {}), QUEUE_KEYS);
 });
@@ -1352,6 +1417,7 @@ test("TP-63: a snapshot from before the change keeps its old fields through refr
   const none = { key: "N", subscription: "claude", basis: "none", basis_name: "none" };
   const older = { ...data([], []), estimates: [ranged, none], self_check: { ...stage, stages: { plan: stage } } } as unknown as Record<string, unknown>;
   delete older["queue"];
+  delete older["codex_raw"];
 
   const read = refreshShares(older as unknown as StatusData, SEPARATE, NOW);
 

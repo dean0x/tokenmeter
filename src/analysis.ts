@@ -16,6 +16,7 @@ import {
   compareText,
   ok,
   percentile,
+  rawTokens,
   weighted,
 } from "./core.ts";
 import { type FsDeps, defaultDeps } from "./fsafe.ts";
@@ -35,6 +36,8 @@ import type { QuotaWindow } from "./sources.ts";
 import {
   type Provider,
   type StoreError,
+  dayName,
+  dayOfSlot,
   horizonStartMs,
   loadBucketMonth,
   monthName,
@@ -124,6 +127,7 @@ export interface Analysis {
   readonly subscriptions: readonly SubscriptionUsage[];
   // Every model with tokens in a period, the largest week first.
   readonly models: readonly ModelUsage[];
+  readonly codexUtcDays: ReadonlyMap<string, number>;
 }
 
 export interface AnalysisInput {
@@ -440,6 +444,18 @@ function perProvider<T>(make: (provider: Provider) => T): Record<Provider, T> {
   return { claude: make("claude"), codex: make("codex") };
 }
 
+function codexRawByUtcDate(rows: readonly BucketRow[]): ReadonlyMap<string, number> {
+  const days = new Map<string, number>();
+  for (const row of rows) {
+    if (row.provider !== "codex") continue;
+    const raw = rawTokens(row.tokens);
+    if (raw === 0) continue;
+    const date = dayName(dayOfSlot(row.slot));
+    days.set(date, (days.get(date) ?? 0) + raw);
+  }
+  return days;
+}
+
 export function analyze(input: AnalysisInput): Analysis {
   const { nowMs, zone, rows, samples, observations, collectState } = input;
   const today = todayPeriod(zone, nowMs);
@@ -490,7 +506,7 @@ export function analyze(input: AnalysisInput): Analysis {
   const models = [...byModel.values()]
     .map((m): ModelUsage => ({ provider: m.provider, name: m.name, tokens: periodTotals(m.acc) }))
     .sort(compareModels);
-  return { today, month, subscriptions, models };
+  return { today, month, subscriptions, models, codexUtcDays: codexRawByUtcDate(rows) };
 }
 
 // ---------------------------------------------------------------------------

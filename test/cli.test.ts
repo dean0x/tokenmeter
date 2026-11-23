@@ -50,7 +50,7 @@ import {
 } from "../src/quota.ts";
 import { FILE_CAPS, loadDayRows } from "../src/store.ts";
 import { RECORD_DEADLINE_MS, type RecordIo, runRecord } from "../src/record.ts";
-import type { PeriodTotalJson, StatusData } from "../src/status.ts";
+import { readSnapshot, type PeriodTotalJson, type StatusData } from "../src/status.ts";
 import { NO_DATA_LINE, renderStatusline, runStatusline } from "../src/statusline.ts";
 import { type Sandbox, assertGuarded, installSuiteGuard, makeSandbox } from "./helpers.ts";
 import { TIMING_RUNS, judgeTiming, measurePaired, writeBaselineScript } from "./timing.ts";
@@ -214,8 +214,8 @@ async function collectOk(w: World, options: CliOptions = {}): Promise<Envelope> 
   return run.env;
 }
 
-async function dataOf(w: World, command: string): Promise<Envelope["data"]> {
-  const run = await cli(w, [command]);
+async function dataOf(w: World, command: string, options: CliOptions = {}): Promise<Envelope["data"]> {
+  const run = await cli(w, [command], options);
   assert.equal(run.code, 0, run.text);
   return run.env.data;
 }
@@ -833,6 +833,67 @@ test("TP-32: snapshot queries read the account once, add its totals and preserve
   assert.equal(readFileSync(snapshotPath, "utf8"), snapshot);
 });
 
+test("collect stores five-column Codex totals and status adds only the dates missing from the account", async (t) => {
+  const w = makeWorld(t);
+  seedFixtures(w);
+  recordPoints(w, 5, 10);
+  put(claudeFile(w, "proxy"), ["02", "03"].map((day) => `${JSON.stringify({
+    type: "assistant", timestamp: `2026-11-${day}T08:00:00Z`, cwd: "/work/alpha",
+    message: { id: `resp_fixture_${day}`, model: "gpt-test", usage: {
+      input_tokens: 100, output_tokens: 50, cache_creation_input_tokens: 30, cache_read_input_tokens: 20,
+    } },
+  })}\n`).join(""));
+  const options = { io: withEnv(w, POOL_ENV) };
+  assert.equal((await cli(w, ["tasks", "sync"], { ...options, stdin: SYNC_BODY })).code, 0);
+  await collectOk(w, options);
+  const logs = await dataOf(w, "status", options);
+  const before = logs.subscriptions[1];
+  const read = readSnapshot(dataDir(w), DEPS);
+  assert.ok(read.ok && read.value?.data);
+  assert.deepEqual(read.value.data.codex_raw, {
+    today: 2605, week: 2805, month: 2805, utc_days: { "2026-11-02": 200, "2026-11-03": 2605 },
+  });
+  assert.deepEqual([before.tokens.today.total, before.tokens.week.total, before.tokens.month.total], [2605, 2805, 2805]);
+  assert.equal(before.tokens.today.cache_write, null);
+
+  writeFileSync(join(dataDir(w), ACCOUNT_USAGE_FILE), accountText(ACCOUNT_ROWS.slice(0, 2)), { mode: 0o600 });
+  const over = await dataOf(w, "status", options);
+  const after = over.subscriptions[1];
+  assert.deepEqual(after.tokens.today, before.tokens.today);
+  assert.deepEqual([after.tokens.week.total, after.tokens.month.total], [2623, 2623]);
+  assert.deepEqual([after.tokens.week.source, after.tokens.month.source], ["mixed", "mixed"]);
+  assert.deepEqual(logColumns(after.tokens.week), logColumns(before.tokens.week));
+  assert.notEqual(before.calibration, null);
+  assert.deepEqual(after.calibration, before.calibration);
+  assert.equal(logs.pool.mode, "combined");
+  assert.ok(logs.tasks.some((task: StatusData["tasks"][number]) => task.pool_pct !== null &&
+    task.shares.some((share) => share.subscription === "codex" && share.weighted > 0)));
+  assert.deepEqual(over.tasks, logs.tasks);
+  assert.equal(Object.hasOwn(over, "codex_raw"), false);
+  assert.equal(over.periods.months[0].subs.codex.account, 18);
+  assert.deepEqual(over.periods.months[0].subs.total, logs.periods.months[0].subs.total);
+});
+
+test("an optional Codex raw field does not change the version 1 snapshot check", async (t) => {
+  const w = makeWorld(t);
+  seedFixtures(w);
+  await collectOk(w);
+  writeFileSync(join(dataDir(w), ACCOUNT_USAGE_FILE), accountText(), { mode: 0o600 });
+  const path = join(dataDir(w), "status.json");
+  const { data: { codex_raw, ...snapshotData }, ...body } = JSON.parse(readFileSync(path, "utf8"));
+  assert.equal(body.version, 1);
+
+  for (const raw of [undefined, { ...codex_raw, utc_days: [] }]) {
+    writeFileSync(path, JSON.stringify({ ...body, data: { ...snapshotData, codex_raw: raw } }));
+    const read = readSnapshot(dataDir(w), DEPS);
+    assert.ok(read.ok && read.value?.data);
+    const { subscriptions: [, codex], ...output } = await dataOf(w, "status");
+    assert.deepEqual([codex.tokens.week.source, codex.tokens.month.source, codex.label], ["logs", "logs", "Codex"]);
+    assert.deepEqual(codex.account, { at: NOW, through: "2026-11-03" });
+    assert.equal(Object.hasOwn(output, "codex_raw"), false);
+  }
+});
+
 function mockForeignAccountOwner(t: TestContext, path: string): void {
   const account = statSync(path);
   const fstat = fs.fstatSync;
@@ -1128,7 +1189,7 @@ test("TP-64/132: 500 long project estimates keep the snapshot and output within 
     const run = await cli(w, [command]);
     assert.equal(run.code, 0, run.text.slice(0, 200));
     const { periods, estimates, queue, self_check, subscriptions: [, codex] } = run.env.data;
-    assert.equal(codex.tokens.month.total, 4 * ACCOUNT_DAY_TOKENS_MAX);
+    assert.equal(codex.tokens.month.total, 3 * ACCOUNT_DAY_TOKENS_MAX);
     assert.equal(periods.days.at(-1)?.subs.codex.account, ACCOUNT_DAY_TOKENS_MAX);
     const fixed = Buffer.byteLength(JSON.stringify({ ...run.env, data: { ...run.env.data, periods: null, periods_error: null } })) + 1;
     maxFixed = Math.max(maxFixed, fixed);
