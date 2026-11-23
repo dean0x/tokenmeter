@@ -204,8 +204,7 @@ export interface CodexSnapshot {
   readonly previous: string | null;
 }
 
-export interface LedgerEntry {
-  readonly provider: Provider;
+export type LedgerEntry = {
   readonly dev: number;
   readonly ino: number;
   readonly size: number;
@@ -213,8 +212,10 @@ export interface LedgerEntry {
   // The file time at the last read. Null in a ledger that was saved before the
   // time was kept. It lets a pass drop the entry of a file that left the horizon.
   readonly mtimeMs: number | null;
-  readonly codex: CodexSnapshot | null;
-}
+} & (
+  | { readonly provider: "claude"; readonly rev: number; readonly codex: null }
+  | { readonly provider: "codex"; readonly rev?: never; readonly codex: CodexSnapshot }
+);
 
 export type StoreErrorCode = "store_corrupt" | "store_newer" | "store_too_large" | "internal_error";
 
@@ -408,12 +409,15 @@ function parseLedgerEntry(value: unknown): LedgerEntry | null {
   if (body === null) return null;
   const { provider, dev, ino, size, offset, codex } = body;
   const mtimeMs = body["mtimeMs"] ?? null;
+  const rev = body["rev"] ?? 0;
   if (provider !== "claude" && provider !== "codex") return null;
   if (!isIdNumber(dev) || !isIdNumber(ino) || !isCount(size) || !isCount(offset) || offset > size) return null;
   if (mtimeMs !== null && !isIdNumber(mtimeMs)) return null;
-  if (provider === "claude") return codex === null ? { provider, dev, ino, size, offset, mtimeMs, codex: null } : null;
+  if (!isCount(rev)) return null;
+  const position = { dev, ino, size, offset, mtimeMs };
+  if (provider === "claude") return codex === null ? { provider, ...position, rev, codex: null } : null;
   const snapshot = parseSnapshot(codex);
-  return snapshot === null ? null : { provider, dev, ino, size, offset, mtimeMs, codex: snapshot };
+  return snapshot === null ? null : { provider, ...position, codex: snapshot };
 }
 
 function parseLedger(parsed: unknown): Result<Map<string, LedgerEntry>, StoreError> {
@@ -531,7 +535,7 @@ export interface BackfillStats {
 
 function sameLedgerEntry(a: LedgerEntry, b: LedgerEntry): boolean {
   if (a.provider !== b.provider || a.dev !== b.dev || a.ino !== b.ino) return false;
-  if (a.size !== b.size || a.offset !== b.offset || a.mtimeMs !== b.mtimeMs) return false;
+  if (a.size !== b.size || a.offset !== b.offset || a.mtimeMs !== b.mtimeMs || a.rev !== b.rev) return false;
   if (a.codex === null || b.codex === null) return a.codex === b.codex;
   return (
     a.codex.metaSeen === b.codex.metaSeen &&

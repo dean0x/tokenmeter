@@ -40,6 +40,7 @@ import {
 import { type RowScan, readRows } from "./lines.ts";
 import { type Zone, localZone } from "./periods.ts";
 import {
+  CLAUDE_PARSER_REV,
   CODEX_INITIAL_STATE,
   type CodexFileState,
   type CodexQuotaSample,
@@ -677,10 +678,11 @@ function scanCodex(
   return scanned.ok ? ok({ scan: scanned.value, codex: state }) : scanned;
 }
 
-// A file is read again from 0 when its device or inode changed, or when it is
-// smaller than the saved offset.
+// A file is read again from 0 after a change in identity or a shrink past the
+// saved offset. A Claude file also restarts after a parser revision increase.
 function startOffset(saved: LedgerEntry | undefined, file: Candidate): number {
   if (saved === undefined) return 0;
+  if (file.provider === "claude" && (saved.rev ?? 0) < CLAUDE_PARSER_REV) return 0;
   const replaced = saved.dev !== file.dev || saved.ino !== file.ino || file.size < saved.offset;
   return replaced ? 0 : saved.offset;
 }
@@ -695,16 +697,16 @@ interface Position {
 function ledgerEntryFor(file: Candidate, at: Position, codex: CodexFileState): LedgerEntry {
   // The file shrank between the stat and the open: read it again from 0 next time.
   const lost = at.offset > at.size;
-  const state = lost ? CODEX_INITIAL_STATE : codex;
-  return {
-    provider: file.provider,
+  const position = {
     dev: at.dev,
     ino: at.ino,
     size: at.size,
     offset: lost ? 0 : at.offset,
     mtimeMs: file.mtimeMs,
-    codex: file.provider === "codex" ? snapshotOf(state) : null,
   };
+  return file.provider === "claude"
+    ? { ...position, provider: "claude", rev: CLAUDE_PARSER_REV, codex: null }
+    : { ...position, provider: "codex", codex: snapshotOf(lost ? CODEX_INITIAL_STATE : codex) };
 }
 
 // The Codex state to go on with: the saved one, or a fresh one when the file starts at 0.
@@ -949,7 +951,8 @@ function runPass(
 
   const { tally } = pass;
   return ok({
-    stoppedBy,
+    // A budget cut in the last file leaves backlog without a next file to stop at.
+    stoppedBy: stoppedBy === "none" && backlogBytes > 0 ? "bytes" : stoppedBy,
     roots: found.roots,
     files: found.candidates.length,
     filesRead,

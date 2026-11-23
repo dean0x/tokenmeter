@@ -62,7 +62,7 @@ import {
 } from "../src/store.ts";
 import { zoneNamed } from "../src/periods.ts";
 import { quotaMonthFile, storeCodexQuota } from "../src/quota.ts";
-import { CODEX_INITIAL_STATE, type CodexQuotaSample, stepCodexRow } from "../src/sources.ts";
+import { CLAUDE_PARSER_REV, CODEX_INITIAL_STATE, type CodexQuotaSample, stepCodexRow } from "../src/sources.ts";
 import { type Sandbox, assertGuarded, installSuiteGuard, makeSandbox } from "./helpers.ts";
 
 installSuiteGuard();
@@ -1651,8 +1651,162 @@ test("temp files cannot fill the data folder up to its name cap", (t) => {
 });
 
 // ---------------------------------------------------------------------------
-// The ledger: file time, pruning and the size cap
+// The ledger: parser revision, file time, pruning and the size cap
 // ---------------------------------------------------------------------------
+
+type LedgerFile = { version: number; files: Record<string, Record<string, unknown>> };
+
+function rewriteLedgerEntry(
+  w: World, path: string, update: (entry: Readonly<Record<string, unknown>>) => Record<string, unknown>,
+): void {
+  const ledgerPath = join(w.data, LEDGER_FILE);
+  const ledger = readJson(ledgerPath) as LedgerFile;
+  const key = fileKeyOf(path);
+  const entry = ledger.files[key];
+  assert.ok(entry !== undefined);
+  ledger.files[key] = update(entry);
+  writeFileSync(ledgerPath, JSON.stringify(ledger), { mode: 0o600 });
+}
+
+test("a legacy offset at EOF resumes a budget-cut re-read and counts each proxy row once", (t) => {
+  const w = makeWorld(t);
+  const path = claudeFile(w, "legacy");
+  const at = "2026-11-03T08:01:00Z";
+  const native = ["A", "B"].map((id) => claudeLines({ id, at }));
+  const proxy = [
+    proxyLine("old", "2026-10-24T08:01:00Z", 40),
+    proxyLine("new1", at, 10),
+    proxyLine("new2", at, 20),
+  ];
+  put(path, native.join(""));
+  assert.equal(passOk(w).rows.counted, 2);
+  append(path, proxy.join(""));
+  const { size, mtimeMs } = statSync(path);
+  rewriteLedgerEntry(w, path, ({ rev, ...legacy }) => ({ ...legacy, size, mtimeMs, offset: size }));
+  const lines = [...native, ...proxy];
+  const budget = { bytes: Math.max(...lines.map((line) => Buffer.byteLength(line))), ms: SCAN_BUDGET_MS };
+
+  let backlog = size;
+  const reports: CollectReport[] = [];
+  for (let i = 0; i < lines.length && backlog > 0; i += 1) {
+    const report = passOk(w, { budget });
+    assert.ok(report.bytesRead > 0 && report.bytesRead <= budget.bytes);
+    assert.ok(report.backlogBytes < backlog, "each pass advances from its saved offset");
+    if (report.backlogBytes > 0) assert.equal(report.stoppedBy, "bytes");
+    reports.push(report);
+    backlog = report.backlogBytes;
+  }
+
+  assert.equal(backlog, 0);
+  assert.ok(reports.length > 2);
+  assert.equal(ledgerOffset(w, path), size);
+  assert.equal(reports.reduce((n, report) => n + report.rows.repeats, 0), 2);
+  assert.equal(reports.reduce((n, report) => n + report.rows.beforeHorizon, 0), 1);
+  assert.equal(reports.reduce((n, report) => n + report.rows.counted, 0), 2);
+  assert.deepEqual(totals(w), {
+    [SONNET_ALPHA]: [2, 0, 0, 0, 2],
+    [rowKey(at, "codex", PROXY_MODEL, PROJECT)]: [200, 0, 0, 60, 30],
+  });
+  const warm = passOk(w, { budget });
+  assert.equal(warm.bytesRead, 0);
+  assert.equal(warm.filesWritten, 0);
+});
+
+test("a legacy ledger rewrite accepts the extended store and adds no rows on re-read", (t) => {
+  const w = makeWorld(t);
+  const path = claudeFile(w, "legacy");
+  const at = "2026-11-03T08:01:00Z";
+  const id = "x".repeat(123);
+  put(path, claudeLines({ id: "A", at }) + proxyLine(id, at, 10));
+  passOk(w);
+  const before = totals(w);
+
+  // The 0.3.0 dedupe pattern accepts the complete 128-character response ID.
+  const legacyClaudeKey = /^[A-Za-z0-9_.:-]{1,128}\|[A-Za-z0-9_.:-]{1,128}$/;
+  const dedupe = readJson(join(w.data, "dedupe-2026-11-03.json")) as { entries: Record<string, unknown> };
+  const key = `resp_${id}|codex`;
+  assert.ok(Object.hasOwn(dedupe.entries, key));
+  assert.match(key, legacyClaudeKey);
+
+  // Version 1 checks only the known ledger fields. The old writer drops rev.
+  const ledger = readJson(join(w.data, LEDGER_FILE)) as LedgerFile;
+  assert.equal(ledger.version, 1);
+  rewriteLedgerEntry(w, path, ({ rev, ...legacy }) => {
+    const { dev, ino, size, mtimeMs } = statSync(path);
+    assert.deepEqual(legacy, { provider: "claude", dev, ino, size, offset: size, mtimeMs, codex: null });
+    assert.equal(rev, CLAUDE_PARSER_REV);
+    return legacy;
+  });
+  const reread = passOk(w);
+  assert.equal(reread.rows.repeats, 2);
+  assert.equal(reread.rows.counted, 0);
+  assert.deepEqual(totals(w), before);
+});
+
+test("a null parser revision requests a re-read", (t) => {
+  const w = makeWorld(t);
+  const path = claudeFile(w, "legacy");
+  put(path, claudeLines({ id: "A", at: "2026-11-03T08:01:00Z" }));
+  passOk(w);
+  rewriteLedgerEntry(w, path, (entry) => ({ ...entry, rev: null }));
+
+  const report = passOk(w);
+  assert.equal(report.rows.repeats, 1);
+  assert.equal(report.rows.counted, 0);
+});
+
+test("the Claude ledger records the parser revision even when the file has no bytes", (t) => {
+  const w = makeWorld(t);
+  const path = claudeFile(w, "empty");
+  put(path, "");
+  passOk(w);
+  rewriteLedgerEntry(w, path, ({ rev, ...legacy }) => legacy);
+
+  const upgraded = passOk(w);
+  assert.equal(upgraded.bytesRead, 0);
+  assert.equal(upgraded.filesWritten, 1);
+  assert.equal(passOk(w).filesWritten, 0);
+});
+
+test("a future parser revision keeps the offset and the next write records the current revision", (t) => {
+  const w = makeWorld(t);
+  const path = claudeFile(w, "future");
+  const at = "2026-11-03T08:01:00Z";
+  put(path, claudeLines({ id: "A", at }));
+  passOk(w);
+  rewriteLedgerEntry(w, path, (entry) => ({ ...entry, rev: CLAUDE_PARSER_REV + 1 }));
+  append(path, proxyLine("new", at, 10));
+
+  const report = passOk(w);
+  assert.equal(report.rows.counted, 1);
+  assert.equal(report.rows.repeats, 0);
+  const ledger = readJson(join(w.data, LEDGER_FILE)) as LedgerFile;
+  assert.equal(ledger.files[fileKeyOf(path)]?.["rev"], CLAUDE_PARSER_REV);
+});
+
+test("the Codex ledger keeps its offset without a parser revision", (t) => {
+  const w = makeWorld(t);
+  const path = codexFile(w, "parent");
+  put(path, fixtureText("codex-basic.jsonl"));
+  passOk(w);
+
+  const ledger = readJson(join(w.data, LEDGER_FILE)) as LedgerFile;
+  const entry = ledger.files[fileKeyOf(path)];
+  assert.ok(entry !== undefined && !Object.hasOwn(entry, "rev"));
+  assert.equal(passOk(w).bytesRead, 0);
+});
+
+test("the ledger rejects a parser revision that is not a count", (t) => {
+  const w = makeWorld(t);
+  const path = claudeFile(w, "legacy");
+  put(path, claudeLines({ id: "A", at: "2026-11-03T08:01:00Z" }));
+  passOk(w);
+
+  for (const rev of ["1", -1, 0.5, Number.MAX_SAFE_INTEGER + 1, true, []]) {
+    rewriteLedgerEntry(w, path, (entry) => ({ ...entry, rev }));
+    assertStopsWithNoWrite(w, { code: "store_corrupt", file: LEDGER_FILE });
+  }
+});
 
 test("the ledger keeps the file time of each source, and a ledger without it is read and upgraded", (t) => {
   const w = makeWorld(t);
@@ -1660,7 +1814,6 @@ test("the ledger keeps the file time of each source, and a ledger without it is 
   put(path, claudeLines({ id: "L1", at: "2026-11-03T08:01:00Z" }));
   passOk(w);
   const ledgerPath = join(w.data, LEDGER_FILE);
-  type LedgerFile = { version: number; files: Record<string, Record<string, unknown>> };
   const saved = readJson(ledgerPath) as LedgerFile;
   assert.equal(saved.files[fileKeyOf(path)]?.["mtimeMs"], statSync(path).mtimeMs);
 
