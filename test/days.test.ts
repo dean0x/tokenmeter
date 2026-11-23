@@ -133,6 +133,19 @@ function claudeLine(spec: ClaudeSpec): string {
   })}\n`;
 }
 
+function proxyLine(id: string, at: string, output: number): string {
+  return `${JSON.stringify({
+    type: "assistant",
+    timestamp: at,
+    cwd: "/work/alpha",
+    message: {
+      id: `resp_${id}`,
+      model: "gpt-9-test",
+      usage: { input_tokens: 100, cache_read_input_tokens: 30, output_tokens: output },
+    },
+  })}\n`;
+}
+
 function codexMeta(at: string): string {
   return `${JSON.stringify({ timestamp: at, type: "session_meta", payload: { id: "sess-old", cwd: "/work/alpha" } })}\n`;
 }
@@ -342,6 +355,34 @@ test("the first pass fills the day rows from the bucket files and from the logs 
   assert.deepEqual(second.backfill, { ran: false, files: 0, rows: 0, cut: false });
   assert.deepEqual(dayRows(w).dates(), ["2026-08-05", "2026-08-10", "2026-09-10", "2026-11-02"]);
 });
+
+for (const rebuild of [false, true]) {
+  test(`proxy backfill counts only the uncovered date ${rebuild ? "after days.json is deleted" : "on the first pass"}`, (t) => {
+    const w = makeWorld(t);
+    seedOldBuckets(w);
+    if (rebuild) {
+      passOk(w);
+      rmSync(join(w.data, DAYS_FILE));
+    }
+    put(
+      claudeFile(w, "proxy"),
+      proxyLine("covered", "2026-08-10T12:00:00Z", 50) +
+        proxyLine("uncovered", "2026-09-10T10:00:00Z", 10) +
+        proxyLine("uncovered", "2026-09-10T10:01:00Z", 30),
+    );
+
+    const first = passOk(w);
+    const rows = dayRows(w);
+    assert.deepEqual(first.backfill, { ran: true, files: 1, rows: 1, cut: false });
+    assert.deepEqual(columnsOn(rows, "2026-08-10", "codex"), [0, 0, 0, 0, 0]);
+    assert.deepEqual(columnsOn(rows, "2026-08-10", "claude"), [1000, 0, 0, 0, 100]);
+    assert.deepEqual(columnsOn(rows, "2026-09-10", "codex"), [100, 0, 0, 30, 30]);
+    assert.deepEqual(columnsOn(rows, "2026-09-10", "claude"), [0, 0, 0, 0, 0]);
+
+    assert.equal(passOk(w).backfill.ran, false);
+    assert.deepEqual(columnsOn(dayRows(w), "2026-09-10", "codex"), [100, 0, 0, 30, 30]);
+  });
+}
 
 test("a folder with no source file gets an empty days file and the backfill is marked done", (t) => {
   const w = makeWorld(t);

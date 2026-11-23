@@ -56,9 +56,11 @@ import {
   dedupeFileName,
   horizonStartMs,
   loadBucketMonth,
+  loadDayRows,
   monthName,
   slotOf,
 } from "../src/store.ts";
+import { zoneNamed } from "../src/periods.ts";
 import { quotaMonthFile, storeCodexQuota } from "../src/quota.ts";
 import { CODEX_INITIAL_STATE, type CodexQuotaSample, stepCodexRow } from "../src/sources.ts";
 import { type Sandbox, assertGuarded, installSuiteGuard, makeSandbox } from "./helpers.ts";
@@ -225,6 +227,21 @@ function claudeLine(spec: ClaudeSpec): string {
 
 function claudeLines(...specs: readonly ClaudeSpec[]): string {
   return specs.map((spec) => `${claudeLine(spec)}\n`).join("");
+}
+
+const PROXY_MODEL = "gpt-9-test";
+
+function proxyLine(id: string, at: string, output: number): string {
+  return `${JSON.stringify({
+    type: "assistant",
+    timestamp: at,
+    cwd: "/work/alpha",
+    message: {
+      id: `resp_${id}`,
+      model: PROXY_MODEL,
+      usage: { input_tokens: 100, cache_read_input_tokens: 30, output_tokens: output },
+    },
+  })}\n`;
 }
 
 // --- Codex rows ---
@@ -453,6 +470,49 @@ test("claude repeat across passes: a larger output replaces, a smaller one is ig
   const report = passOk(w);
   assert.deepEqual(totals(w), { [SONNET_ALPHA]: [1, 0, 0, 0, 55] });
   assert.equal(report.rows.repeats, 1);
+});
+
+test("proxy usage keeps its model and counts only as Codex in buckets and days", (t) => {
+  const w = makeWorld(t);
+  const at = "2026-11-03T08:01:00Z";
+  put(
+    claudeFile(w, "proxy"),
+    proxyLine("A", at, 10) + claudeLines({ id: "native", at, model: PROXY_MODEL, output: 2 }),
+  );
+
+  passOk(w, { zone: must(zoneNamed("UTC")) });
+
+  assert.deepEqual(totals(w), {
+    [rowKey(at, "codex", PROXY_MODEL, PROJECT)]: [100, 0, 0, 30, 10],
+    [rowKey(at, "claude", PROXY_MODEL, PROJECT)]: [1, 0, 0, 0, 2],
+  });
+  assert.deepEqual(must(loadDayRows(w.data, DEPS)).get("2026-11-03"), {
+    codex: [100, 0, 0, 30, 10],
+    claude: [1, 0, 0, 0, 2],
+    models: new Map([
+      [`codex|${PROXY_MODEL}`, [100, 0, 0, 30, 10]],
+      [`claude|${PROXY_MODEL}`, [1, 0, 0, 0, 2]],
+    ]),
+  });
+});
+
+test("proxy repeats keep the largest output and earliest slot per UTC day without bucket underflow", (t) => {
+  const w = makeWorld(t);
+  const file = claudeFile(w, "proxy");
+  const id = "x".repeat(123);
+  const early = "2026-11-02T23:29:00Z";
+  const nextDay = "2026-11-03T00:01:00Z";
+  put(file, proxyLine(id, "2026-11-02T23:59:00Z", 10));
+  passOk(w);
+  append(file, proxyLine(id, early, 30) + proxyLine(id, "2026-11-02T23:59:05Z", 55) + proxyLine(id, nextDay, 10));
+
+  const report = passOk(w);
+
+  assert.equal(report.bucketUnderflow, 0);
+  assert.deepEqual(totals(w), {
+    [rowKey(early, "codex", PROXY_MODEL, PROJECT)]: [100, 0, 0, 30, 55],
+    [rowKey(nextDay, "codex", PROXY_MODEL, PROJECT)]: [100, 0, 0, 30, 10],
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1140,6 +1200,19 @@ test("doctor counter: a key in more than one Claude day file is counted, and col
   assert.equal(must(crossDayClaudeKeys(w.data, NOW, DEPS)), 1);
   const rows = Object.values(totals(w));
   assert.equal(rows.reduce((acc, row) => acc + (row[4] ?? 0), 0), 5 + 5 + 1, "both copies of the fork are counted");
+});
+
+test("doctor counter ignores a proxy key across UTC days but counts a Claude fork", (t) => {
+  const w = makeWorld(t);
+  const before = "2026-11-02T23:59:00Z";
+  const after = "2026-11-03T00:01:00Z";
+  put(claudeFile(w, "proxy"), proxyLine("A", before, 10) + proxyLine("A", after, 10));
+  passOk(w);
+  assert.equal(must(crossDayClaudeKeys(w.data, NOW, DEPS)), 0);
+
+  put(claudeFile(w, "fork"), claudeLines({ id: "F", at: before }, { id: "F", at: after }));
+  passOk(w);
+  assert.equal(must(crossDayClaudeKeys(w.data, NOW, DEPS)), 1);
 });
 
 test("doctor counter: zero when no key repeats across days, and zero for an empty store", (t) => {

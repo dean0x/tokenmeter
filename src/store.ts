@@ -4,7 +4,7 @@
 //   store.json                 { version }
 //   ledger.json                { version, files: { sha256(path): offset record } }
 //   flush-journal.json         { version, renames }, only while a flush is cut short
-//   dedupe-YYYY-MM-DD.json     { version, entries } Claude, by the day of the message
+//   dedupe-YYYY-MM-DD.json     { version, entries } Claude-format rows, by UTC message day
 //   codex-dedupe-YYYY-MM-DD.json  Codex, by the day of the first-seen event
 //   buckets-YYYY-MM.json       { version, rows: { "slot|provider|model|folder": 5 buckets } }
 //   days.json                  { version, backfilled, cutThrough, days }, the totals of each local day (days.ts)
@@ -46,6 +46,7 @@ import {
   TOKEN_BUCKETS,
   err,
   ok,
+  providerOfClaudeKey,
 } from "./core.ts";
 import { DAYS_FILE, DayRows, type DayTotals, cutoffDateOf, isDateName, localDateOf } from "./days.ts";
 import { type FsDeps, defaultDeps, listDir, removeFile, removeOldTemps, safeRead } from "./fsafe.ts";
@@ -474,8 +475,8 @@ function listDayFiles(dataDir: string, horizonDay: number): Result<DayFiles, Sto
   return ok({ inHorizon, expired });
 }
 
-// Doctor only: how many Claude keys sit in more than one day file. A restamped
-// fork across days is counted twice by collect; the real-data check expects 0.
+// Doctor only: how many native Claude keys sit in more than one day file. A
+// restamped fork across days counts twice; the real-data check expects 0.
 export function crossDayClaudeKeys(
   dataDir: string,
   nowMs: number,
@@ -490,6 +491,7 @@ export function crossDayClaudeKeys(
     const loaded = loadDedupeDay(dataDir, "claude", file.day, deps);
     if (!loaded.ok) return loaded;
     for (const key of loaded.value.keys()) {
+      if (providerOfClaudeKey(key) !== "claude") continue;
       if (seen.has(key)) {
         repeated.add(key);
       } else {
@@ -753,7 +755,7 @@ export class Store {
       this.#days.add(date, provider, entry[MODEL_INDEX], columnsOf(entry), 1);
       rows += 1;
     };
-    for (const entry of this.#oldClaude.values()) fold("claude", entry);
+    for (const [key, entry] of this.#oldClaude) fold(providerOfClaudeKey(key), entry);
     for (const [key, entry] of this.#oldCodex) {
       if (!this.#codex.has(key)) fold("codex", entry);
     }
@@ -805,16 +807,16 @@ export class Store {
 
   // --- dedupe and buckets ---
 
-  // Claude: one entry per key and day. The largest output wins; the earliest
-  // slot (with its folder key) wins. A key is looked up in the day file of the
-  // row itself only.
+  // Claude-format rows: one entry per key and UTC day. The largest output wins;
+  // the earliest slot (with its folder key) wins. The key sets the provider.
   applyClaude(key: string, incoming: DedupeEntry): Result<Applied, StoreError> {
     const day = dayOfSlot(incoming[SLOT_INDEX]);
     const dayMap = this.#claudeDay(day);
     if (!dayMap.ok) return dayMap;
     const existing = dayMap.value.get(key);
+    const provider = providerOfClaudeKey(key);
     if (existing === undefined) {
-      const added = this.#addTokens("claude", incoming, 1);
+      const added = this.#addTokens(provider, incoming, 1);
       if (!added.ok) return added;
       dayMap.value.set(key, incoming);
       this.#claudeDirty.add(day);
@@ -824,7 +826,7 @@ export class Store {
     const move = incoming[SLOT_INDEX] < existing[SLOT_INDEX];
     if (!replace && !move) return ok("repeat");
     const merged = mergeEntries(existing, incoming, replace, move);
-    const swapped = this.#swapTokens("claude", existing, merged);
+    const swapped = this.#swapTokens(provider, existing, merged);
     if (!swapped.ok) return swapped;
     dayMap.value.set(key, merged);
     this.#claudeDirty.add(day);
